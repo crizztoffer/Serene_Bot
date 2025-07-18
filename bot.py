@@ -24,8 +24,6 @@ DB_HOST = os.getenv("DB_HOST")
 BOT_PREFIX = "!"
 
 # Initialize the bot with intents.
-# For slash commands, message_content intent is generally not required
-# unless you also plan to process regular text messages.
 intents = discord.Intents.default()
 intents.message_content = True # Required for bot.process_commands in on_message
 intents.members = True # Required for on_member_join and iterating guild.members

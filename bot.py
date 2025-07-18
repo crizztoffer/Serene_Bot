@@ -1,15 +1,22 @@
 # bot.py
-# This is your main bot file, updated to handle slash commands.
+# This is your main bot file, updated to handle slash commands and all environment variables.
 
 import discord
 from discord.ext import commands
 from discord import app_commands # Import app_commands for slash commands
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv # Import load_dotenv to load variables from .env file
 
-# Load environment variables
+# Load environment variables from .env file (for local development)
+# On Railway, these will be automatically provided by the platform.
 load_dotenv()
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+
+# --- Retrieve all necessary environment variables ---
+TOKEN = os.getenv("BOT_TOKEN") # Using BOT_TOKEN as per your sb.py
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
 
 # Define your bot's prefix (still useful for some legacy commands or debugging)
 BOT_PREFIX = "!"
@@ -19,6 +26,8 @@ BOT_PREFIX = "!"
 # unless you also plan to process regular text messages.
 intents = discord.Intents.default()
 # intents.message_content = True # Uncomment if you also need to read regular message content
+# intents.members = True # If you need on_member_join or member-related events
+# intents.presences = True # If you need presence updates
 
 # Initialize the bot. We also initialize the CommandTree for slash commands.
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
@@ -35,14 +44,8 @@ async def on_ready():
     print('Bot is ready!')
 
     # Sync slash commands to Discord.
-    # This should typically be done once after your bot starts and commands are loaded.
-    # For development, you might sync every time. For production, sync only when commands change.
     try:
         synced = await bot.tree.sync() # Sync global commands
-        # If you want to sync to a specific guild for faster testing, use:
-        # guild_id = YOUR_GUILD_ID # Replace with your test guild ID
-        # guild = discord.Object(id=guild_id)
-        # synced = await bot.tree.sync(guild=guild)
         print(f"Synced {len(synced)} slash commands.")
     except Exception as e:
         print(f"Failed to sync slash commands: {e}")
@@ -65,7 +68,7 @@ async def on_command_error(ctx, error):
         await ctx.send("You don't have the necessary permissions to run this prefix command.")
     else:
         print(f"An error occurred with a prefix command: {error}")
-        await ctx.send(f"An unexpected error occurred with a prefix command: {error}")
+        await ctx.send(f"An unexpected error occurred with a prefix command: {e}")
 
 
 # --- Cog Loading ---
@@ -94,11 +97,18 @@ async def main():
     """
     Main function to load cogs and run the bot.
     """
+    # Check if the main bot token is set
     if TOKEN is None:
-        print("Error: DISCORD_BOT_TOKEN not found in environment variables.")
-        print("Please create a .env file in the same directory as bot.py with:")
-        print("DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN_HERE")
+        print("Error: BOT_TOKEN environment variable not found.")
+        print("Please ensure it's set in your Railway variables or in a local .env file.")
         return
+
+    # You might want to add checks for other critical variables too, e.g.:
+    # if GEMINI_API_KEY is None:
+    #     print("Warning: GEMINI_API_KEY not set. Gemini API calls may fail.")
+    # if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+    #     print("Warning: Database credentials (DB_USER, DB_PASSWORD, DB_HOST) not fully set. Database operations may fail.")
+
 
     await load_cogs()
     await bot.start(TOKEN)
@@ -107,106 +117,4 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-
-```python
-# cogs/serene_slash_commands.py
-# This file contains the implementation for /serene and its subcommands.
-
-import discord
-from discord.ext import commands
-from discord import app_commands # Crucial import for slash commands
-
-class SereneSlashCommands(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    # Define the main command group for /serene
-    # This creates the top-level slash command /serene
-    serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
-
-    # Define a subcommand group under /serene: /serene game
-    # This creates the /serene game subcommand group
-    game_group = app_commands.Group(parent=serene_group, name="game", description="Commands related to game management.")
-
-    # --- Commands under /serene game ---
-
-    @game_group.command(name="start", description="Starts a new game.")
-    @app_commands.describe(
-        game_name="The name of the game to start",
-        max_players="Maximum number of players (default 4)"
-    )
-    async def game_start(self, interaction: discord.Interaction, game_name: str, max_players: int = 4):
-        """
-        Starts a new game with a specified name and optional max players.
-        Usage: /serene game start <game_name> [max_players]
-        """
-        try:
-            if max_players < 2:
-                await interaction.response.send_message("A game needs at least 2 players!", ephemeral=True) # ephemeral makes message visible only to user
-                return
-
-            await interaction.response.send_message(f"Game '{game_name}' started! Maximum players: {max_players}.")
-            # Here you would add logic to actually start a game session
-        except Exception as e:
-            await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
-            print(f"Error in /serene game start: {e}")
-
-    @game_group.command(name="join", description="Joins an existing game.")
-    @app_commands.describe(
-        game_name="The name of the game to join"
-    )
-    async def game_join(self, interaction: discord.Interaction, game_name: str):
-        """
-        Allows a user to join an existing game.
-        Usage: /serene game join <game_name>
-        """
-        try:
-            await interaction.response.send_message(f"{interaction.user.display_name} has joined game '{game_name}'.")
-            # Here you would add logic to add the user to the game session
-        except Exception as e:
-            await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
-            print(f"Error in /serene game join: {e}")
-
-    @game_group.command(name="end", description="Ends an existing game.")
-    @app_commands.describe(
-        game_name="The name of the game to end"
-    )
-    # You can add permission checks here, e.g., @app_commands.default_permissions(manage_guild=True)
-    async def game_end(self, interaction: discord.Interaction, game_name: str):
-        """
-        Ends a specified game. (Requires admin/host permissions)
-        Usage: /serene game end <game_name>
-        """
-        try:
-            # You'd typically add permission checks here, e.g., checking if the user is the game host
-            await interaction.response.send_message(f"Game '{game_name}' has been ended.")
-            # Logic to terminate the game session
-        except Exception as e:
-            await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
-            print(f"Error in /serene game end: {e}")
-
-    # You can add more commands directly under /serene that are NOT game-related, e.g.:
-    @serene_group.command(name="info", description="Displays information about the bot.")
-    async def serene_info(self, interaction: discord.Interaction):
-        """
-        Displays general information about the bot.
-        Usage: /serene info
-        """
-        try:
-            await interaction.response.send_message("This is Serene Bot, your friendly game manager (slash edition)!")
-        except Exception as e:
-            await interaction.response.send_message(f"An error occurred: {e}", ephemeral=True)
-            print(f"Error in /serene info: {e}")
-
-
-# This setup function is crucial for discord.py to load the cog.
-async def setup(bot):
-    # Add the main command group to the bot's command tree
-    bot.tree.add_command(SereneSlashCommands.serene_group)
-    await bot.add_cog(SereneSlashCommands(bot))
-```text
-# .env
-# Create this file in the same directory as bot.py
-# Replace YOUR_BOT_TOKEN_HERE with your actual Discord bot token.
-DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN_HERE
 

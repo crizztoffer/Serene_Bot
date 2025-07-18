@@ -1,29 +1,36 @@
 # bot.py
-# This is your main bot file, now centrally defining the top-level /serene command group.
+# This is your main bot file, updated to handle slash commands and all environment variables.
+# IMPORTANT: This file now correctly defines the top-level /serene command group once.
 
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
+from discord.ext import commands, tasks # Import tasks for hourly execution
+from discord import app_commands # Import app_commands for slash commands
 import os
-from dotenv import load_dotenv
-import aiomysql
-import json
+from dotenv import load_dotenv # Import load_dotenv to load variables from .env file
+import aiomysql # Import aiomysql for asynchronous MySQL connection
+import json # Import json for handling JSON data in database
 
+# Load environment variables from .env file (for local development)
+# On Railway, these will be automatically provided by the platform.
 load_dotenv()
 
-TOKEN = os.getenv("BOT_TOKEN")
+# --- Retrieve all necessary environment variables ---
+TOKEN = os.getenv("BOT_TOKEN") # Using BOT_TOKEN as per your sb.py
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 
+# Define your bot's prefix (still useful for some legacy commands or debugging)
 BOT_PREFIX = "!"
 
+# Initialize the bot with intents.
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.presences = True
+intents.message_content = True # Required for bot.process_commands in on_message
+intents.members = True # Required for on_member_join and iterating guild.members
+intents.presences = True # If you need presence updates, as per your sb.py
 
+# Initialize the bot. We also initialize the CommandTree for slash commands.
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
 # --- Define the top-level /serene slash command group here ---
@@ -42,8 +49,8 @@ async def add_user_to_db_if_not_exists(guild_id: int, user_name: str, discord_id
         print("Database operation failed: Missing one or more environment variables (DB_USER, DB_PASSWORD, DB_HOST).")
         return
 
-    db_name = "serene_users"
-    table_name = "discord_users"
+    db_name = "serene_users" # The database name where discord_users table resides
+    table_name = "discord_users" # The table name as specified by the user
 
     conn = None
     try:
@@ -52,23 +59,28 @@ async def add_user_to_db_if_not_exists(guild_id: int, user_name: str, discord_id
             user=DB_USER,
             password=DB_PASSWORD,
             db=db_name,
-            charset='utf8mb4',
-            autocommit=True
+            charset='utf8mb4', # Crucial for handling all Unicode characters
+            autocommit=True # Set autocommit to True for simple connection check and inserts
         )
         async with conn.cursor() as cursor:
+            # Check if user already exists for this guild
+            # Use %s placeholders for parameters to prevent SQL injection
             await cursor.execute(
                 f"SELECT COUNT(*) FROM {table_name} WHERE channel_id = %s AND discord_id = %s",
-                (str(guild_id), str(discord_id))
+                (str(guild_id), str(discord_id)) # Convert IDs to string as per VARCHAR column type
             )
             (count,) = await cursor.fetchone()
 
             if count == 0:
-                initial_json_data = json.dumps({"warnings": {}})
+                # User does not exist, insert them
+                initial_json_data = json.dumps({"warnings": {}}) # Initialize json_data as {"warnings":{}}
                 await cursor.execute(
                     f"INSERT INTO {table_name} (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
                     (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
                 )
                 print(f"Added new user '{user_name}' (ID: {discord_id}) to '{table_name}' in guild {guild_id}.")
+            # else:
+            #     print(f"User '{user_name}' (ID: {discord_id}) already exists in '{table_name}' for guild {guild_id}. Skipping insertion.")
 
     except aiomysql.Error as e:
         print(f"Database operation failed for user {user_name} (ID: {discord_id}): MySQL Error: {e}")
@@ -259,19 +271,12 @@ async def load_cogs():
         print(f"Warning: '{cogs_dir}' directory not found. No cogs will be loaded.")
         os.makedirs(cogs_dir)
 
-    # Get the already defined serene_group from the bot's command tree
-    # This ensures we are adding subcommands to the *same* group instance
-    serene_group_instance = bot.tree.get_command('serene')
-    if serene_group_instance is None:
-        print("Error: /serene command group not found in bot.tree. Cogs may not load correctly.")
-        return
-
     for filename in os.listdir(cogs_dir):
         if filename.endswith(".py"):
             module_name = f"{cogs_dir}.{filename[:-3]}"
             try:
-                # Pass the serene_group_instance to the cog's setup function
-                await bot.load_extension(module_name, extras={'serene_group': serene_group_instance})
+                # Removed 'extras' keyword argument. Cogs will now retrieve serene_group directly.
+                await bot.load_extension(module_name)
                 print(f"Successfully loaded cog: {module_name}")
             except Exception as e:
                 print(f"Failed to load cog {module_name}: {e}")

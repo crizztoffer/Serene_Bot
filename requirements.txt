@@ -5,3 +5,4 @@ Pillow
 requests 
 svglib 
 reportlab
+python-dotenv

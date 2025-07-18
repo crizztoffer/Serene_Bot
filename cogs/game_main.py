@@ -6,20 +6,25 @@ from discord.ext import commands
 from discord import app_commands
 
 class GameCommands(commands.Cog):
-    def __init__(self, bot, serene_group_parent: app_commands.Group):
+    def __init__(self, bot):
         self.bot = bot
-        # Store the parent serene_group passed from bot.py
-        self.serene_group_parent = serene_group_parent
+        # CORRECTED: Retrieve the parent serene_group directly from the bot's command tree
+        # This assumes serene_group has already been added to bot.tree in bot.py
+        self.serene_group_parent = self.bot.tree.get_command('serene')
+        
+        if self.serene_group_parent is None:
+            print("Error: /serene command group not found in bot.tree. Game subcommands may not register.")
+            # It's crucial to raise an error or handle this gracefully if the parent group isn't found
+            # as subcommands cannot be added without it.
+            raise commands.ExtensionFailed(self.qualified_name, "Parent /serene command group not found.")
 
-        # Define a subcommand group under the *passed* /serene group: /serene game
-        # This creates the /serene game subcommand group, nested under 'serene_group_parent'
-        # We add this group directly to the parent group.
+
+        # Define a subcommand group under the *retrieved* /serene group: /serene game
         self.game_group = app_commands.Group(parent=self.serene_group_parent, name="game", description="Commands related to game management.")
 
-        # Add the game_group to the bot's command tree.
+        # Add the game_group as a subcommand to the parent serene_group.
         # This makes /serene game available.
-        # Note: We are adding this *subgroup* to the tree, not the top-level /serene.
-        # The top-level /serene is already added in bot.py.
+        # Note: We are adding this *subgroup* to the parent group, not directly to bot.tree.
         self.serene_group_parent.add_command(self.game_group)
 
     # --- Commands under /serene game ---
@@ -100,14 +105,7 @@ class GameCommands(commands.Cog):
             print(f"Error in /serene info: {e}")
 
 # This setup function is crucial for discord.py to load the cog.
-# It now accepts the 'serene_group' as an argument from bot.py
-async def setup(bot, extras=None):
-    serene_group_from_bot = extras['serene_group'] if extras and 'serene_group' in extras else None
-    
-    if serene_group_from_bot is None:
-        print("Error: serene_group not passed to game_main cog. Subcommands may not register.")
-        return
-
-    # Initialize the cog, passing the serene_group instance
-    await bot.add_cog(GameCommands(bot, serene_group_from_bot))
-
+# It no longer accepts 'extras' and directly initializes the cog.
+async def setup(bot):
+    # Initialize the cog. The cog will retrieve the serene_group itself.
+    await bot.add_cog(GameCommands(bot))

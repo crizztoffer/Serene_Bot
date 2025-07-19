@@ -518,7 +518,8 @@ class TexasHoldEmGameView(discord.ui.View):
                 self.game.player_action_pending = True # Player must now call or fold
 
                 # When dealer raises, player can only Call or Fold
-                self._set_button_states(self.game.game_phase, betting_buttons_visible=False, call_after_raise_enabled=True)
+                # Removed 'call_after_raise_enabled=True' as it's no longer needed in _set_button_states
+                self._set_button_states(self.game.game_phase, betting_buttons_visible=False)
                 await self.game._update_game_message(self)
                 await interaction.followup.send(f"Serene raises by ${raise_amount}! You must Call or Fold.")
         except Exception as e:

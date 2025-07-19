@@ -6,7 +6,7 @@ from discord import app_commands
 import os
 import importlib.util
 
-class GameCommands(commands.Cog):
+class TalkCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.serene_group = self.bot.tree.get_command("serene")
@@ -33,7 +33,7 @@ class GameCommands(commands.Cog):
 
         self.serene_group.add_command(game)
 
-    async def autocomplete_games(self, interaction: discord.Interaction, current: str):
+    async def autocomplete_talking(self, interaction: discord.Interaction, current: str):
         talk_path = os.path.join(os.path.dirname(__file__), "talking")
         if not os.path.exists(talk_path):
             return []
@@ -41,4 +41,4 @@ class GameCommands(commands.Cog):
         return [app_commands.Choice(name=f, value=f) for f in files if current.lower() in f.lower()]
 
 async def setup(bot):
-    await bot.add_cog(GameCommands(bot))
+    await bot.add_cog(TalkCommands(bot))

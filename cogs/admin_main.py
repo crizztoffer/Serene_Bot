@@ -1,52 +1,51 @@
-import os
-import importlib
+# --- cogs/admin_main.py ---
+
+import discord
 from discord.ext import commands
-from discord import app_commands, Interaction
+from discord import app_commands
+import os
+import importlib.util
 
-# --- Admin Check ---
+class AdminCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.serene_group = self.bot.tree.get_command("serene")
 
-async def is_admin_or_mod(interaction: Interaction) -> bool:
-    return (
-        interaction.user.guild_permissions.administrator
-        or interaction.user.guild_permissions.manage_guild
-        or interaction.user.guild_permissions.kick_members
-    )
+        if self.serene_group is None:
+            raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-# --- Admin Command Group ---
+        @app_commands.command(name="admin", description="Run an admin tool")
+        @app_commands.describe(tool="Select an admin command")
+        @app_commands.autocomplete(tool=self.autocomplete_admin_tools)
+        async def admin(interaction: discord.Interaction, tool: str):
+            # Ensure only admins or mods can access
+            if not interaction.user.guild_permissions.administrator:
+                await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
+                return
 
-class AdminGroup(app_commands.Group):
-    def __init__(self):
-        super().__init__(name="admin", description="Admin-only commands")
-
-admin_group = AdminGroup()
-
-# --- Dynamic Loader ---
-
-def load_admin_commands():
-    command_folder = "admin_commands"
-    for filename in os.listdir(command_folder):
-        if filename.endswith(".py") and not filename.startswith("_"):
-            module_name = f"{command_folder}.{filename[:-3]}"
             try:
-                module = importlib.import_module(module_name)
+                module_path = os.path.join(os.path.dirname(__file__), "..", "admin_commands", f"{tool}.py")
+                module_path = os.path.abspath(module_path)
+                spec = importlib.util.spec_from_file_location(tool, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
                 if hasattr(module, "command"):
-                    admin_group.add_command(module.command)
-                    print(f"[admin_main] Loaded admin command: {filename}")
+                    await module.command.callback(interaction)
                 else:
-                    print(f"[admin_main] Skipped {filename}: no 'command' object.")
+                    await interaction.response.send_message(f"Admin tool '{tool}' does not define a 'command' object.", ephemeral=True)
+
             except Exception as e:
-                print(f"[admin_main] Failed to load {filename}: {e}")
+                await interaction.response.send_message(f"Failed to load admin tool '{tool}': {e}", ephemeral=True)
 
-# --- Setup ---
+        self.serene_group.add_command(admin)
 
-async def setup(bot: commands.Bot):
-    load_admin_commands()
-    bot.tree.add_command(admin_group)
+    async def autocomplete_admin_tools(self, interaction: discord.Interaction, current: str):
+        tools_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "admin_commands"))
+        if not os.path.exists(tools_path):
+            return []
+        files = [f[:-3] for f in os.listdir(tools_path) if f.endswith(".py") and f != "__init__.py"]
+        return [app_commands.Choice(name=f, value=f) for f in files if current.lower() in f.lower()]
 
-    @bot.tree.error
-    async def on_app_command_error(interaction: Interaction, error):
-        if isinstance(error, app_commands.errors.MissingPermissions):
-            await interaction.response.send_message("You don’t have permission to use this command.", ephemeral=True)
-        else:
-            await interaction.response.send_message("An error occurred while processing your command.", ephemeral=True)
-
+async def setup(bot):
+    await bot.add_cog(AdminCommands(bot))

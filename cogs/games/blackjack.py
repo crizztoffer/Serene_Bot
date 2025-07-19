@@ -1,141 +1,132 @@
+# cogs/games/blackjack.py
+
 import discord
-from discord.ext import commands
-from io import BytesIO
+from discord import ui
+import asyncio, random, io, os, aiohttp
 from PIL import Image, ImageDraw, ImageFont
+from .blackjack_card_images import create_card_combo_image  # assuming you keep your card-image logic in this helper file
 
-class Blackjack(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-        self.deck = []
-        self.player_hand = []
-        self.dealer_hand = []
-        self.game_in_progress = False
+active_blackjack_games = {}
 
-    def create_deck(self):
-        suits = ['♠', '♥', '♦', '♣']
-        ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-        self.deck = [f'{rank}{suit}' for suit in suits for rank in ranks]
+async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
+    print(f"Simulating update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}.")
 
-    def shuffle_deck(self):
-        import random
+async def get_user_kekchipz(guild_id: int, discord_id: int) -> int:
+    print(f"Simulating fetch: User {discord_id} kekchipz.")
+    return 1000  # placeholder balance
+
+class BlackjackGame:
+    def __init__(self, channel_id: int, player: discord.User):
+        self.channel_id = channel_id
+        self.player = player
+        self.reset_game()
+
+    def reset_game(self):
+        self.deck = self._create_standard_deck()
         random.shuffle(self.deck)
+        self.player_hand = [self.deal_card(), self.deal_card()]
+        self.dealer_hand = [self.deal_card(), self.deal_card()]
 
-    def draw_card(self):
+    def _create_standard_deck(self):
+        suits = ['S','D','C','H']
+        ranks = {'A':1,'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'0':10,'J':10,'Q':10,'K':10}
+        deck = []
+        for s in suits:
+            for r,n in ranks.items():
+                card = {'code': r+s, 'cardNumber': n, 'title': f"{r}{s}"}
+                deck.append(card)
+        return deck
+
+    def deal_card(self):
         return self.deck.pop()
 
     def calculate_hand_value(self, hand):
-        value = 0
-        aces = 0
-        for card in hand:
-            rank = card[:-1]
-            if rank in ['J', 'Q', 'K']:
-                value += 10
-            elif rank == 'A':
-                value += 11
+        value, aces = 0, 0
+        for c in hand:
+            v = c['cardNumber']
+            if v == 1:
                 aces += 1
-            else:
-                value += int(rank)
+                v = 11
+            value += v
         while value > 21 and aces:
             value -= 10
             aces -= 1
         return value
 
-    def create_blackjack_image(self, player_hand, dealer_hand, hide_dealer_card=True):
-        # Simplified: create an image showing cards as text for demonstration
-        width, height = 400, 200
-        img = Image.new('RGBA', (width, height), (34, 139, 34, 255))  # green felt background
-        draw = ImageDraw.Draw(img)
-        font = ImageFont.load_default()
+    async def _create_game_embed_with_images(self, reveal_dealer=False):
+        player_codes = [c['code'] for c in self.player_hand]
+        dealer_codes = [c['code'] for c in self.dealer_hand] if reveal_dealer else [self.dealer_hand[0]['code'], 'XX']
 
-        # Dealer's cards
-        draw.text((10, 10), "Dealer's Hand:", fill='white', font=font)
-        for i, card in enumerate(dealer_hand):
-            text = '??' if (i == 0 and hide_dealer_card) else card
-            draw.text((10 + i*40, 30), text, fill='white', font=font)
+        pimg = await create_card_combo_image(",".join(player_codes), scale_factor=0.4, overlap_percent=0.4)
+        dimg = await create_card_combo_image(",".join(dealer_codes), scale_factor=0.4, overlap_percent=0.4)
 
-        # Player's cards
-        draw.text((10, 100), "Your Hand:", fill='white', font=font)
-        for i, card in enumerate(player_hand):
-            draw.text((10 + i*40, 120), card, fill='white', font=font)
+        pd = io.BytesIO(); pimg.save(pd,'PNG'); pd.seek(0)
+        dd = io.BytesIO(); dimg.save(dd,'PNG'); dd.seek(0)
 
-        return img
+        pf = discord.File(pd, "player.png")
+        df = discord.File(dd, "dealer.png")
 
-    @commands.command(name="blackjack")
-    async def start_blackjack(self, ctx):
-        if self.game_in_progress:
-            await ctx.send("A game is already in progress!")
-            return
+        embed = discord.Embed(title="Blackjack", color=discord.Color.dark_green())
+        embed.add_field("Your Hand", f"Value: {self.calculate_hand_value(self.player_hand)}", inline=False)
+        sv= self.calculate_hand_value(self.dealer_hand) if reveal_dealer else f"{self.calculate_hand_value([self.dealer_hand[0]])} + ?"
+        embed.add_field("Serene's Hand", f"Value: {sv}", inline=False)
+        embed.set_image(url="attachment://player.png")
+        embed.set_thumbnail(url="attachment://dealer.png")
+        embed.set_footer(text="Hit or Stay?")
+        return embed, pf, df
 
-        self.game_in_progress = True
-        self.create_deck()
-        self.shuffle_deck()
-        self.player_hand = [self.draw_card(), self.draw_card()]
-        self.dealer_hand = [self.draw_card(), self.draw_card()]
+    async def start_game(self, interaction: discord.Interaction):
+        view = BlackjackGameView(self)
+        embed, pf, df = await self._create_game_embed_with_images()
+        msg = await interaction.response.send_message(embed=embed, view=view, files=[pf, df])
+        view.message = msg
+        active_blackjack_games[self.channel_id] = view
 
-        img = self.create_blackjack_image(self.player_hand, self.dealer_hand)
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        buffer.seek(0)
-        file = discord.File(fp=buffer, filename='blackjack.png')
+class BlackjackGameView(ui.View):
+    def __init__(self, game: BlackjackGame):
+        super().__init__(timeout=300)
+        self.game = game; self.message=None; self.play_again_task=None
 
-        await ctx.send(f"Game started! Your cards:", file=file)
-        await ctx.send("Type `!hit` to draw a card or `!stand` to hold.")
-
-    @commands.command()
-    async def hit(self, ctx):
-        if not self.game_in_progress:
-            await ctx.send("No game in progress. Start one with `!blackjack`.")
-            return
-
-        self.player_hand.append(self.draw_card())
-        player_value = self.calculate_hand_value(self.player_hand)
-        dealer_value = self.calculate_hand_value(self.dealer_hand)
-
-        img = self.create_blackjack_image(self.player_hand, self.dealer_hand)
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        buffer.seek(0)
-        file = discord.File(fp=buffer, filename='blackjack.png')
-
-        if player_value > 21:
-            self.game_in_progress = False
-            await ctx.send("You busted! Dealer wins.", file=file)
+    @ui.button(label="Hit", style=discord.ButtonStyle.green)
+    async def hit(self, i:discord.Interaction, b:ui.Button):
+        if i.user != self.game.player: return await i.response.send_message("Not your game", ephemeral=True)
+        self.game.player_hand.append(self.game.deal_card())
+        v = self.game.calculate_hand_value(self.game.player_hand)
+        embed, pf, df = await self.game._create_game_embed_with_images()
+        if v>21:
+            i.response.edit_message(embed=embed, view=self, attachments=[])
+            await update_user_kekchipz(i.guild.id,i.user.id, -50)
+            await self.end_game("Bust! Serene wins.")
         else:
-            await ctx.send(f"You drew a card. Your total is {player_value}.", file=file)
-            await ctx.send("Type `!hit` to draw again or `!stand` to hold.")
+            await i.response.edit_message(embed=embed, view=self, attachments=[pf,df])
 
-    @commands.command()
-    async def stand(self, ctx):
-        if not self.game_in_progress:
-            await ctx.send("No game in progress. Start one with `!blackjack`.")
-            return
+    @ui.button(label="Stay", style=discord.ButtonStyle.red)
+    async def stay(self, i:discord.Interaction, b:ui.Button):
+        if i.user != self.game.player: return await i.response.send_message("Not your game", ephemeral=True)
+        while self.game.calculate_hand_value(self.game.dealer_hand) < 17:
+            self.game.dealer_hand.append(self.game.deal_card())
+        pv = self.game.calculate_hand_value(self.game.player_hand)
+        dv = self.game.calculate_hand_value(self.game.dealer_hand)
+        if dv>21 or pv>dv: res="You win!"; delta=+100
+        elif pv<dv: res="Serene wins!"; delta=-50
+        else: res="Push."; delta=0
+        embed, pf, df = await self.game._create_game_embed_with_images(reveal_dealer=True)
+        await i.response.edit_message(embed=embed, view=self, attachments=[pf,df])
+        await update_user_kekchipz(i.guild.id,i.user.id,delta)
+        await self.end_game(res)
 
-        player_value = self.calculate_hand_value(self.player_hand)
-        dealer_value = self.calculate_hand_value(self.dealer_hand)
+    async def end_game(self, result_text):
+        for b in self.children: b.disabled=True
+        await self.message.edit(content=result_text, view=self)
+        del active_blackjack_games[self.game.channel_id]
 
-        # Dealer draws cards until 17 or higher
-        while dealer_value < 17:
-            self.dealer_hand.append(self.draw_card())
-            dealer_value = self.calculate_hand_value(self.dealer_hand)
+    async def on_timeout(self):
+        if self.message: await self.message.edit(content="Game timed out.", view=None)
+        active_blackjack_games.pop(self.game.channel_id, None)
 
-        img = self.create_blackjack_image(self.player_hand, self.dealer_hand, hide_dealer_card=False)
-        buffer = BytesIO()
-        img.save(buffer, format='PNG')
-        buffer.seek(0)
-        file = discord.File(fp=buffer, filename='blackjack.png')
-
-        result = ""
-        if dealer_value > 21:
-            result = "Dealer busts! You win!"
-        elif dealer_value > player_value:
-            result = "Dealer wins!"
-        elif dealer_value < player_value:
-            result = "You win!"
-        else:
-            result = "It's a tie!"
-
-        self.game_in_progress = False
-        await ctx.send(result, file=file)
-
-async def setup(bot):
-    await bot.add_cog(Blackjack(bot))
+async def start(interaction: discord.Interaction, bot):
+    gid = interaction.channel.id
+    if gid in active_blackjack_games:
+        return await interaction.response.send_message("Game already in progress!", ephemeral=True)
+    game = BlackjackGame(gid, interaction.user)
+    await game.start_game(interaction)

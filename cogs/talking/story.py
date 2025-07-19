@@ -3,6 +3,7 @@ import json
 import aiohttp
 import discord
 from discord import app_commands
+import random
 
 # --- Helper Function ---
 
@@ -52,30 +53,37 @@ async def command(interaction: discord.Interaction):
         await interaction.followup.send("Failed to fetch story structure.")
         return
 
-    # Extract verb form hints to guide Gemini more intelligently
+    # Extract verb form hints to guide Gemini
     verb_context = {
         key: value["verb_form"]
         for key, value in story_parts.items()
         if key in ["first", "second", "third", "forth", "fifth"]
     }
 
-    # Ask Gemini for appropriate verbs/nouns based on the structure
-    nouns = ["creature", "thing"]
-    verbs = ["wiggle", "crash"]
-
+    # Prompt Gemini
+    gemini_fills = {}
     try:
         gemini_prompt = f"""
-        Based on the following verb usage requirements, generate fitting noun and verb words.
-        The goal is to complete a 5-part surreal story. For each entry in the input below, return a word that fits its verb_form:
+        You are crafting a surreal, humorous short story with five parts.
 
+        Each entry below has a required word type:
+        - "infinitive": a present tense verb (e.g., "explode", "scream").
+        - "past_tense": also return a present tense verb (we convert it).
+        - "none": provide a strange or unusual noun.
+
+        All words MUST be creative, unexpected, and **different from each other**.
+
+        Input:
         {json.dumps(verb_context, indent=2)}
 
-        - If "verb_form" is "infinitive", provide a verb in base form (like "eat", "fly").
-        - If "verb_form" is "past_tense", provide a verb in base form (we will convert it).
-        - If "verb_form" is "none", provide a creative and unusual noun.
-
-        Return a JSON object with keys matching the inputs and values being the words.
-        Example: {{"first": "dragon", "second": "sing", "third": "monster", "forth": "dance", "fifth": "portal"}}
+        Return a JSON object like:
+        {{
+            "first": "lizard-witch",
+            "second": "disintegrate",
+            "third": "sky-yogurt",
+            "forth": "giggle",
+            "fifth": "portal-taco"
+        }}
         """
 
         payload = {
@@ -95,20 +103,24 @@ async def command(interaction: discord.Interaction):
                         parts = data["candidates"][0]["content"]["parts"]
                         gemini_fills = json.loads(parts[0]["text"])
 
-                        # Fallback safety
-                        nouns = [gemini_fills.get("first", "creature"), gemini_fills.get("third", "thing")]
-                        verbs = [
-                            gemini_fills.get("second", "run"),
-                            gemini_fills.get("forth", "explode")
-                        ]
+                        # Check for duplicates and warn
+                        if len(set(gemini_fills.values())) < 5:
+                            print("Duplicate words detected in Gemini response.")
+
     except Exception as e:
         print(f"Gemini API error: {e}")
 
-    # Final verb handling
-    v1 = verbs[0]
-    v2 = to_past_tense(verbs[1])
-    n1 = nouns[0]
-    n2 = nouns[1]
+    # Default fallbacks if Gemini fails
+    default_nouns = ["pickle-satyr", "orb-crab", "lava-toaster", "slug-pyramid"]
+    default_verbs = ["vibrate", "launch", "implode", "hiccup"]
+
+    # Fill values with fallbacks if needed
+    n1 = gemini_fills.get("first", random.choice(default_nouns))
+    v1 = gemini_fills.get("second", random.choice(default_verbs))
+    n2 = gemini_fills.get("third", random.choice(default_nouns))
+    v2_raw = gemini_fills.get("forth", random.choice(default_verbs))
+    v2 = to_past_tense(v2_raw)
+    n3 = gemini_fills.get("fifth", random.choice(default_nouns))
 
     # Build the story
     full_story = (
@@ -116,7 +128,7 @@ async def command(interaction: discord.Interaction):
         story_parts["second"]["sentence"] + v1 +
         story_parts["third"]["sentence"] + n2 +
         story_parts["forth"]["sentence"] + v2 +
-        story_parts["fifth"]["sentence"]
+        story_parts["fifth"]["sentence"] + n3
     )
 
     await interaction.followup.send(

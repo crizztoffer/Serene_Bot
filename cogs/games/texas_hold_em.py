@@ -303,12 +303,12 @@ class TexasHoldEmGameView(discord.ui.View):
         # Initialize button states for the pre-flop phase
         self._set_button_states("pre_flop")
 
-    def _set_button_states(self, phase: str, betting_buttons_visible: bool = False, call_after_raise_enabled: bool = False):
+    def _set_button_states(self, phase: str, betting_buttons_visible: bool = False):
         """
         Manages the visibility and disabled state of buttons based on game phase.
         Buttons are dynamically added/removed to control their visibility.
         """
-        print(f"Setting button states for phase: {phase}, betting_buttons_visible: {betting_buttons_visible}, call_after_raise_enabled: {call_after_raise_enabled}")
+        print(f"Setting button states for phase: {phase}, betting_buttons_visible: {betting_buttons_visible}")
         self.clear_items() # Clear all existing items from the view
 
         # Define buttons and their callbacks
@@ -334,7 +334,7 @@ class TexasHoldEmGameView(discord.ui.View):
 
         # Add buttons based on the current game phase and flags
         if betting_buttons_visible:
-            # Player is choosing a raise amount
+            # Player is choosing a raise amount, so show bet buttons and Fold
             self.add_item(bet_5_button)
             self.add_item(bet_10_button)
             self.add_item(bet_25_button)
@@ -347,12 +347,12 @@ class TexasHoldEmGameView(discord.ui.View):
             # Check is not available pre-flop
         elif phase in ["flop", "turn", "river"]:
             # Post-flop actions
-            if self.game.player_action_pending and self.game.dealer_raise_amount > 0:
+            if self.game.dealer_raise_amount > 0: # Serene has made a bet/raise
                 # Player must respond to dealer's raise: Call or Fold
                 self.add_item(call_button)
                 self.add_item(fold_button)
             else:
-                # No outstanding raise: Player can Check, Raise, or Fold
+                # No outstanding raise from Serene: Player can Check, Raise, or Fold
                 self.add_item(check_button)
                 self.add_item(raise_button)
                 self.add_item(fold_button)
@@ -414,20 +414,20 @@ class TexasHoldEmGameView(discord.ui.View):
             
             await interaction.response.defer() # Defer to allow time for updates
 
-            # Case 1: Pre-flop Call (always moves to flop)
+            # Case 1: Pre-flop Call (player calls the initial big blind)
             if self.game.game_phase == "pre_flop":
-                self.game.g_total = self.game.minimum_bet * 2
+                self.game.g_total = self.game.minimum_bet * 2 # Player matches big blind
                 self.game.deal_flop()
-                self._set_button_states("flop") # Set buttons for flop phase
+                self._set_button_states("flop") # Transition to flop buttons
                 await self.game._update_game_message(self)
                 return # Important: return after handling a case
 
-            # Case 2: Player calls after dealer's raise (player_action_pending is True, dealer_raise_amount > 0)
+            # Case 2: Player calls after dealer's raise (post-flop)
             elif self.game.player_action_pending and self.game.dealer_raise_amount > 0:
-                self.game.g_total += self.game.dealer_raise_amount * 2
+                self.game.g_total += self.game.dealer_raise_amount * 2 # Player matches dealer's raise
                 self.game.dealer_raise_amount = 0 # Reset dealer's raise
-                self.game.player_action_pending = False
-                
+                self.game.player_action_pending = False # Player's action is complete
+
                 # Advance game phase
                 if self.game.game_phase == "flop":
                     self.game.deal_turn()
@@ -435,40 +435,23 @@ class TexasHoldEmGameView(discord.ui.View):
                 elif self.game.game_phase == "turn":
                     self.game.deal_river()
                     self._set_button_states("river")
-                elif self.game.game_phase == "river": # If river, go to showdown
+                elif self.game.game_phase == "river":
                     self.game.game_phase = "showdown"
                     self._end_game_buttons()
                     await self.game._update_game_message(self, reveal_opponent=True)
                     del active_texasholdem_games[self.game.channel_id]
                     self.stop()
-                    return
+                    return # Game ends here
                 await self.game._update_game_message(self)
-                return # Important: return after handling a case
+                return
 
-            # Case 3: Player calls when there is no active raise (effectively a check)
-            # This happens when the Call button is visible but dealer_raise_amount is 0
-            elif not self.game.player_action_pending and self.game.dealer_raise_amount == 0:
-                # This is equivalent to a check action, so we advance the game phase
-                if self.game.game_phase == "flop":
-                    self.game.deal_turn()
-                    self._set_button_states("turn")
-                elif self.game.game_phase == "turn":
-                    self.game.deal_river()
-                    self._set_button_states("river")
-                elif self.game.game_phase == "river": # If river, go to showdown
-                    self.game.game_phase = "showdown"
-                    self._end_game_buttons()
-                    await self.game._update_game_message(self, reveal_opponent=True)
-                    del active_texasholdem_games[self.game.channel_id]
-                    self.stop()
-                    return
-                await self.game._update_game_message(self)
-                return # Important: return after handling a case
-
-            # Fallback for any unhandled or truly invalid call actions
+            # If we reach here, it means the 'Call' button was clicked in an unexpected state
+            # (e.g., no outstanding bet to call, but the button was somehow visible).
+            # This indicates an internal logic error or an unexpected user interaction.
             else:
-                await interaction.followup.send("Invalid call action.", ephemeral=True)
-                self._set_button_states(self.game.game_phase, call_after_raise_enabled=self.game.dealer_raise_amount > 0)
+                await interaction.followup.send("Invalid call action: No active bet to call or unexpected game state.", ephemeral=True)
+                # Re-evaluate button states to try and correct the display
+                self._set_button_states(self.game.game_phase, betting_buttons_visible=self.game.current_bet_buttons_visible) # Ensure betting buttons state is preserved if applicable
                 await self.game._update_game_message(self)
 
         except Exception as e:
@@ -534,7 +517,8 @@ class TexasHoldEmGameView(discord.ui.View):
                 self.game.dealer_raise_amount = raise_amount
                 self.game.player_action_pending = True # Player must now call or fold
 
-                self._set_button_states(self.game.game_phase, call_after_raise_enabled=True) # Enable Call, disable Check/Raise
+                # When dealer raises, player can only Call or Fold
+                self._set_button_states(self.game.game_phase, betting_buttons_visible=False, call_after_raise_enabled=True)
                 await self.game._update_game_message(self)
                 await interaction.followup.send(f"Serene raises by ${raise_amount}! You must Call or Fold.")
         except Exception as e:
@@ -892,7 +876,7 @@ class TexasHoldEmGame:
             dealer_raise_text = f"Raise: ${self.dealer_raise_amount}"
             bbox = dummy_draw.textbbox((0,0), dealer_raise_text, font=font_small)
             dealer_raise_text_width = bbox[2] - bbox[0]
-            dealer_raise_text_height = bbox[3] - bbox[1]
+            dealer_raise_text_height = bbox[3] - bbox[0]
             # Position to the left of dealer's hand image
             dealer_raise_x = dealer_img_x_offset - dealer_raise_text_width - text_padding_x
             draw.text((dealer_raise_x, current_y_offset + bot_hand_img.height // 2 - dealer_raise_text_height // 2),

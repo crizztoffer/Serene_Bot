@@ -14,7 +14,6 @@ class GameCommands(commands.Cog):
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        # Define /serene game as a command with a game_name option
         @app_commands.command(name="game", description="Start a game")
         @app_commands.describe(game_name="Choose a game to play")
         @app_commands.autocomplete(game_name=self.autocomplete_games)
@@ -26,7 +25,7 @@ class GameCommands(commands.Cog):
                 spec.loader.exec_module(module)
 
                 if hasattr(module, "start"):
-                    await module.start(interaction)
+                    await module.start(interaction, self.bot)
                 else:
                     await interaction.response.send_message(f"Game '{game_name}' does not have a start() function.", ephemeral=True)
             except Exception as e:

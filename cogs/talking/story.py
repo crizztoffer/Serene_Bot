@@ -124,5 +124,5 @@ async def start(interaction: discord.Interaction, bot: commands.Bot):
             f"**Serene says:** {full_story}"
         )
 
-    bot.tree.add_command(story_command)
+    # DO NOT call bot.tree.add_command(story_command) here
     print("'/serene story' command registered.")

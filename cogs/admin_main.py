@@ -14,34 +14,36 @@ class AdminCommands(commands.Cog):
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        @app_commands.command(name="admin", description="Run an admin tool")
-        @app_commands.describe(tool="Select an admin command")
+        @app_commands.command(
+            name="admin",
+            description="Run an admin tool",
+            default_permissions=discord.Permissions(administrator=True)
+        )
+        @app_commands.describe(tool="Select an admin tool")
         @app_commands.autocomplete(tool=self.autocomplete_admin_tools)
         async def admin(interaction: discord.Interaction, tool: str):
-            # Ensure only admins or mods can access
-            if not interaction.user.guild_permissions.administrator:
-                await interaction.response.send_message("You do not have permission to use this command.", ephemeral=True)
-                return
-
             try:
-                module_path = os.path.join(os.path.dirname(__file__), "..", "admin_commands", f"{tool}.py")
-                module_path = os.path.abspath(module_path)
+                module_path = os.path.join(os.path.dirname(__file__), "admin_commands", f"{tool}.py")
                 spec = importlib.util.spec_from_file_location(tool, module_path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 
-                if hasattr(module, "command"):
-                    await module.command.callback(interaction)
+                if hasattr(module, "start"):
+                    await module.start(interaction, self.bot)
                 else:
-                    await interaction.response.send_message(f"Admin tool '{tool}' does not define a 'command' object.", ephemeral=True)
-
+                    await interaction.response.send_message(
+                        f"Admin tool '{tool}' does not define a `start()` function.",
+                        ephemeral=True
+                    )
+            except FileNotFoundError:
+                await interaction.response.send_message(f"Tool '{tool}' not found.", ephemeral=True)
             except Exception as e:
-                await interaction.response.send_message(f"Failed to load admin tool '{tool}': {e}", ephemeral=True)
+                await interaction.response.send_message(f"Failed to load tool '{tool}': {e}", ephemeral=True)
 
         self.serene_group.add_command(admin)
 
     async def autocomplete_admin_tools(self, interaction: discord.Interaction, current: str):
-        tools_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "admin_commands"))
+        tools_path = os.path.join(os.path.dirname(__file__), "admin_commands")
         if not os.path.exists(tools_path):
             return []
         files = [f[:-3] for f in os.listdir(tools_path) if f.endswith(".py") and f != "__init__.py"]

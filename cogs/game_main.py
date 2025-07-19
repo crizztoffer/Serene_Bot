@@ -4,6 +4,7 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import os
+import importlib.util
 
 class GameCommands(commands.Cog):
     def __init__(self, bot):
@@ -18,7 +19,18 @@ class GameCommands(commands.Cog):
         @app_commands.describe(game_name="Choose a game to play")
         @app_commands.autocomplete(game_name=self.autocomplete_games)
         async def game(interaction: discord.Interaction, game_name: str):
-            await interaction.response.send_message(f"You chose to play: {game_name}")
+            try:
+                module_path = os.path.join(os.path.dirname(__file__), "games", f"{game_name}.py")
+                spec = importlib.util.spec_from_file_location(game_name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+
+                if hasattr(module, "start"):
+                    await module.start(interaction)
+                else:
+                    await interaction.response.send_message(f"Game '{game_name}' does not have a start() function.", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Failed to load game '{game_name}': {e}", ephemeral=True)
 
         self.serene_group.add_command(game)
 

@@ -511,17 +511,16 @@ class TexasHoldEmGameView(discord.ui.View):
                     return # Exit early after showdown
                 
                 await self.game._update_game_message(self)
-                await interaction.followup.send("Serene checks.")
+                # No separate message for Serene checking, it's implied by game progression
             else: # Dealer raises
                 raise_amount = random.choice([5, 10, 25])
                 self.game.dealer_raise_amount = raise_amount
                 self.game.player_action_pending = True # Player must now call or fold
 
                 # When dealer raises, player can only Call or Fold
-                # Removed 'call_after_raise_enabled=True' as it's no longer needed in _set_button_states
                 self._set_button_states(self.game.game_phase, betting_buttons_visible=False)
-                await self.game._update_game_message(self)
-                await interaction.followup.send(f"Serene raises by ${raise_amount}! You must Call or Fold.")
+                await self.game._update_game_message(self) # Update the main message with raise info
+                # The raise message will now be part of the main game message content
         except Exception as e:
             print(f"Error in check_main_callback: {e}")
             if not interaction.response.is_done():
@@ -945,6 +944,11 @@ class TexasHoldEmGame:
 
         # Message content now includes Kekchipz balance
         message_content = f"**{self.player.display_name}'s Kekchipz:** ${player_kekchipz}"
+
+        # Append Serene's raise message if applicable
+        if self.dealer_raise_amount > 0 and not reveal_opponent:
+            message_content += f"\nSerene raises by ${self.dealer_raise_amount}! You must Call or Fold."
+
 
         if self.game_message:
             try:

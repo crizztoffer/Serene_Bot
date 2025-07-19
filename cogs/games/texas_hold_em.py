@@ -836,7 +836,7 @@ class TexasHoldEmGame:
             player_text_width
         )
         # Increase overall image width to accommodate text
-        combined_image_width = max_content_width + text_padding_x * 4 # Increased multiplier for wider image
+        combined_image_width = max_content_width + text_padding_x * 6 # Increased multiplier for wider image
         
         # Calculate total height
         total_height = (

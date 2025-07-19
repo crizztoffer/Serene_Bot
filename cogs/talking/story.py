@@ -1,6 +1,5 @@
 import os
 import json
-import urllib.parse
 import aiohttp
 import discord
 from discord import app_commands
@@ -42,47 +41,45 @@ async def command(interaction: discord.Interaction):
     php_backend_url = "https://serenekeks.com/serene_bot_2.php"
     player_name = interaction.user.display_name
 
-    nouns = ["dragon", "wizard", "monster"]
-    verbs = ["fly", "vanish"]
-
-    php_structure = {
-        "first": "There once was a ",
-        "second": " who loved to ",
-        "third": ". But then one night, there came a shock… for a ",
-        "forth": " came barreling towards them before they ",
-        "fifth": " and lived happily ever after."
-    }
-
-    # Fetch structure from PHP backend
+    story_parts = {}
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(php_backend_url) as response:
                 if response.status == 200:
-                    php_structure = await response.json()
+                    story_parts = await response.json()
     except Exception as e:
         print(f"PHP fetch error: {e}")
+        await interaction.followup.send("Failed to fetch story structure.")
+        return
 
-    # Fetch nouns and verbs from Gemini API
+    # Extract verb form hints to guide Gemini more intelligently
+    verb_context = {
+        key: value["verb_form"]
+        for key, value in story_parts.items()
+        if key in ["first", "second", "third", "forth", "fifth"]
+    }
+
+    # Ask Gemini for appropriate verbs/nouns based on the structure
+    nouns = ["creature", "thing"]
+    verbs = ["wiggle", "crash"]
+
     try:
-        gemini_prompt = """
-        Return a JSON object with:
-        - 'nouns': 3 imaginative, simple lowercase nouns
-        - 'verbs': 2 action verbs in BASE form (will be conjugated to past tense as needed)
-        Output format: {"nouns": [...], "verbs": [...]}
+        gemini_prompt = f"""
+        Based on the following verb usage requirements, generate fitting noun and verb words.
+        The goal is to complete a 5-part surreal story. For each entry in the input below, return a word that fits its verb_form:
+
+        {json.dumps(verb_context, indent=2)}
+
+        - If "verb_form" is "infinitive", provide a verb in base form (like "eat", "fly").
+        - If "verb_form" is "past_tense", provide a verb in base form (we will convert it).
+        - If "verb_form" is "none", provide a creative and unusual noun.
+
+        Return a JSON object with keys matching the inputs and values being the words.
+        Example: {{"first": "dragon", "second": "sing", "third": "monster", "forth": "dance", "fifth": "portal"}}
         """
 
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": gemini_prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseSchema": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "nouns": {"type": "ARRAY", "items": {"type": "STRING"}},
-                        "verbs": {"type": "ARRAY", "items": {"type": "STRING"}}
-                    }
-                }
-            }
+            "contents": [{"role": "user", "parts": [{"text": gemini_prompt}]}]
         }
 
         api_key = os.getenv("GEMINI_API_KEY")
@@ -96,22 +93,30 @@ async def command(interaction: discord.Interaction):
                     if response.status == 200:
                         data = await response.json()
                         parts = data["candidates"][0]["content"]["parts"]
-                        parsed = json.loads(parts[0]["text"])
-                        nouns = (parsed.get("nouns", nouns))[:3]
-                        verbs = (parsed.get("verbs", verbs))[:2]
+                        gemini_fills = json.loads(parts[0]["text"])
+
+                        # Fallback safety
+                        nouns = [gemini_fills.get("first", "creature"), gemini_fills.get("third", "thing")]
+                        verbs = [
+                            gemini_fills.get("second", "run"),
+                            gemini_fills.get("forth", "explode")
+                        ]
     except Exception as e:
         print(f"Gemini API error: {e}")
 
-    # Assemble story
+    # Final verb handling
     v1 = verbs[0]
     v2 = to_past_tense(verbs[1])
+    n1 = nouns[0]
+    n2 = nouns[1]
 
+    # Build the story
     full_story = (
-        php_structure["first"] + nouns[0] +
-        php_structure["second"] + v1 +
-        php_structure["third"] + nouns[1] +
-        php_structure["forth"] + v2 +
-        php_structure["fifth"]
+        story_parts["first"]["sentence"] + n1 +
+        story_parts["second"]["sentence"] + v1 +
+        story_parts["third"]["sentence"] + n2 +
+        story_parts["forth"]["sentence"] + v2 +
+        story_parts["fifth"]["sentence"]
     )
 
     await interaction.followup.send(

@@ -15,23 +15,23 @@ class TalkCommands(commands.Cog):
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
         @app_commands.command(name="talk", description="Talk with Serene")
-        @app_commands.describe(game_name="What kinda talkin' you looking for, kek?")
-        @app_commands.autocomplete(talk_type=self.autocomplete_talk)
-        async def game(interaction: discord.Interaction, talk: str):
+        @app_commands.describe(talk="What kinda talkin' you looking for, kek?")
+        @app_commands.autocomplete(talk=self.autocomplete_talking)
+        async def talk(interaction: discord.Interaction, talk: str):
             try:
-                module_path = os.path.join(os.path.dirname(__file__), "talk", f"{talk_type}.py")
-                spec = importlib.util.spec_from_file_location(talk_type, module_path)
+                module_path = os.path.join(os.path.dirname(__file__), "talking", f"{talk}.py")
+                spec = importlib.util.spec_from_file_location(talk, module_path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 
                 if hasattr(module, "start"):
                     await module.start(interaction, self.bot)
                 else:
-                    await interaction.response.send_message(f"Talk '{talk_type}' does not have a start() function.", ephemeral=True)
+                    await interaction.response.send_message(f"Talk '{talk}' does not have a start() function.", ephemeral=True)
             except Exception as e:
-                await interaction.response.send_message(f"Failed to load talk '{talk_type}': {e}", ephemeral=True)
+                await interaction.response.send_message(f"Failed to load talk '{talk}': {e}", ephemeral=True)
 
-        self.serene_group.add_command(game)
+        self.serene_group.add_command(talk)
 
     async def autocomplete_talking(self, interaction: discord.Interaction, current: str):
         talk_path = os.path.join(os.path.dirname(__file__), "talking")

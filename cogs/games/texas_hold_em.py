@@ -572,27 +572,35 @@ class TexasHoldEmGameView(discord.ui.View):
             await interaction.response.send_message("This is not your Texas Hold 'em game!", ephemeral=True)
             return
         
-        await interaction.response.defer() # Defer to allow time for updates
+        # Defer the interaction immediately
+        await interaction.response.defer()
 
-        self.game.reset_game()
-        # The game view's buttons need to be reset to the initial pre_flop state
-        self._set_button_states("pre_flop")
-        self.game.deal_hole_cards() # Deal new cards after resetting game state
+        # Stop the current view (the one with the "Play Again" button)
+        self.stop() 
 
+        # Remove the old game from active games to allow a new one
+        if self.game.channel_id in active_texasholdem_games:
+            del active_texasholdem_games[self.game.channel_id]
+
+        # Try to edit the old message to indicate game over, then send a new one
         try:
-            # Update the existing game message with the new game state and buttons
-            await self.game._update_game_message(self)
-            active_texasholdem_games[self.game.channel_id] = self
+            if self.game.game_message:
+                # Create a temporary view with no active buttons to replace the old one
+                temp_view = discord.ui.View(timeout=1) # Short timeout
+                temp_view.add_item(discord.ui.Button(label="Game Ended", style=discord.ButtonStyle.red, disabled=True))
+                await self.game.game_message.edit(content=f"Game over for {self.game.player.display_name}. Starting a new game...", view=temp_view, attachments=[])
         except discord.errors.NotFound:
-            print("WARNING: Original game messages not found during 'Play Again' edit for Hold 'em.")
-            await interaction.followup.send("Could not restart game. Please try `/serene game texas_hold_em` again.", ephemeral=True)
-            if self.game.channel_id in active_texasholdem_games:
-                del active_texasholdem_games[self.game.channel_id]
+            print("WARNING: Old game message not found during 'Play Again' cleanup.")
         except Exception as e:
-            print(f"WARNING: An error occurred during 'Play Again' edit for Hold 'em: {e}")
-            await interaction.followup.send("An error occurred while restarting the game.", ephemeral=True)
-            if self.game.channel_id in active_texasholdem_games:
-                del active_texasholdem_games[self.game.channel_id]
+            print(f"WARNING: Error editing old game message during 'Play Again' cleanup: {e}")
+
+        # Start a brand new game
+        try:
+            new_holdem_game = TexasHoldEmGame(interaction.channel.id, interaction.user, self.bot_instance)
+            await new_holdem_game.start_game(interaction) # This will send a new message
+        except Exception as e:
+            print(f"Error starting new game from Play Again: {e}")
+            await interaction.followup.send("An error occurred while trying to start a new game. Please try `/serene game texas_hold_em` again.", ephemeral=True)
 
 
 class TexasHoldEmGame:
@@ -836,7 +844,7 @@ class TexasHoldEmGame:
             player_text_width
         )
         # Increase overall image width to accommodate text
-        combined_image_width = max_content_width + text_padding_x * 6 # Increased multiplier for wider image
+        combined_image_width = max_content_width + text_padding_x * 8 # Increased multiplier for wider image
         
         # Calculate total height
         total_height = (

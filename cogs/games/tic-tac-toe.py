@@ -1,83 +1,85 @@
-import math
+import discord
+import random
 
-class TicTacToe:
-    def __init__(self):
-        self.board = [' ' for _ in range(9)]
-        self.current_winner = None
+class TicTacToeView(discord.ui.View):
+    def __init__(self, player: discord.User):
+        super().__init__(timeout=60)
+        self.board = [" "] * 9
+        self.player = player
+        self.current_turn = "X"  # Player always starts as X
+        self.message = None
 
-    def available_moves(self):
-        return [i for i, spot in enumerate(self.board) if spot == ' ']
+        for i in range(9):
+            self.add_item(TicTacToeButton(i))
 
-    def empty_squares(self):
-        return ' ' in self.board
+    async def handle_turn(self, interaction: discord.Interaction, index: int):
+        if interaction.user != self.player:
+            await interaction.response.send_message("This game isn't for you!", ephemeral=True)
+            return
 
-    def make_move(self, square, player):
-        if self.board[square] == ' ':
-            self.board[square] = player
-            if self.check_winner(square, player):
-                self.current_winner = player
-            return True
-        return False
+        if self.board[index] != " ":
+            await interaction.response.send_message("That spot is already taken!", ephemeral=True)
+            return
 
-    def check_winner(self, square, player):
-        row_ind = square // 3
-        row = self.board[row_ind*3 : (row_ind+1)*3]
-        if all(s == player for s in row):
-            return True
+        self.board[index] = "X"
+        self.children[index].label = "X"
+        self.children[index].disabled = True
 
-        col_ind = square % 3
-        column = [self.board[col_ind + i*3] for i in range(3)]
-        if all(s == player for s in column):
-            return True
+        winner = self.check_winner()
+        if winner or " " not in self.board:
+            await self.end_game(interaction, winner)
+            return
 
-        if square % 2 == 0:
-            diagonal1 = [self.board[i] for i in [0, 4, 8]]
-            diagonal2 = [self.board[i] for i in [2, 4, 6]]
-            if all(s == player for s in diagonal1) or all(s == player for s in diagonal2):
-                return True
-
-        return False
-
-    def get_board_as_string(self):
-        board_str = ""
-        for row in [self.board[i*3:(i+1)*3] for i in range(3)]:
-            board_str += "| " + " | ".join(row) + " |\n"
-        return board_str
-
-class DummyPlayer:
-    def __init__(self, symbol):
-        self.symbol = symbol
-
-    def get_move(self, game):
-        return game.available_moves()[0]  # Always pick first available
-
-def play_game(game_instance, x_player, o_player):
-    current_player = 'X'
-
-    while game_instance.empty_squares():
-        if current_player == 'O':
-            square = o_player.get_move(game_instance)
+        # Serene's turn
+        await self.serene_move()
+        winner = self.check_winner()
+        if winner or " " not in self.board:
+            await self.end_game(interaction, winner)
         else:
-            square = x_player.get_move(game_instance)
+            await interaction.response.edit_message(view=self)
 
-        if game_instance.make_move(square, current_player):
-            if game_instance.current_winner:
-                return current_player
+    async def serene_move(self):
+        empty = [i for i, val in enumerate(self.board) if val == " "]
+        move = random.choice(empty)
+        self.board[move] = "O"
+        self.children[move].label = "O"
+        self.children[move].disabled = True
 
-            current_player = 'O' if current_player == 'X' else 'X'
+    def check_winner(self):
+        wins = [
+            [0, 1, 2], [3, 4, 5], [6, 7, 8],  # rows
+            [0, 3, 6], [1, 4, 7], [2, 5, 8],  # cols
+            [0, 4, 8], [2, 4, 6]              # diags
+        ]
+        for a, b, c in wins:
+            if self.board[a] == self.board[b] == self.board[c] != " ":
+                return self.board[a]
+        return None
+
+    async def end_game(self, interaction: discord.Interaction, winner: str):
+        for child in self.children:
+            child.disabled = True
+
+        if winner == "X":
+            content = f"🎉 {self.player.mention} wins!"
+        elif winner == "O":
+            content = f"🤖 Serene wins!"
         else:
-            break
+            content = "It's a tie!"
 
-    return "Tie"
+        await interaction.response.edit_message(content=content, view=self)
+        self.stop()
 
-# Entry point for the Discord bot
-async def start(interaction):
-    game = TicTacToe()
-    x_player = DummyPlayer('X')
-    o_player = DummyPlayer('O')
-    winner = play_game(game, x_player, o_player)
-    board_display = game.get_board_as_string()
+class TicTacToeButton(discord.ui.Button):
+    def __init__(self, index: int):
+        super().__init__(style=discord.ButtonStyle.secondary, label=" ", row=index // 3)
+        self.index = index
 
-    await interaction.response.send_message(
-        f"🎮 Tic-Tac-Toe Game Result:\n```{board_display}```\nWinner: **{winner}**"
-    )
+    async def callback(self, interaction: discord.Interaction):
+        view: TicTacToeView = self.view
+        await view.handle_turn(interaction, self.index)
+
+# Required entry point for dynamic loading
+async def start(interaction: discord.Interaction, bot):
+    view = TicTacToeView(interaction.user)
+    await interaction.response.send_message(f"{interaction.user.mention} vs 🤖 Serene - Tic-Tac-Toe!", view=view)

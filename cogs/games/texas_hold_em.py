@@ -334,27 +334,27 @@ class TexasHoldEmGameView(discord.ui.View):
 
         # Add buttons based on the current game phase and flags
         if betting_buttons_visible:
-            # Show betting amount buttons and Fold
+            # Player is choosing a raise amount
             self.add_item(bet_5_button)
             self.add_item(bet_10_button)
             self.add_item(bet_25_button)
-            self.add_item(fold_button)
+            self.add_item(fold_button) # Player can always fold
         elif phase == "pre_flop":
-            # Pre-flop: Player can Raise, Call, or Fold. Check is NOT available.
+            # Pre-flop actions: Raise, Call (big blind), Fold
             self.add_item(raise_button)
             self.add_item(call_button)
             self.add_item(fold_button)
+            # Check is not available pre-flop
         elif phase in ["flop", "turn", "river"]:
-            # Flop, Turn, River phases
-            if call_after_raise_enabled:
-                # If dealer raised, player can only Call or Fold
+            # Post-flop actions
+            if self.game.player_action_pending and self.game.dealer_raise_amount > 0:
+                # Player must respond to dealer's raise: Call or Fold
                 self.add_item(call_button)
                 self.add_item(fold_button)
             else:
-                # Normal betting round: Player can Raise, Call, Check, or Fold
-                self.add_item(raise_button)
-                self.add_item(call_button)
+                # No outstanding raise: Player can Check, Raise, or Fold
                 self.add_item(check_button)
+                self.add_item(raise_button)
                 self.add_item(fold_button)
         # For "showdown" or "folded" phases, no action buttons are added here,
         # only the "Play Again" button will be present (added below).
@@ -414,40 +414,63 @@ class TexasHoldEmGameView(discord.ui.View):
             
             await interaction.response.defer() # Defer to allow time for updates
 
+            # Case 1: Pre-flop Call (always moves to flop)
             if self.game.game_phase == "pre_flop":
-                # Pre-flop call: Gtotal = minimum_bet * 2
                 self.game.g_total = self.game.minimum_bet * 2
                 self.game.deal_flop()
                 self._set_button_states("flop") # Set buttons for flop phase
+                await self.game._update_game_message(self)
+                return # Important: return after handling a case
+
+            # Case 2: Player calls after dealer's raise (player_action_pending is True, dealer_raise_amount > 0)
             elif self.game.player_action_pending and self.game.dealer_raise_amount > 0:
-                # Player calls after dealer's raise
                 self.game.g_total += self.game.dealer_raise_amount * 2
                 self.game.dealer_raise_amount = 0 # Reset dealer's raise
                 self.game.player_action_pending = False
                 
+                # Advance game phase
                 if self.game.game_phase == "flop":
                     self.game.deal_turn()
                     self._set_button_states("turn")
                 elif self.game.game_phase == "turn":
                     self.game.deal_river()
                     self._set_button_states("river")
-                else: # Should not happen if logic is correct, but for safety
-                    self._set_button_states(self.game.game_phase)
+                elif self.game.game_phase == "river": # If river, go to showdown
+                    self.game.game_phase = "showdown"
+                    self._end_game_buttons()
+                    await self.game._update_game_message(self, reveal_opponent=True)
+                    del active_texasholdem_games[self.game.channel_id]
+                    self.stop()
+                    return
+                await self.game._update_game_message(self)
+                return # Important: return after handling a case
+
+            # Case 3: Player calls when there is no active raise (effectively a check)
+            # This happens when the Call button is visible but dealer_raise_amount is 0
+            elif not self.game.player_action_pending and self.game.dealer_raise_amount == 0:
+                # This is equivalent to a check action, so we advance the game phase
+                if self.game.game_phase == "flop":
+                    self.game.deal_turn()
+                    self._set_button_states("turn")
+                elif self.game.game_phase == "turn":
+                    self.game.deal_river()
+                    self._set_button_states("river")
+                elif self.game.game_phase == "river": # If river, go to showdown
+                    self.game.game_phase = "showdown"
+                    self._end_game_buttons()
+                    await self.game._update_game_message(self, reveal_opponent=True)
+                    del active_texasholdem_games[self.game.channel_id]
+                    self.stop()
+                    return
+                await self.game._update_game_message(self)
+                return # Important: return after handling a case
+
+            # Fallback for any unhandled or truly invalid call actions
             else:
                 await interaction.followup.send("Invalid call action.", ephemeral=True)
-                self._set_button_states(self.game.game_phase, call_after_raise_enabled=self.game.dealer_raise_amount > 0) # Reset buttons
+                self._set_button_states(self.game.game_phase, call_after_raise_enabled=self.game.dealer_raise_amount > 0)
                 await self.game._update_game_message(self)
-                return
 
-            # Check if it's the river and player calls, then proceed to showdown
-            if self.game.game_phase == "river" and not self.game.player_action_pending:
-                self.game.game_phase = "showdown"
-                self._end_game_buttons()
-                await self.game._update_game_message(self, reveal_opponent=True)
-                del active_texasholdem_games[self.game.channel_id]
-                self.stop()
-            else:
-                await self.game._update_game_message(self)
         except Exception as e:
             print(f"Error in call_main_callback: {e}")
             if not interaction.response.is_done():

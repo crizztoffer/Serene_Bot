@@ -1,4 +1,4 @@
-# --- cogs/communication_main.py ---
+# cogs/communication_main.py
 
 import discord
 from discord.ext import commands
@@ -6,51 +6,31 @@ from discord import app_commands
 import os
 import importlib.util
 
-
 class TalkCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.serene_group = self.bot.tree.get_command("serene")
 
-        if self.serene_group is None:
+    async def cog_load(self):
+        serene_group = self.bot.tree.get_command("serene")
+
+        if serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        @app_commands.command(name="start", description="Talk with Serene")
-        @app_commands.describe(talk="What kinda talkin' you looking for, kek?")
-        @app_commands.autocomplete(talk=self.autocomplete_talking)
-        async def start(interaction: discord.Interaction, talk: str):
-            try:
-                module_path = os.path.join(os.path.dirname(__file__), "talking", f"{talk}.py")
-                spec = importlib.util.spec_from_file_location(talk, module_path)
+        # Dynamically load all talk subcommands
+        talk_path = os.path.join(os.path.dirname(__file__), "talking")
+        for file in os.listdir(talk_path):
+            if file.endswith(".py") and file != "__init__.py":
+                command_name = file[:-3]
+                module_path = os.path.join(talk_path, file)
+
+                spec = importlib.util.spec_from_file_location(command_name, module_path)
                 module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(module)
 
-                if hasattr(module, "start"):
-                    await module.start(interaction, self.bot)
+                if hasattr(module, "command"):
+                    serene_group.add_command(module.command)
                 else:
-                    await interaction.response.send_message(
-                        f"Talk '{talk}' does not have a start() function.",
-                        ephemeral=True
-                    )
-            except Exception as e:
-                await interaction.response.send_message(
-                    f"Failed to load talk '{talk}': {e}",
-                    ephemeral=True
-                )
-
-        self.serene_group.add_command(start)
-
-    async def autocomplete_talking(self, interaction: discord.Interaction, current: str):
-        talk_path = os.path.join(os.path.dirname(__file__), "talking")
-        if not os.path.exists(talk_path):
-            return []
-
-        files = [f[:-3] for f in os.listdir(talk_path) if f.endswith(".py") and f != "__init__.py"]
-        return [
-            app_commands.Choice(name=f, value=f)
-            for f in files if current.lower() in f.lower()
-        ]
-
+                    print(f"[!] {file} does not define a 'command' object.")
 
 async def setup(bot):
     await bot.add_cog(TalkCommands(bot))

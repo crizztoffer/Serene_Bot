@@ -49,7 +49,10 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             (count,) = await cursor.fetchone()
             if count == 0:
                 initial_json_data = json.dumps({"warnings": {}})
-                await cursor.execute("INSERT INTO discord_users (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)", (str(guild_id), user_name, str(discord_id), 0, initial_json_data))
+                await cursor.execute(
+                    "INSERT INTO discord_users (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
+                    (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
+                )
                 logger.info(f"Added new user '{user_name}' to DB.")
     except Exception as e:
         logger.error(f"DB error: {e}")
@@ -57,11 +60,34 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
         if conn:
             await conn.ensure_closed()
 
-# Other DB functions (update_user_kekchipz, get_user_kekchipz) follow same pattern
+async def load_flag_reasons():
+    """Load flag reasons from DB and store on bot."""
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        logger.error("Missing DB credentials, cannot load flag reasons.")
+        bot.flag_reasons = []
+        return
+
+    conn = None
+    try:
+        conn = await aiomysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users", charset='utf8mb4', autocommit=True)
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT reason FROM rule_flagging")
+            rows = await cursor.fetchall()
+            bot.flag_reasons = [row[0] for row in rows]
+            logger.info(f"Loaded {len(bot.flag_reasons)} flag reasons from DB.")
+    except Exception as e:
+        logger.error(f"Failed to load flag reasons: {e}")
+        bot.flag_reasons = []
+    finally:
+        if conn:
+            await conn.ensure_closed()
 
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user}.")
+
+    # Load flag reasons before loading cogs (so autocomplete can use them)
+    await load_flag_reasons()
 
     await load_cogs()
     try:
@@ -101,6 +127,7 @@ async def on_command_error(ctx, error):
 
 @tasks.loop(hours=1)
 async def hourly_db_check():
+    conn = None
     try:
         conn = await aiomysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users", charset='utf8mb4', autocommit=True)
         logger.info("DB connection OK.")

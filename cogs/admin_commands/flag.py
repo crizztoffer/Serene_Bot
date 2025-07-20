@@ -94,12 +94,11 @@ class FlagCancelButton(Button):
         # Disable all controls in the view to prevent further interaction
         for item in self.view.children:
             item.disabled = True
-        
+
         # Edit the original ephemeral message to reflect disabled controls
         await interaction.response.edit_message(view=self.view)
-        
-        # Send a follow-up ephemeral message to confirm cancellation
-        await interaction.followup.send("Cancelled.", ephemeral=True)
+
+        # DO NOT send a followup or another response here to avoid InteractionResponded error
 
 
 class FlagView(View):

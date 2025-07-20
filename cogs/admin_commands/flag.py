@@ -4,35 +4,32 @@ from __future__ import annotations
 
 import discord
 from discord import app_commands, User
-from discord.ext import commands
 import json
 import aiomysql
 import logging
 
 logger = logging.getLogger(__name__)
 
-# --- Autocomplete handler ---
-async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
-    reasons = getattr(interaction.client, "flag_reasons", [])
-    return [
+# This will be dynamically populated from the DB
+reason_choices = []
+
+def setup_flag_command(bot, admin_group: app_commands.Group):
+    global reason_choices
+    reasons = getattr(bot, "flag_reasons", [])
+
+    reason_choices = [
         app_commands.Choice(name=reason.title(), value=reason)
-        for reason in reasons if current.lower() in reason.lower()
-    ][:25]
+        for reason in reasons[:25]
+    ]
 
-# --- Cog class that holds the flag command ---
-class FlagCommand(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    @app_commands.command(name="flag", description="Flag a user for a rule violation.")
+    @admin_group.command(name="flag", description="Flag a user for a rule violation.")
     @app_commands.describe(reason="Choose a reason", user="User to flag")
-    @app_commands.autocomplete(reason=autocomplete_flag_reasons)
-    async def flag(self, interaction: discord.Interaction, reason: str, user: User):
+    async def flag(interaction: discord.Interaction, reason: app_commands.Choice[str], user: User):
         await interaction.response.defer(ephemeral=True)
 
-        db_user = self.bot.db_user
-        db_password = self.bot.db_password
-        db_host = self.bot.db_host
+        db_user = interaction.client.db_user
+        db_password = interaction.client.db_password
+        db_host = interaction.client.db_host
 
         if not all([db_user, db_password, db_host]):
             await interaction.followup.send("Database credentials are not configured.", ephemeral=True)
@@ -55,7 +52,7 @@ class FlagCommand(commands.Cog):
 
                 if not row:
                     logger.info(f"{user.display_name} not in DB. Attempting to add.")
-                    await self.bot.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
+                    await interaction.client.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
                     await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
                     row = await cursor.fetchone()
                     if not row:
@@ -67,16 +64,18 @@ class FlagCommand(commands.Cog):
                 flags = warnings.setdefault("flags", [])
                 strikes = warnings.setdefault("strikes", [])
 
-                if any(f.get("reason") == reason for f in flags):
-                    strike_count = sum(1 for s in strikes if s.get("reason") == reason)
+                reason_str = reason.value
+
+                if any(f.get("reason") == reason_str for f in flags):
+                    strike_count = sum(1 for s in strikes if s.get("reason") == reason_str)
                     strikes.append({
-                        "reason": reason,
+                        "reason": reason_str,
                         "strike_number": strike_count + 1,
                         "timestamp": discord.utils.utcnow().isoformat()
                     })
                 else:
                     flags.append({
-                        "reason": reason,
+                        "reason": reason_str,
                         "seen": False,
                         "timestamp": discord.utils.utcnow().isoformat()
                     })
@@ -84,7 +83,7 @@ class FlagCommand(commands.Cog):
                 json_data["warnings"] = {"flags": flags, "strikes": strikes}
                 await cursor.execute("UPDATE discord_users SET json_data = %s WHERE discord_id = %s", (json.dumps(json_data), str(user.id)))
 
-            await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason}**", ephemeral=True)
+            await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason_str}**", ephemeral=True)
 
         except Exception as e:
             logger.error(f"DB error: {e}", exc_info=True)
@@ -93,7 +92,11 @@ class FlagCommand(commands.Cog):
             if conn:
                 await conn.ensure_closed()
 
-# --- Register with the admin group ---
+    # Dynamically attach the choices
+    param_list = flag.parameters
+    for param in param_list:
+        if param.name == "reason":
+            param.choices = reason_choices
+
 def start(admin_group: app_commands.Group, bot):
-    cog = FlagCommand(bot)
-    admin_group.add_command(cog.flag)
+    setup_flag_command(bot, admin_group)

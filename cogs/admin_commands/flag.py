@@ -1,7 +1,6 @@
 # --- cogs/admin_commands/flag.py ---
 
 import discord
-from discord import app_commands
 from discord.ui import View, Select, UserSelect
 import logging
 
@@ -54,15 +53,13 @@ class FlagView(View):
         self.add_item(FlagReasonSelect(reasons))
         self.add_item(FlagUserSelect())
 
-        # Submit button can be added here later
 
-
-async def start(admin_group: app_commands.Group, bot):
-    @app_commands.command(name="flag", description="Flag one or more users for moderation review.")
-    async def flag_command(interaction: discord.Interaction):
+async def start(serene_group, bot):
+    # This is called directly by /serene admin flag
+    async def run_flag_ui(interaction: discord.Interaction):
         reasons = getattr(bot, "flag_reasons", [])
         if not reasons:
-            await interaction.response.send_message("❌ No flag reasons found.", ephemeral=True)
+            await interaction.response.send_message("❌ No flag reasons configured.", ephemeral=True)
             return
 
         embed = discord.Embed(
@@ -73,9 +70,8 @@ async def start(admin_group: app_commands.Group, bot):
         embed.set_footer(text="Admins only — all actions are logged.")
 
         view = FlagView(reasons)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-        # Properly defer the interaction before sending view
-        await interaction.response.defer(ephemeral=True)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
-    admin_group.add_command(flag_command)
+    # Call the UI directly from the interaction
+    ctx = await bot.get_context_from_interaction()
+    await run_flag_ui(ctx.interaction)

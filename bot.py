@@ -1,191 +1,105 @@
-# --- bot.py ---
+# --- cogs/admin_commands/flag.py ---
+
+from __future__ import annotations
 
 import discord
-from discord.ext import commands, tasks
-from discord import app_commands
-import os
-from dotenv import load_dotenv
-import aiomysql
+from discord import app_commands, User
 import json
+import aiomysql
 import logging
 
-# Load env vars
-load_dotenv()
-
-TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
-DB_HOST = os.getenv("DB_HOST")
-
-BOT_PREFIX = "!"
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-intents.presences = True
-
-bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
-
-# Add /serene group BEFORE cog loading
-serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
-bot.tree.add_command(serene_group)
-
-# Logging setup
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# DB methods
-async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
-    """Adds a user to the database if they do not already exist."""
-    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
-        logger.error("Missing DB credentials.")
+# Autocomplete callback with logging
+async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
+    reasons = getattr(interaction.client, "flag_reasons", [])
+    logger.info(f"Autocomplete requested, current input: '{current}', available reasons: {reasons}")
+    return [
+        app_commands.Choice(name=reason, value=reason)
+        for reason in reasons
+        if current.lower() in reason.lower()
+    ]
+
+@app_commands.describe(reason="Choose a reason from the rules", user="User to flag")
+@app_commands.autocomplete(reason=autocomplete_flag_reasons)
+async def flag_command(
+    interaction: discord.Interaction,
+    reason: str,
+    user: User
+):
+    await interaction.response.defer(ephemeral=True)
+
+    db_user = interaction.client.db_user
+    db_password = interaction.client.db_password
+    db_host = interaction.client.db_host
+
+    if not all([db_user, db_password, db_host]):
+        await interaction.followup.send("Database credentials are not configured.", ephemeral=True)
+        logger.error("Missing DB credentials in flag_command.")
         return
 
     conn = None
     try:
         conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
+            host=db_host,
+            user=db_user,
+            password=db_password,
             db="serene_users",
             charset='utf8mb4',
             autocommit=True
         )
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s", (str(guild_id), str(discord_id)))
-            (count,) = await cursor.fetchone()
-            if count == 0:
-                initial_json_data = json.dumps({"warnings": {}})
-                await cursor.execute(
-                    "INSERT INTO discord_users (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
-                )
-                logger.info(f"Added new user '{user_name}' to DB.")
+            await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
+            row = await cursor.fetchone()
+
+            if not row:
+                logger.info(f"{user.display_name} not found in DB, adding...")
+                await interaction.client.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
+                await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
+                row = await cursor.fetchone()
+                if not row:
+                    await interaction.followup.send("Could not add user to DB.", ephemeral=True)
+                    return
+
+            json_data = json.loads(row[0])
+            warnings = json_data.get("warnings", {})
+            flags = warnings.setdefault("flags", [])
+            strikes = warnings.setdefault("strikes", [])
+
+            # Check if already flagged for this reason
+            if any(f.get("reason") == reason for f in flags):
+                strike_count = sum(1 for s in strikes if s.get("reason") == reason)
+                strikes.append({
+                    "reason": reason,
+                    "strike_number": strike_count + 1,
+                    "timestamp": discord.utils.utcnow().isoformat()
+                })
+                logger.info(f"Added strike {strike_count + 1} for reason '{reason}' to user {user.display_name}")
+            else:
+                flags.append({
+                    "reason": reason,
+                    "seen": False,
+                    "timestamp": discord.utils.utcnow().isoformat()
+                })
+                logger.info(f"Added new flag for reason '{reason}' to user {user.display_name}")
+
+            json_data["warnings"] = {"flags": flags, "strikes": strikes}
+            await cursor.execute("UPDATE discord_users SET json_data = %s WHERE discord_id = %s", (json.dumps(json_data), str(user.id)))
+
+        await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason}**", ephemeral=True)
+
     except Exception as e:
-        logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
+        logger.error(f"DB error in flag_command: {e}", exc_info=True)
+        await interaction.followup.send("An error occurred while flagging.", ephemeral=True)
     finally:
         if conn:
             await conn.ensure_closed()
 
-# Attach the function to the bot object so it can be accessed by other modules
-bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
-
-async def load_flag_reasons():
-    """Load flag reasons from DB and store on bot."""
-    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
-        logger.error("Missing DB credentials, cannot load flag reasons.")
-        bot.flag_reasons = []
-        return
-
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True
-        )
-        async with conn.cursor() as cursor:
-            await cursor.execute("SELECT reason FROM rule_flagging")
-            rows = await cursor.fetchall()
-            logger.info(f"DB rows fetched: {rows}")
-            bot.flag_reasons = [row[0] for row in rows]
-            logger.info(f"Loaded flag reasons: {bot.flag_reasons}")
-    except Exception as e:
-        logger.error(f"Failed to load flag reasons: {e}")
-        bot.flag_reasons = []
-    finally:
-        if conn:
-            await conn.ensure_closed()
-
-@bot.event
-async def on_ready():
-    logger.info(f"Logged in as {bot.user}.")
-
-    # Load flag reasons before loading cogs
-    await load_flag_reasons()
-
-    # Assign DB credentials for use in modules like flag.py
-    bot.db_user = DB_USER
-    bot.db_password = DB_PASSWORD
-    bot.db_host = DB_HOST
-
-    await load_cogs() # This will now load admin_main.py, which in turn loads flag.py
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        logger.error(f"Slash sync failed: {e}")
-
-    for guild in bot.guilds:
-        for member in guild.members:
-            if not member.bot:
-                await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
-
-    hourly_db_check.start()
-
-@bot.event
-async def on_member_join(member):
-    if not member.bot:
-        await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
-
-@bot.event
-async def on_message(message):
-    if message.author.id != bot.user.id:
-        await bot.process_commands(message)
-
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.send("Command not found.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument: {error.param.name}.")
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send("You lack permissions.")
-    else:
-        logger.error(f"Command error: {error}")
-        await ctx.send(f"Unexpected error: {error}")
-
-@tasks.loop(hours=1)
-async def hourly_db_check():
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True
-        )
-        logger.info("DB connection OK.")
-    except Exception as e:
-        logger.error(f"Hourly DB check failed: {e}")
-    finally:
-        if conn:
-            await conn.ensure_closed()
-
-async def load_cogs():
-    """Loads all cogs from the 'cogs' directory."""
-    if not os.path.exists("cogs"):
-        os.makedirs("cogs")
-    for filename in os.listdir("cogs"):
-        if filename.endswith(".py"):
-            try:
-                await bot.load_extension(f"cogs.{filename[:-3]}")
-                logger.info(f"Loaded cog {filename}")
-            except Exception as e:
-                logger.error(f"Failed to load cog {filename}: {e}")
-
-async def main():
-    if not TOKEN:
-        logger.error("BOT_TOKEN missing")
-        return
-    await bot.start(TOKEN)
-
-if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+# Hook for admin_main.py or other loaders
+def start(admin_group: app_commands.Group, bot):
+    command = app_commands.Command(
+        name="flag",
+        description="Flag a user for a rule violation.",
+        callback=flag_command
+    )
+    admin_group.add_command(command)

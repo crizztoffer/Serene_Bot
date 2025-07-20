@@ -3,7 +3,7 @@
 from __future__ import annotations # Defer evaluation of type hints
 
 import discord
-from discord import app_commands
+from discord import app_commands, User # Explicitly import User
 from typing import List
 import json
 import aiomysql
@@ -28,7 +28,7 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
 async def flag_command(
     interaction: discord.Interaction,
     reason: str,
-    users: "List[discord.User]" # Changed to string literal type hint
+    users: "List[User]" # Changed to string literal type hint with direct User import
 ):
     """
     Flags specified users for a given reason.

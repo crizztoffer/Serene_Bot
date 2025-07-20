@@ -1,114 +1,104 @@
 import discord
-from discord import app_commands
 from discord.ext import commands
 import json
-import pymysql
-import os
+import aiomysql
+import re
 
-DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "database": os.getenv("DB_NAME"),
-    "cursorclass": pymysql.cursors.DictCursor
-}
-
-# Store reasons in memory after DB fetch
-reasons_cache = {}
-
-class ReasonTransformer(app_commands.Transformer):
-    async def autocomplete(self, interaction: discord.Interaction, current: str):
-        try:
-            connection = pymysql.connect(**DB_CONFIG)
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT reason FROM rule_flagging")
-                results = cursor.fetchall()
-                matches = [r["reason"] for r in results if current.lower() in r["reason"].lower()]
-                return [app_commands.Choice(name=r, value=r) for r in matches[:25]]
-        except Exception as e:
-            print(f"[Autocomplete Error]: {e}")
-            return []
-
-@app_commands.command(name="flag", description="Flag one or more users for a rule violation.")
-@app_commands.describe(reason="The rule violation reason", users="Users to flag")
-async def command(
-    interaction: discord.Interaction,
-    reason: app_commands.Transform[str, ReasonTransformer],
-    users: app_commands.Transform[list[discord.User], app_commands.Greedy[discord.User]]
-):
+async def start(interaction: discord.Interaction, bot: commands.Bot):
     await interaction.response.defer(ephemeral=True)
 
-    if not users:
-        await interaction.followup.send("No users specified.")
-        return
-
-    flagged = []
-    struck = []
-
     try:
-        connection = pymysql.connect(**DB_CONFIG)
-        with connection.cursor() as cursor:
-            # --- Step 1: Get action from rule_flagging table ---
-            cursor.execute("SELECT action FROM rule_flagging WHERE reason = %s", (reason,))
-            result = cursor.fetchone()
-            if not result:
-                await interaction.followup.send(f"Reason '{reason}' not found in database.")
+        # Parse the command options
+        options = {opt.name: opt.value for opt in interaction.data.get("options", [])}
+        reason = options.get("reason")
+        mentions_input = options.get("users")
+
+        if not reason or not mentions_input:
+            await interaction.followup.send("You must provide a reason and at least one user mention.", ephemeral=True)
+            return
+
+        # Extract user IDs from the mentions
+        user_ids = [int(uid) for uid in re.findall(r"<@!?(\d+)>", mentions_input)]
+
+        if not user_ids:
+            await interaction.followup.send("No valid user mentions found.", ephemeral=True)
+            return
+
+        # Connect to MySQL
+        conn = await aiomysql.connect(
+            host=bot.db_host,
+            user=bot.db_user,
+            password=bot.db_pass,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            # Check the reason in the rule_flagging table
+            await cursor.execute("SELECT action FROM rule_flagging WHERE reason = %s", (reason,))
+            rule = await cursor.fetchone()
+
+            if not rule:
+                await interaction.followup.send(f"The reason '{reason}' is not a valid rule violation.", ephemeral=True)
                 return
 
-            action_type = result["action"]
+            action_type = rule["action"].lower()
 
-            for user in users:
-                cursor.execute("SELECT moderation_data FROM users WHERE discord_id = %s", (str(user.id),))
-                row = cursor.fetchone()
+            updates = []
+            for uid in user_ids:
+                await cursor.execute("SELECT flags FROM user_data WHERE discord_id = %s", (uid,))
+                row = await cursor.fetchone()
 
-                if not row:
-                    continue
-
-                moderation_data = json.loads(row.get("moderation_data", "{}"))
-                warnings = moderation_data.get("warnings", {})
-                flags = warnings.get("flags", [])
-                strikes = warnings.get("strikes", [])
-
-                # --- Flags and Strikes Logic ---
-                already_flagged = any(f["reason"] == reason for f in flags)
-                current_strikes = [s for s in strikes if s["reason"] == reason]
-                next_strike = 1 if not current_strikes else max(s["strike_number"] for s in current_strikes) + 1
-
-                if action_type == "ban":
-                    if not already_flagged:
-                        flags.append({ "reason": reason, "seen": False })
-                    for i in range(1, 4):  # Insert 3 strikes
-                        strikes.append({ "reason": reason, "strike_number": i })
-                    struck.append(user.mention + " (auto-ban level)")
-                else:
-                    if not already_flagged:
-                        flags.append({ "reason": reason, "seen": False })
-                        flagged.append(user.mention)
-                    else:
-                        strikes.append({ "reason": reason, "strike_number": next_strike })
-                        struck.append(user.mention)
-
-                new_data = {
+                user_flags = {
                     "warnings": {
-                        "flags": flags,
-                        "strikes": strikes
+                        "flags": [],
+                        "strikes": []
                     }
                 }
 
-                cursor.execute(
-                    "UPDATE users SET moderation_data = %s WHERE discord_id = %s",
-                    (json.dumps(new_data), str(user.id))
+                if row and row.get("flags"):
+                    try:
+                        user_flags = json.loads(row["flags"])
+                    except json.JSONDecodeError:
+                        pass  # fallback to empty structure if bad JSON
+
+                flags = user_flags["warnings"]["flags"]
+                strikes = user_flags["warnings"]["strikes"]
+
+                already_flagged = any(f["reason"] == reason for f in flags)
+                new_strike_count = sum(1 for s in strikes if s["reason"] == reason) + 1
+
+                if action_type == "ban":
+                    # Insert flag and 3 strikes
+                    flags.append({"reason": reason, "seen": False})
+                    for i in range(1, 4):
+                        strikes.append({"reason": reason, "strike_number": i})
+                else:
+                    if already_flagged:
+                        strikes.append({
+                            "reason": reason,
+                            "strike_number": new_strike_count
+                        })
+                    else:
+                        flags.append({
+                            "reason": reason,
+                            "seen": False
+                        })
+
+                updated_json = json.dumps(user_flags)
+
+                await cursor.execute(
+                    "UPDATE user_data SET flags = %s WHERE discord_id = %s",
+                    (updated_json, uid)
                 )
 
-            connection.commit()
+                user_obj = await bot.fetch_user(uid)
+                updates.append(f"{user_obj.mention} — {'Flagged and Banned' if action_type == 'ban' else ('Strike Added' if already_flagged else 'Flag Added')}")
 
-        msg = ""
-        if flagged:
-            msg += f"🚩 **Flagged**: {', '.join(flagged)} for `{reason}`\n"
-        if struck:
-            msg += f"⚠️ **Struck**: {', '.join(struck)} for `{reason}`"
-
-        await interaction.followup.send(msg or "No action taken.")
+        await interaction.followup.send(
+            f"✅ Processed {len(user_ids)} user(s) for reason: **{reason}**\n\n" + "\n".join(updates),
+            ephemeral=True
+        )
 
     except Exception as e:
-        await interaction.followup.send(f"Error during flagging: {e}")
+        await interaction.followup.send(f"❌ An error occurred: {e}", ephemeral=True)

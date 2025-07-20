@@ -1,6 +1,6 @@
 # --- cogs/admin_commands/view.py ---
 
-from __future__ import annotations  # Defer evaluation of type hints
+from __future__ import annotations
 
 import discord
 from discord import app_commands
@@ -9,20 +9,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-@app_commands.command(
-    name="view",
-    description="View flagged users."
-)
 @app_commands.checks.has_permissions(administrator=True)
 async def view_command(interaction: discord.Interaction):
-    """
-    Creates an embed with a link to view flagged users.
-    The link is presented as a button that only admins can interact with.
-    """
     await interaction.response.defer(ephemeral=True)
 
-    # Replace this with your actual admin dashboard URL
-    view_url = "https://example.com/admin/flagged_users"
+    view_url = "https://example.com/admin/flagged_users"  # Replace with real dashboard URL
 
     embed = discord.Embed(
         title="Flagged Users Dashboard",
@@ -45,5 +36,12 @@ async def view_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     logger.info(f"Admin {interaction.user.display_name} requested to view flagged users.")
 
-# ✅ Expose for dynamic import
-command = view_command
+# Hook for admin_main.py
+async def start(admin_group: app_commands.Group, bot):
+    command = app_commands.Command(
+        name="view",
+        description="View flagged users.",
+        callback=view_command
+    )
+    admin_group.add_command(command)
+    logger.info("View command added to '/serene admin' group.")

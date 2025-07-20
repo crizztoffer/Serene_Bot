@@ -19,7 +19,7 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
         if current.lower() in reason.lower()
     ]
 
-# ✅ Put these decorators back — they modify the function metadata
+@app_commands.command(name="flag", description="Flag a user for a rule violation.")
 @app_commands.describe(
     reason="Choose a reason from the rules",
     user="User to flag"
@@ -118,12 +118,5 @@ async def flag_command(
         if conn:
             await conn.ensure_closed()
 
-# Register the command using the wrapped function
-async def start(admin_group: app_commands.Group, bot):
-    command = app_commands.Command(
-        name="flag",
-        description="Flag a user for a rule violation.",
-        callback=flag_command
-    )
-    admin_group.add_command(command)
-    logger.info("Flag command added to '/serene admin' group.")
+# ✅ Export the command so it can be registered by admin_main.py
+command = flag_command

@@ -10,7 +10,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Autocomplete callback for 'reason'
+# Autocomplete callback
 async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
     reasons = getattr(interaction.client, "flag_reasons", [])
     return [
@@ -19,11 +19,8 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
         if current.lower() in reason.lower()
     ]
 
-# Define the flag command
-@app_commands.describe(
-    reason="Choose a reason from the rules",
-    user="User to flag"
-)
+# Define subcommand
+@app_commands.describe(reason="Choose a reason from the rules", user="User to flag")
 @app_commands.autocomplete(reason=autocomplete_flag_reasons)
 async def flag_command(
     interaction: discord.Interaction,
@@ -37,8 +34,8 @@ async def flag_command(
     db_host = interaction.client.db_host
 
     if not all([db_user, db_password, db_host]):
-        await interaction.followup.send("Database credentials are not configured. Cannot flag user.", ephemeral=True)
-        logger.error("Missing DB credentials in flag_command.")
+        await interaction.followup.send("Database credentials are not configured.", ephemeral=True)
+        logger.error("Missing DB credentials.")
         return
 
     conn = None
@@ -52,25 +49,16 @@ async def flag_command(
             autocommit=True
         )
         async with conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT json_data FROM discord_users WHERE discord_id = %s",
-                (str(user.id),)
-            )
+            await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
             row = await cursor.fetchone()
 
             if not row:
-                logger.info(f"User {user.display_name} ({user.id}) not found in DB. Adding now.")
-                await interaction.client.add_user_to_db_if_not_exists(
-                    interaction.guild_id, user.display_name, user.id
-                )
-                await cursor.execute(
-                    "SELECT json_data FROM discord_users WHERE discord_id = %s",
-                    (str(user.id),)
-                )
+                logger.info(f"{user.display_name} not in DB. Attempting to add.")
+                await interaction.client.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
+                await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
                 row = await cursor.fetchone()
                 if not row:
-                    await interaction.followup.send(f"Could not find or add user {user.display_name} to database.", ephemeral=True)
-                    logger.error(f"Failed to add user {user.display_name} to DB.")
+                    await interaction.followup.send("Could not add user to DB.", ephemeral=True)
                     return
 
             json_data = json.loads(row[0])
@@ -78,52 +66,37 @@ async def flag_command(
             flags = warnings.setdefault("flags", [])
             strikes = warnings.setdefault("strikes", [])
 
-            flag_exists = any(flag.get("reason") == reason for flag in flags)
-            if flag_exists:
+            if any(f.get("reason") == reason for f in flags):
                 strike_count = sum(1 for s in strikes if s.get("reason") == reason)
                 strikes.append({
                     "reason": reason,
                     "strike_number": strike_count + 1,
                     "timestamp": discord.utils.utcnow().isoformat()
                 })
-                logger.info(f"Added strike for {user.display_name} for reason: {reason}. Total strikes: {strike_count + 1}")
             else:
                 flags.append({
                     "reason": reason,
                     "seen": False,
                     "timestamp": discord.utils.utcnow().isoformat()
                 })
-                logger.info(f"Flagged {user.display_name} for reason: {reason}.")
 
-            json_data["warnings"] = {
-                "flags": flags,
-                "strikes": strikes
-            }
+            json_data["warnings"] = {"flags": flags, "strikes": strikes}
+            await cursor.execute("UPDATE discord_users SET json_data = %s WHERE discord_id = %s", (json.dumps(json_data), str(user.id)))
 
-            updated_json = json.dumps(json_data)
-            await cursor.execute(
-                "UPDATE discord_users SET json_data = %s WHERE discord_id = %s",
-                (updated_json, str(user.id))
-            )
-
-        await interaction.followup.send(
-            f"✅ **{user.display_name}** has been flagged for: **{reason}**",
-            ephemeral=True
-        )
+        await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason}**", ephemeral=True)
 
     except Exception as e:
-        logger.error(f"Database error in flag_command: {e}", exc_info=True)
-        await interaction.followup.send(f"An error occurred while flagging: {e}", ephemeral=True)
+        logger.error(f"DB error: {e}", exc_info=True)
+        await interaction.followup.send("An error occurred while flagging.", ephemeral=True)
     finally:
         if conn:
             await conn.ensure_closed()
 
 # Hook for admin_main.py
-async def start(admin_group: app_commands.Group, bot):
+def start(admin_group: app_commands.Command, bot):
     command = app_commands.Command(
         name="flag",
         description="Flag a user for a rule violation.",
         callback=flag_command
     )
     admin_group.add_command(command)
-    logger.info("Flag command added to '/serene admin' group.")

@@ -507,13 +507,14 @@ class TexasHoldEmGameView(discord.ui.View):
                     raise_amount = random.choice([10, 25]) # Aggressive raise
                 else: # 20% chance to check (for deception)
                     dealer_action = 1 # Check
-            elif bot_hand_rank >= 4: # Medium hand: Three of a Kind, Straight, Flush
+            # MODIFIED: Two Pair (rank 3) is now considered a medium hand
+            elif bot_hand_rank >= 3: # Medium hand: Two Pair, Three of a Kind, Straight, Flush
                 if random.random() < 0.5: # 50% chance to raise
                     dealer_action = 2 # Raise
                     raise_amount = random.choice([5, 10]) # Moderate raise
                 else: # 50% chance to check
                     dealer_action = 1 # Check
-            else: # Weak hand: High Card, One Pair, Two Pair
+            else: # Weak hand: High Card, One Pair (ranks 1, 2)
                 if random.random() < 0.2: # 20% chance to bluff raise
                     dealer_action = 2 # Raise
                     raise_amount = random.choice([5]) # Small bluff raise

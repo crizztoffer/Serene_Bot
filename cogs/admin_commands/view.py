@@ -31,7 +31,7 @@ async def view_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 # Hook
-def start(admin_group: app_commands.Command, bot):
+async def start(admin_group: app_commands.Group, bot):
     command = app_commands.Command(
         name="view",
         description="View flagged users.",

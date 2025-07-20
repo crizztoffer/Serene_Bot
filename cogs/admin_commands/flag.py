@@ -19,12 +19,7 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
         if current.lower() in reason.lower()
     ]
 
-@app_commands.command(name="flag", description="Flag a user for a rule violation.")
-@app_commands.describe(
-    reason="Choose a reason from the rules",
-    user="User to flag"
-)
-@app_commands.autocomplete(reason=autocomplete_flag_reasons)
+# Define the command as a regular function, no decorators
 async def flag_command(
     interaction: discord.Interaction,
     reason: str,
@@ -118,6 +113,15 @@ async def flag_command(
         if conn:
             await conn.ensure_closed()
 
+# Setup function that adds the command to the admin group
 async def start(admin_group: app_commands.Group, bot):
-    admin_group.add_command(flag_command)
+    command = app_commands.Command(
+        name="flag",
+        description="Flag a user for a rule violation.",
+        callback=flag_command
+    )
+    command.describe(reason="Choose a reason from the rules", user="User to flag")
+    command.autocomplete("reason")(autocomplete_flag_reasons)
+    
+    admin_group.add_command(command)
     logger.info("Flag command added to '/serene admin' group.")

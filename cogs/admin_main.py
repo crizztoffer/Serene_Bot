@@ -29,7 +29,7 @@ class AdminCommands(commands.Cog):
                 spec.loader.exec_module(module)
 
                 if hasattr(module, "start"):
-                    await module.start(self.serene_group, self.bot)
+                    await module.start(self.serene_group, self.bot, interaction)
                 else:
                     await interaction.response.send_message(f"Task '{task_name}' does not have a start() function.", ephemeral=True)
             except Exception as e:

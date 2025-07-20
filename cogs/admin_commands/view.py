@@ -9,7 +9,10 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# The command callback — no decorator here!
+@app_commands.command(
+    name="view",
+    description="View flagged users."
+)
 @app_commands.checks.has_permissions(administrator=True)
 async def view_command(interaction: discord.Interaction):
     """
@@ -42,14 +45,5 @@ async def view_command(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
     logger.info(f"Admin {interaction.user.display_name} requested to view flagged users.")
 
-# This is called by admin_main.py
-async def start(admin_group: app_commands.Group, bot):
-    command = app_commands.Command(
-        name="view",
-        description="View flagged users.",
-        callback=view_command
-    )
-    command.default_permissions = discord.Permissions(administrator=True)
-
-    admin_group.add_command(command)
-    logger.info("View command added to '/serene admin' group.")
+# ✅ Expose for dynamic import
+command = view_command

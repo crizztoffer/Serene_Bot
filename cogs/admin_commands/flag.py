@@ -92,10 +92,11 @@ async def start(serene_group, bot, interaction: discord.Interaction):
     embed = discord.Embed(
         title="🚩 Flag Users",
         description=(
-            "1. Select a **reason** from the dropdown.\n"
-            "2. Select one or more **users** to flag.\n"
-            "3. Click **Confirm Flag** when ready.\n\n"
-            "📝 A comment field will be added later."
+            "Serene Bot will handle the hassle of administrating disciplinary actions towards a user or group of users.\n"
+            "It does this by checking each discord user's flag status for the given reason you specify below, and if \n"
+            "flag for it already exists, Serene Bot automatically administers the first strike. If a strike or strikes \n"
+            "have already been administered, Serene Bot will automatically increase the strike until the third, in \n"
+            "case, the user(s) will be banned from the server."
         ),
         color=discord.Color.orange()
     )

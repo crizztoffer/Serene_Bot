@@ -159,10 +159,10 @@ class FlagView(View):
         self.add_item(ConfirmButton())
 
 
-async def start(admin_group: app_commands.Group, bot):
+async def start(admin_group: app_commands.Group, bot, client):
     @app_commands.command(name="flag", description="Flag one or more users for moderation review.")
     async def flag_command(interaction: discord.Interaction):
-        reasons = getattr(bot, "flag_reasons", [])
+        reasons = getattr(client, "flag_reasons", [])
         if not reasons:
             await interaction.response.send_message("⚠️ No flag reasons found in configuration.", ephemeral=True)
             return

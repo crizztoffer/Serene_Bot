@@ -8,10 +8,15 @@ import aiomysql
 logger = logging.getLogger(__name__)
 
 class FlagReasonSelect(Select):
-    def __init__(self, reasons: list[str]):
-        options = [
-            discord.SelectOption(label=reason, value=reason) for reason in reasons
-        ]
+    def __init__(self, reasons: list[str], current_selection: str = None):
+        self.all_reasons = reasons # Store all reasons to re-create options if needed
+        options = []
+        for reason in reasons:
+            option = discord.SelectOption(label=reason, value=reason)
+            if reason == current_selection:
+                option.default = True # Mark this option as selected
+            options.append(option)
+
         super().__init__(
             placeholder="Select a reason to flag",
             min_values=1,
@@ -22,22 +27,48 @@ class FlagReasonSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_reason = self.values[0]
+        # Re-create the select with the new default
+        self.view.reason_select = FlagReasonSelect(self.all_reasons, self.view.selected_reason)
+        # Remove and re-add the item to update its position in the view
+        self.view.remove_item(self) # Remove the old instance
+        self.view.add_item(self.view.reason_select) # Add the new instance at the same logical position
+
         # Enable confirm button if both reason and users are selected
         self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
         await interaction.response.edit_message(view=self.view)
 
 
 class FlagUserSelect(UserSelect):
-    def __init__(self):
+    def __init__(self, current_selections: list[discord.User] = None):
+        # UserSelect handles defaults differently, you can't set `default=True` on options like Select
+        # The selected users are automatically managed by Discord if the view isn't recreated.
+        # However, since we are re-editing the message, we need to consider how to visually represent this.
+        # For UserSelect, the default behavior is often good enough if you're managing `selected_users`
+        # on the view. The issue is more pronounced with standard Select options.
         super().__init__(
             placeholder="Select user(s) to flag",
             min_values=1,
             max_values=5,
             custom_id="flag_users"
         )
+        # Store current selections if needed, though UserSelect often handles this visually on re-render
+        # if the interaction is with itself. The problem arises when a *different* component causes the re-render.
+        self.current_selected_users = current_selections if current_selections is not None else []
+
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_users = self.values
+        # For UserSelect, Discord typically handles the display of selected users internally
+        # when the message is edited with the same view instance.
+        # However, if you need to "force" the re-selection visual when *another* component
+        # triggers the edit, you'd need to recreate the UserSelect instance similarly to FlagReasonSelect
+        # For simplicity, let's just make sure the confirm button is updated.
+
+        # Re-create the select with the new default users (this is more for visual consistency)
+        self.view.user_select = FlagUserSelect(self.view.selected_users)
+        self.view.remove_item(self)
+        self.view.add_item(self.view.user_select)
+
         # Enable confirm button if both reason and users are selected
         self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
         await interaction.response.edit_message(view=self.view)
@@ -56,14 +87,13 @@ class FlagConfirmButton(Button):
         view: FlagView = self.view
 
         if not view.selected_reason or not view.selected_users:
-            # This should ideally not be reached if button is properly disabled
             await interaction.response.send_message(
                 "⚠️ Please select both a reason and at least one user before confirming.",
                 ephemeral=True
             )
             return
 
-        bot = interaction.client  # Get your bot instance
+        bot = interaction.client
 
         db_user = getattr(bot, "db_user", None)
         db_password = getattr(bot, "db_password", None)
@@ -96,7 +126,6 @@ class FlagConfirmButton(Button):
 
                         if not row:
                             logger.info(f"{user.display_name} not in DB. Attempting to add.")
-                            # Assumes bot has this method, else you must implement it
                             if hasattr(bot, 'add_user_to_db_if_not_exists'):
                                 await bot.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
                             else:
@@ -107,7 +136,7 @@ class FlagConfirmButton(Button):
                             row = await cursor.fetchone()
                             if not row:
                                 logger.error(f"Could not add user {user.display_name} to DB after initial attempt.")
-                                continue  # Skip this user
+                                continue
 
                         json_data = json.loads(row[0])
                         warnings = json_data.setdefault("warnings", {})
@@ -139,32 +168,31 @@ class FlagConfirmButton(Button):
                     except Exception as e:
                         logger.error(f"Failed to process user {user} ({user.id}) for flagging: {e}", exc_info=True)
 
-            # Remove all components by setting view=None
             if flagged_mentions:
                 mentions_str = ", ".join(flagged_mentions)
                 await interaction.response.edit_message(
                     content=f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
-                    view=None, # Set view to None to remove all components
+                    view=None,
                     embed=None
                 )
             else:
-                await interaction.response.edit_message( # Use edit_message here for consistency
+                await interaction.response.edit_message(
                     content="⚠️ Failed to flag any users due to an internal error or processing issues.",
-                    view=None, # Remove components even on partial failure for a clean state
+                    view=None,
                     embed=None
                 )
 
         except Exception as e:
             logger.error(f"DB connection or general error during flagging: {e}", exc_info=True)
-            await interaction.response.edit_message( # Use edit_message here for consistency
+            await interaction.response.edit_message(
                 content="An error occurred while attempting to flag users.",
-                view=None, # Remove components
+                view=None,
                 embed=None
             )
 
         finally:
             if conn:
-                conn.close() # Use conn.close() for aiomysql connections
+                conn.close()
 
 class FlagCancelButton(Button):
     def __init__(self):
@@ -175,11 +203,10 @@ class FlagCancelButton(Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Edit the original ephemeral message to remove all components and update message
         await interaction.response.edit_message(
             content="🗑️ Flag operation cancelled.",
-            view=None, # Set view to None to remove all components
-            embed=None # Remove the embed
+            view=None,
+            embed=None
         )
 
 
@@ -189,10 +216,12 @@ class FlagView(View):
         self.selected_reason = None
         self.selected_users = None
 
-        self.reason_select = FlagReasonSelect(reasons)
-        self.user_select = FlagUserSelect()
+        # Pass initial selected_reason and selected_users to the select constructors
+        self.reason_select = FlagReasonSelect(reasons, self.selected_reason)
+        self.user_select = FlagUserSelect(self.selected_users) # Pass initial empty list for users
+
         self.confirm_button = FlagConfirmButton()
-        self.cancel_button = FlagCancelButton() # Corrected this line!
+        self.cancel_button = FlagCancelButton()
 
         self.add_item(self.reason_select)
         self.add_item(self.user_select)

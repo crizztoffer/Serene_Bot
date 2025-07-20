@@ -43,7 +43,14 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
 
     conn = None
     try:
-        conn = await aiomysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users", charset='utf8mb4', autocommit=True)
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
         async with conn.cursor() as cursor:
             await cursor.execute("SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s", (str(guild_id), str(discord_id)))
             (count,) = await cursor.fetchone()
@@ -69,7 +76,14 @@ async def load_flag_reasons():
 
     conn = None
     try:
-        conn = await aiomysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users", charset='utf8mb4', autocommit=True)
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
         async with conn.cursor() as cursor:
             await cursor.execute("SELECT reason FROM rule_flagging")
             rows = await cursor.fetchall()
@@ -86,8 +100,13 @@ async def load_flag_reasons():
 async def on_ready():
     logger.info(f"Logged in as {bot.user}.")
 
-    # Load flag reasons before loading cogs (so autocomplete can use them)
+    # Load flag reasons before loading cogs
     await load_flag_reasons()
+
+    # Assign DB credentials for use in modules like flag.py
+    bot.db_user = DB_USER
+    bot.db_password = DB_PASSWORD
+    bot.db_host = DB_HOST
 
     await load_cogs()
     try:
@@ -129,7 +148,14 @@ async def on_command_error(ctx, error):
 async def hourly_db_check():
     conn = None
     try:
-        conn = await aiomysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users", charset='utf8mb4', autocommit=True)
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
         logger.info("DB connection OK.")
     except Exception as e:
         logger.error(f"Hourly DB check failed: {e}")

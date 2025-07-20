@@ -1,12 +1,9 @@
-# --- cogs/admin_commands/flag.py ---
-
 import discord
 from discord import app_commands
 from discord.ui import View, Select, UserSelect, Button
 import logging
 
 logger = logging.getLogger(__name__)
-
 
 class FlagReasonSelect(Select):
     def __init__(self, reasons: list[str]):
@@ -23,7 +20,7 @@ class FlagReasonSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_reason = self.values[0]
-        # Do NOT send a message here as per your request
+        # No message here as requested
 
 
 class FlagUserSelect(UserSelect):
@@ -37,7 +34,7 @@ class FlagUserSelect(UserSelect):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_users = self.values
-        # Do NOT send a message here as per your request
+        # No message here as requested
 
 
 class FlagConfirmButton(Button):
@@ -46,7 +43,7 @@ class FlagConfirmButton(Button):
             label="Confirm Flag",
             style=discord.ButtonStyle.danger,
             custom_id="confirm_flag",
-            disabled=True  # Disabled initially
+            disabled=True
         )
 
     async def callback(self, interaction: discord.Interaction):
@@ -59,13 +56,30 @@ class FlagConfirmButton(Button):
             )
             return
 
-        # Here you can add your database flagging logic or call a method
-        flagged_mentions = ", ".join(user.mention for user in view.selected_users)
-        await interaction.response.send_message(
-            f"🚩 Flagged {flagged_mentions} for **{view.selected_reason}**.",
-            ephemeral=True
-        )
-        # Optionally log the action here
+        bot = interaction.client  # Get your bot instance
+
+        # DB logic: For each user, add flag and handle strikes/banning
+        flagged_mentions = []
+        for user in view.selected_users:
+            try:
+                # Example async DB call - replace with your actual method
+                await bot.db.add_flag(user.id, view.selected_reason)
+                flagged_mentions.append(user.mention)
+            except Exception as e:
+                logger.error(f"Failed to flag user {user} ({user.id}): {e}")
+
+        if flagged_mentions:
+            mentions_str = ", ".join(flagged_mentions)
+            await interaction.response.send_message(
+                f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
+                ephemeral=True
+            )
+            # Optionally, add logging or webhook notification here
+        else:
+            await interaction.response.send_message(
+                "⚠️ Failed to flag any users due to an internal error.",
+                ephemeral=True
+            )
 
 
 class FlagCancelButton(Button):
@@ -77,11 +91,11 @@ class FlagCancelButton(Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Defer to acknowledge interaction and prevent "This interaction failed"
-        await interaction.response.defer()
-
-        # Delete the ephemeral message containing the embed & buttons
-        await interaction.message.delete()
+        # Disable all buttons to simulate cancel
+        for item in self.view.children:
+            item.disabled = True
+        await interaction.response.edit_message(view=self.view)
+        await interaction.followup.send("Cancelled.", ephemeral=True)
 
 
 class FlagView(View):
@@ -101,7 +115,7 @@ class FlagView(View):
         self.add_item(self.cancel_button)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Enable confirm button only if both reason and users are selected
+        # Enable confirm button only if both reason and users selected
         self.confirm_button.disabled = not (self.selected_reason and self.selected_users)
         await interaction.response.edit_message(view=self)
         return True

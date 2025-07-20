@@ -28,7 +28,7 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
 async def flag_command(
     interaction: discord.Interaction,
     reason: str,
-    users: List[discord.User]
+    users: "List[discord.User]" # Changed to string literal type hint
 ):
     """
     Flags specified users for a given reason.

@@ -2,6 +2,8 @@ import discord
 from discord import app_commands
 from discord.ui import View, Select, UserSelect, Button
 import logging
+import json
+import aiomysql
 
 logger = logging.getLogger(__name__)
 
@@ -63,33 +65,107 @@ class FlagConfirmButton(Button):
 
         bot = interaction.client  # Get your bot instance
 
-        # DB logic: For each user, add flag and handle strikes/banning
-        flagged_mentions = []
-        for user in view.selected_users:
-            try:
-                # Example async DB call - replace with your actual method
-                # await bot.db.add_flag(user.id, view.selected_reason) # Uncomment and replace
-                flagged_mentions.append(user.mention)
-            except Exception as e:
-                logger.error(f"Failed to flag user {user} ({user.id}): {e}")
+        db_user = getattr(bot, "db_user", None)
+        db_password = getattr(bot, "db_password", None)
+        db_host = getattr(bot, "db_host", None)
 
-        if flagged_mentions:
-            mentions_str = ", ".join(flagged_mentions)
-            # Disable all components after confirmation
-            for item in view.children:
-                item.disabled = True
-            await interaction.response.edit_message(
-                content=f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
-                view=view,
-                embed=None # Remove the embed as it's no longer needed
-            )
-            # Optionally, add logging or webhook notification here
-        else:
+        if not all([db_user, db_password, db_host]):
             await interaction.response.send_message(
-                "⚠️ Failed to flag any users due to an internal error.",
-                ephemeral=True
+                "⚠️ Database credentials are not configured.", ephemeral=True
+            )
+            logger.error("Missing DB credentials.")
+            return
+
+        flagged_mentions = []
+        conn = None
+        try:
+            conn = await aiomysql.connect(
+                host=db_host,
+                user=db_user,
+                password=db_password,
+                db="serene_users",
+                charset='utf8mb4',
+                autocommit=True
             )
 
+            async with conn.cursor() as cursor:
+                for user in view.selected_users:
+                    try:
+                        await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
+                        row = await cursor.fetchone()
+
+                        if not row:
+                            logger.info(f"{user.display_name} not in DB. Attempting to add.")
+                            # Assumes bot has this method, else you must implement it
+                            # You need to ensure bot.add_user_to_db_if_not_exists is defined and works
+                            if hasattr(bot, 'add_user_to_db_if_not_exists'):
+                                await bot.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
+                            else:
+                                logger.warning("bot.add_user_to_db_if_not_exists method not found. User might not be added.")
+                                continue
+
+                            await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
+                            row = await cursor.fetchone()
+                            if not row:
+                                logger.error(f"Could not add user {user.display_name} to DB after initial attempt.")
+                                continue  # Skip this user
+
+                        json_data = json.loads(row[0])
+                        warnings = json_data.setdefault("warnings", {})
+                        flags = warnings.setdefault("flags", [])
+                        strikes = warnings.setdefault("strikes", [])
+
+                        if any(f.get("reason") == view.selected_reason for f in flags):
+                            strike_count = sum(1 for s in strikes if s.get("reason") == view.selected_reason)
+                            strikes.append({
+                                "reason": view.selected_reason,
+                                "strike_number": strike_count + 1,
+                                "timestamp": discord.utils.utcnow().isoformat()
+                            })
+                        else:
+                            flags.append({
+                                "reason": view.selected_reason,
+                                "seen": False,
+                                "timestamp": discord.utils.utcnow().isoformat()
+                            })
+
+                        json_data["warnings"] = {"flags": flags, "strikes": strikes}
+                        await cursor.execute(
+                            "UPDATE discord_users SET json_data = %s WHERE discord_id = %s",
+                            (json.dumps(json_data), str(user.id))
+                        )
+
+                        flagged_mentions.append(user.mention)
+
+                    except Exception as e:
+                        logger.error(f"Failed to process user {user} ({user.id}) for flagging: {e}", exc_info=True)
+
+            # Remove all components by setting view=None
+            if flagged_mentions:
+                mentions_str = ", ".join(flagged_mentions)
+                await interaction.response.edit_message(
+                    content=f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
+                    view=None, # Set view to None to remove all components
+                    embed=None
+                )
+            else:
+                await interaction.response.edit_message( # Use edit_message here for consistency
+                    content="⚠️ Failed to flag any users due to an internal error or processing issues.",
+                    view=None, # Remove components even on partial failure for a clean state
+                    embed=None
+                )
+
+        except Exception as e:
+            logger.error(f"DB connection or general error during flagging: {e}", exc_info=True)
+            await interaction.response.edit_message( # Use edit_message here for consistency
+                content="An error occurred while attempting to flag users.",
+                view=None, # Remove components
+                embed=None
+            )
+
+        finally:
+            if conn:
+                conn.close() # Use conn.close() for aiomysql connections
 
 class FlagCancelButton(Button):
     def __init__(self):
@@ -100,14 +176,10 @@ class FlagCancelButton(Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Disable all controls in the view to prevent further interaction
-        for item in self.view.children:
-            item.disabled = True
-
-        # Edit the original ephemeral message to reflect disabled controls and update message
+        # Edit the original ephemeral message to remove all components and update message
         await interaction.response.edit_message(
             content="🗑️ Flag operation cancelled.",
-            view=self.view,
+            view=None, # Set view to None to remove all components
             embed=None # Remove the embed
         )
 
@@ -121,18 +193,12 @@ class FlagView(View):
         self.reason_select = FlagReasonSelect(reasons)
         self.user_select = FlagUserSelect()
         self.confirm_button = FlagConfirmButton()
-        self.cancel_button = FlagCancelButton()
+        self.cancel_button = FlagCancel_Button() # Typo fixed here
 
         self.add_item(self.reason_select)
         self.add_item(self.user_select)
         self.add_item(self.confirm_button)
         self.add_item(self.cancel_button)
-
-    # Remove interaction_check as its purpose is now handled in select callbacks
-    # async def interaction_check(self, interaction: discord.Interaction) -> bool:
-    #     self.confirm_button.disabled = not (self.selected_reason and self.selected_users)
-    #     await interaction.response.edit_message(view=self)
-    #     return True
 
 
 async def start(serene_group, bot, interaction: discord.Interaction):

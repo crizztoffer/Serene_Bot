@@ -1,7 +1,8 @@
 # --- cogs/admin_commands/flag.py ---
 
 import discord
-from discord.ui import View, Select, UserSelect
+from discord import app_commands
+from discord.ui import View, Select, UserSelect, Button
 import logging
 
 logger = logging.getLogger(__name__)
@@ -38,9 +39,9 @@ class FlagUserSelect(UserSelect):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_users = self.values
-        selected_names = ", ".join(user.name for user in self.values)
+        selected_names = ", ".join(user.mention for user in self.values)
         await interaction.response.send_message(
-            f"👤 Selected users: **{selected_names}**", ephemeral=True
+            f"👤 Selected users: {selected_names}", ephemeral=True
         )
 
 
@@ -52,26 +53,53 @@ class FlagView(View):
 
         self.add_item(FlagReasonSelect(reasons))
         self.add_item(FlagUserSelect())
+        self.add_item(FlagConfirmButton())
 
-
-async def start(serene_group, bot):
-    # This is called directly by /serene admin flag
-    async def run_flag_ui(interaction: discord.Interaction):
-        reasons = getattr(bot, "flag_reasons", [])
-        if not reasons:
-            await interaction.response.send_message("❌ No flag reasons configured.", ephemeral=True)
+    async def flag_users(self, interaction: discord.Interaction):
+        if not self.selected_reason or not self.selected_users:
+            await interaction.response.send_message(
+                "⚠️ Please select both a reason and at least one user before confirming.",
+                ephemeral=True
+            )
             return
 
-        embed = discord.Embed(
-            title="🚩 Flag Users",
-            description="Select a **reason** and one or more **users** to flag.\n\n📝 A comment field will be added later.",
-            color=discord.Color.orange()
+        flagged_mentions = ", ".join(user.mention for user in self.selected_users)
+        await interaction.response.send_message(
+            f"🚩 Flagged {flagged_mentions} for **{self.selected_reason}**.",
+            ephemeral=True
         )
-        embed.set_footer(text="Admins only — all actions are logged.")
+        # Here you could also log the flag somewhere (e.g., webhook, database, etc.)
 
-        view = FlagView(reasons)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    # Call the UI directly from the interaction
-    ctx = await bot.get_context_from_interaction()
-    await run_flag_ui(ctx.interaction)
+class FlagConfirmButton(Button):
+    def __init__(self):
+        super().__init__(
+            label="Confirm Flag",
+            style=discord.ButtonStyle.danger,
+            custom_id="confirm_flag"
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.view.flag_users(interaction)
+
+
+async def start(serene_group, bot, interaction: discord.Interaction):
+    reasons = getattr(bot, "flag_reasons", [])
+    if not reasons:
+        await interaction.response.send_message("❌ No flag reasons configured.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🚩 Flag Users",
+        description=(
+            "1. Select a **reason** from the dropdown.\n"
+            "2. Select one or more **users** to flag.\n"
+            "3. Click **Confirm Flag** when ready.\n\n"
+            "📝 A comment field will be added later."
+        ),
+        color=discord.Color.orange()
+    )
+    embed.set_footer(text="Admins only — all actions are logged.")
+
+    view = FlagView(reasons)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)

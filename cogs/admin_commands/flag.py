@@ -10,15 +10,15 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Autocomplete callback
+# --- Autocomplete handler for reasons ---
 async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
     reasons = getattr(interaction.client, "flag_reasons", [])
     return [
         app_commands.Choice(name=reason.title(), value=reason)
         for reason in reasons if current.lower() in reason.lower()
-    ][:25]  # Discord max is 25
+    ][:25]
 
-# Dynamically build the flag command using autocomplete
+# --- Dynamically build the flag command using autocomplete ---
 def build_flag_command(bot) -> app_commands.Command:
 
     @app_commands.describe(reason="Choose a reason", user="User to flag")

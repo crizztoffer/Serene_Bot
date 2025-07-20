@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 # DB methods
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
+    """Adds a user to the database if they do not already exist."""
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
         return
@@ -62,10 +63,13 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
                 )
                 logger.info(f"Added new user '{user_name}' to DB.")
     except Exception as e:
-        logger.error(f"DB error: {e}")
+        logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
     finally:
         if conn:
             await conn.ensure_closed()
+
+# Attach the function to the bot object so it can be accessed by other modules
+bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
 async def load_flag_reasons():
     """Load flag reasons from DB and store on bot."""
@@ -108,7 +112,7 @@ async def on_ready():
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
 
-    await load_cogs()
+    await load_cogs() # This will now load admin_main.py, which in turn loads flag.py
     try:
         synced = await bot.tree.sync()
         logger.info(f"Synced {len(synced)} slash commands.")
@@ -164,6 +168,7 @@ async def hourly_db_check():
             await conn.ensure_closed()
 
 async def load_cogs():
+    """Loads all cogs from the 'cogs' directory."""
     if not os.path.exists("cogs"):
         os.makedirs("cogs")
     for filename in os.listdir("cogs"):

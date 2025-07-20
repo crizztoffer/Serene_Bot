@@ -10,18 +10,22 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Dynamically build the flag command with static choices from bot.flag_reasons
-def build_flag_command(bot) -> app_commands.Command:
-    reasons = getattr(bot, "flag_reasons", [])
-    reason_choices = [
+# Autocomplete callback
+async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
+    reasons = getattr(interaction.client, "flag_reasons", [])
+    return [
         app_commands.Choice(name=reason.title(), value=reason)
-        for reason in reasons[:25]  # max 25 choices
-    ]
+        for reason in reasons if current.lower() in reason.lower()
+    ][:25]  # Discord max is 25
+
+# Dynamically build the flag command using autocomplete
+def build_flag_command(bot) -> app_commands.Command:
 
     @app_commands.describe(reason="Choose a reason", user="User to flag")
+    @app_commands.autocomplete(reason=autocomplete_flag_reasons)
     async def flag(
         interaction: discord.Interaction,
-        reason: app_commands.Choice[str],
+        reason: str,
         user: User,
     ):
         await interaction.response.defer(ephemeral=True)
@@ -63,18 +67,16 @@ def build_flag_command(bot) -> app_commands.Command:
                 flags = warnings.setdefault("flags", [])
                 strikes = warnings.setdefault("strikes", [])
 
-                reason_str = reason.value
-
-                if any(f.get("reason") == reason_str for f in flags):
-                    strike_count = sum(1 for s in strikes if s.get("reason") == reason_str)
+                if any(f.get("reason") == reason for f in flags):
+                    strike_count = sum(1 for s in strikes if s.get("reason") == reason)
                     strikes.append({
-                        "reason": reason_str,
+                        "reason": reason,
                         "strike_number": strike_count + 1,
                         "timestamp": discord.utils.utcnow().isoformat()
                     })
                 else:
                     flags.append({
-                        "reason": reason_str,
+                        "reason": reason,
                         "seen": False,
                         "timestamp": discord.utils.utcnow().isoformat()
                     })
@@ -82,7 +84,7 @@ def build_flag_command(bot) -> app_commands.Command:
                 json_data["warnings"] = {"flags": flags, "strikes": strikes}
                 await cursor.execute("UPDATE discord_users SET json_data = %s WHERE discord_id = %s", (json.dumps(json_data), str(user.id)))
 
-            await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason_str}**", ephemeral=True)
+            await interaction.followup.send(f"✅ **{user.display_name}** flagged for: **{reason}**", ephemeral=True)
 
         except Exception as e:
             logger.error(f"DB error: {e}", exc_info=True)
@@ -91,14 +93,11 @@ def build_flag_command(bot) -> app_commands.Command:
             if conn:
                 await conn.ensure_closed()
 
-    # Attach choices explicitly
-    flag = app_commands.Command(
+    return app_commands.Command(
         name="flag",
         description="Flag a user for a rule violation.",
         callback=flag
     )
-    flag.parameters[0].choices = reason_choices  # Manually attach choices
-    return flag
 
 def start(admin_group: app_commands.Group, bot):
     admin_group.add_command(build_flag_command(bot))

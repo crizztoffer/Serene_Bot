@@ -492,8 +492,33 @@ class TexasHoldEmGameView(discord.ui.View):
             
             await interaction.response.defer() # Defer to allow time for updates
 
-            # Dealer's turn to check or raise
-            dealer_action = random.choice([1, 2]) # 1 for check, 2 for raise
+            # Get the bot's current hand (hole cards + community cards)
+            bot_all_cards = self.game.bot_hole_cards + self.game.community_cards
+            bot_hand_score = evaluate_best_hand([c['code'] for c in bot_all_cards])
+            bot_hand_rank = bot_hand_score[0] # Get the hand rank (1-9)
+
+            dealer_action = 1 # Default to check (1)
+            raise_amount = 0
+
+            # AI Logic for dealer's action
+            if bot_hand_rank >= 7: # Strong hand: Full House, Four of a Kind, Straight Flush
+                if random.random() < 0.8: # 80% chance to raise
+                    dealer_action = 2 # Raise
+                    raise_amount = random.choice([10, 25]) # Aggressive raise
+                else: # 20% chance to check (for deception)
+                    dealer_action = 1 # Check
+            elif bot_hand_rank >= 4: # Medium hand: Three of a Kind, Straight, Flush
+                if random.random() < 0.5: # 50% chance to raise
+                    dealer_action = 2 # Raise
+                    raise_amount = random.choice([5, 10]) # Moderate raise
+                else: # 50% chance to check
+                    dealer_action = 1 # Check
+            else: # Weak hand: High Card, One Pair, Two Pair
+                if random.random() < 0.2: # 20% chance to bluff raise
+                    dealer_action = 2 # Raise
+                    raise_amount = random.choice([5]) # Small bluff raise
+                else: # 80% chance to check
+                    dealer_action = 1 # Check
 
             if dealer_action == 1: # Dealer checks
                 if self.game.game_phase == "flop":
@@ -513,7 +538,6 @@ class TexasHoldEmGameView(discord.ui.View):
                 await self.game._update_game_message(self)
                 # No separate message for Serene checking, it's implied by game progression
             else: # Dealer raises
-                raise_amount = random.choice([5, 10, 25])
                 self.game.dealer_raise_amount = raise_amount
                 self.game.player_action_pending = True # Player must now call or fold
 
@@ -842,8 +866,8 @@ class TexasHoldEmGame:
             dealer_text_width,
             player_text_width
         )
-        # Increase overall image width to accommodate text
-        combined_image_width = max_content_width + text_padding_x * 12 # Further increased multiplier for wider image
+        # Increase overall image width to accommodate text - INCREASED MULTIPLIER HERE
+        combined_image_width = max_content_width + text_padding_x * 20 # Increased from 12 to 20 for more width
         
         # Calculate total height
         total_height = (
@@ -1031,3 +1055,4 @@ async def start(interaction: discord.Interaction, bot_instance: commands.Bot):
     
     # Call the start_game method of the TexasHoldEmGame instance
     await holdem_game.start_game(interaction)
+

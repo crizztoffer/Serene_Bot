@@ -1,3 +1,5 @@
+# --- cogs/admin_main.py ---
+
 import discord
 from discord.ext import commands
 from discord import app_commands, Interaction
@@ -11,25 +13,37 @@ class AdminCommands(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self.serene_group = self.bot.tree.get_command("serene")
+
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
-
-        # Define admin group as an app_commands.Group (to hold subcommands)
-        self.admin_group = app_commands.Group(name="admin", description="Perform admin tasks")
-
-        # Add the admin group under serene group
-        self.serene_group.add_command(self.admin_group)
 
         @app_commands.command(name="admin", description="Perform admin tasks")
         @app_commands.describe(task_name="Choose a task to run")
         @app_commands.autocomplete(task_name=self.autocomplete_tasks)
-        @app_commands.checks.has_permissions(administrator=True)
-        async def admin_command(interaction: Interaction, task_name: str):
-            # This can be an optional catch-all or removed if subcommands are added dynamically
-            await interaction.response.send_message(f"Use /serene admin <task>", ephemeral=True)
+        @app_commands.checks.has_permissions(administrator=True)  # Restrict to admins only
+        async def task(interaction: Interaction, task_name: str):
+            try:
+                module_path = os.path.join(os.path.dirname(__file__), "admin_commands", f"{task_name}.py")
+                spec = importlib.util.spec_from_file_location(task_name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
 
-        # Add this catch-all to admin group
-        self.admin_group.add_command(admin_command)
+                if hasattr(module, "start"):
+                    await module.start(self.serene_group, self.bot)
+                else:
+                    await interaction.response.send_message(f"Task '{task_name}' does not have a start() function.", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Failed to load task '{task_name}': {e}", ephemeral=True)
+
+        @task.error
+        async def task_error(interaction: Interaction, error):
+            if isinstance(error, app_commands.errors.MissingPermissions):
+                await interaction.response.send_message("You must be an admin to use this command.", ephemeral=True)
+            else:
+                logger.error(f"Error in admin task command: {error}")
+                await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
+
+        self.serene_group.add_command(task)
 
     async def autocomplete_tasks(self, interaction: discord.Interaction, current: str):
         task_path = os.path.join(os.path.dirname(__file__), "admin_commands")
@@ -38,29 +52,5 @@ class AdminCommands(commands.Cog):
         files = [f[:-3] for f in os.listdir(task_path) if f.endswith(".py") and f != "__init__.py"]
         return [app_commands.Choice(name=f, value=f) for f in files if current.lower() in f.lower()]
 
-    async def load_task(self, task_name):
-        module_path = os.path.join(os.path.dirname(__file__), "admin_commands", f"{task_name}.py")
-        if not os.path.exists(module_path):
-            logger.error(f"Task file not found: {module_path}")
-            return
-        spec = importlib.util.spec_from_file_location(task_name, module_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-
-        if hasattr(module, "start"):
-            await module.start(self.admin_group, self.bot)
-            logger.info(f"Loaded task '{task_name}'")
-        else:
-            logger.error(f"Task '{task_name}' has no start function")
-
 async def setup(bot):
-    admin_cog = AdminCommands(bot)
-    await bot.add_cog(admin_cog)
-
-    # Load all tasks once cog is loaded to register subcommands under /serene admin
-    task_path = os.path.join(os.path.dirname(__file__), "admin_commands")
-    if os.path.exists(task_path):
-        for filename in os.listdir(task_path):
-            if filename.endswith(".py") and filename != "__init__.py":
-                task_name = filename[:-3]
-                await admin_cog.load_task(task_name)
+    await bot.add_cog(AdminCommands(bot))

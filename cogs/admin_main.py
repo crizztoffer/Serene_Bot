@@ -16,9 +16,9 @@ class AdminCommands(commands.Cog):
 
         @app_commands.command(
             name="admin",
-            description="Run an admin tool",
-            default_permissions=discord.Permissions(administrator=True)
+            description="Run an admin tool"
         )
+        @app_commands.checks.has_permissions(administrator=True)  # ✅ Restrict to admins only
         @app_commands.describe(tool="Select an admin tool")
         @app_commands.autocomplete(tool=self.autocomplete_admin_tools)
         async def admin(interaction: discord.Interaction, tool: str):

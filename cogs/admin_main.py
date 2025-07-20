@@ -17,46 +17,31 @@ class AdminCommands(commands.Cog):
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        # ✅ Define an app_commands.Group to hold all admin subcommands
-        self.admin_group = app_commands.Group(
-            name="admin",
-            description="Admin commands for Serene bot"
-        )
+        @app_commands.command(name="admin", description="Perform admin tasks")
+        @app_commands.describe(task_name="Choose a task to run")
+        @app_commands.autocomplete(task_name=self.autocomplete_tasks)
+        async def task(interaction: discord.Interaction, task_name: str):
+            try:
+                module_path = os.path.join(os.path.dirname(__file__), "admin_commands", f"{task_name}.py")
+                spec = importlib.util.spec_from_file_location(task_name, module_path)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
 
-        # ✅ Dynamically load all admin subcommands from the admin_commands/ folder
-        self.load_admin_commands()
+                if hasattr(module, "start"):
+                    await module.start(interaction, self.bot)
+                else:
+                    await interaction.response.send_message(f"Task '{task_name}' does not have a start() function.", ephemeral=True)
+            except Exception as e:
+                await interaction.response.send_message(f"Failed to load task '{task_name}': {e}", ephemeral=True)
 
-        # ✅ Add the admin group under the /serene root group
-        self.serene_group.add_command(self.admin_group)
-        logger.info("'/serene admin' group and subcommands loaded.")
+        self.serene_group.add_command(task)
 
-    def load_admin_commands(self):
-        """
-        Loads all admin subcommands from the 'admin_commands' directory.
-        Each module must define a `start(admin_group, bot)` function.
-        """
-        tools_path = os.path.join(os.path.dirname(__file__), "admin_commands")
-
-        for filename in os.listdir(tools_path):
-            if filename.endswith(".py") and filename != "__init__.py":
-                module_name = filename[:-3]
-                module_path = os.path.join(tools_path, filename)
-
-                try:
-                    spec = importlib.util.spec_from_file_location(module_name, module_path)
-                    module = importlib.util.module_from_spec(spec)
-                    spec.loader.exec_module(module)
-
-                    if hasattr(module, "start"):
-                        module.start(self.admin_group, self.bot)
-                        logger.info(f"Loaded admin subcommand: {module_name}")
-                    else:
-                        logger.warning(f"{filename} does not define a 'start()' function.")
-                except Exception as e:
-                    logger.error(f"Failed to load admin subcommand '{module_name}': {e}", exc_info=True)
-
-    async def cog_unload(self):
-        logger.info("AdminCommands cog unloaded.")
+    async def autocomplete_tasks(self, interaction: discord.Interaction, current: str):
+        task_path = os.path.join(os.path.dirname(__file__), "admin_commands")
+        if not os.path.exists(task_path):
+            return []
+        files = [f[:-3] for f in os.listdir(task_path) if f.endswith(".py") and f != "__init__.py"]
+        return [app_commands.Choice(name=f, value=f) for f in files if current.lower() in f.lower()]
 
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import discord
 from discord import app_commands, User
+from discord.ext import commands
 import json
 import aiomysql
 import logging
 
 logger = logging.getLogger(__name__)
 
-# --- Autocomplete handler for reasons ---
+# --- Autocomplete handler ---
 async def autocomplete_flag_reasons(interaction: discord.Interaction, current: str):
     reasons = getattr(interaction.client, "flag_reasons", [])
     return [
@@ -18,21 +19,20 @@ async def autocomplete_flag_reasons(interaction: discord.Interaction, current: s
         for reason in reasons if current.lower() in reason.lower()
     ][:25]
 
-# --- Dynamically build the flag command using autocomplete ---
-def build_flag_command(bot) -> app_commands.Command:
+# --- Cog class that holds the flag command ---
+class FlagCommand(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
 
+    @app_commands.command(name="flag", description="Flag a user for a rule violation.")
     @app_commands.describe(reason="Choose a reason", user="User to flag")
     @app_commands.autocomplete(reason=autocomplete_flag_reasons)
-    async def flag(
-        interaction: discord.Interaction,
-        reason: str,
-        user: User,
-    ):
+    async def flag(self, interaction: discord.Interaction, reason: str, user: User):
         await interaction.response.defer(ephemeral=True)
 
-        db_user = interaction.client.db_user
-        db_password = interaction.client.db_password
-        db_host = interaction.client.db_host
+        db_user = self.bot.db_user
+        db_password = self.bot.db_password
+        db_host = self.bot.db_host
 
         if not all([db_user, db_password, db_host]):
             await interaction.followup.send("Database credentials are not configured.", ephemeral=True)
@@ -55,7 +55,7 @@ def build_flag_command(bot) -> app_commands.Command:
 
                 if not row:
                     logger.info(f"{user.display_name} not in DB. Attempting to add.")
-                    await interaction.client.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
+                    await self.bot.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
                     await cursor.execute("SELECT json_data FROM discord_users WHERE discord_id = %s", (str(user.id),))
                     row = await cursor.fetchone()
                     if not row:
@@ -93,11 +93,7 @@ def build_flag_command(bot) -> app_commands.Command:
             if conn:
                 await conn.ensure_closed()
 
-    return app_commands.Command(
-        name="flag",
-        description="Flag a user for a rule violation.",
-        callback=flag
-    )
-
+# --- Register with the admin group ---
 def start(admin_group: app_commands.Group, bot):
-    admin_group.add_command(build_flag_command(bot))
+    cog = FlagCommand(bot)
+    admin_group.add_command(cog.flag)

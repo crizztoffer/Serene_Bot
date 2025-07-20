@@ -53,7 +53,10 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             autocommit=True
         )
         async with conn.cursor() as cursor:
-            await cursor.execute("SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s", (str(guild_id), str(discord_id)))
+            await cursor.execute(
+                "SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
             (count,) = await cursor.fetchone()
             if count == 0:
                 initial_json_data = json.dumps({"warnings": {}})
@@ -68,7 +71,6 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
         if conn:
             await conn.ensure_closed()
 
-# Attach the function to the bot object so it can be accessed by other modules
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
 async def load_flag_reasons():
@@ -113,12 +115,15 @@ async def on_ready():
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
 
-    await load_cogs() # This will now load admin_main.py, which in turn loads flag.py
-    try:
-        synced = await bot.tree.sync()
-        logger.info(f"Synced {len(synced)} slash commands.")
-    except Exception as e:
-        logger.error(f"Slash sync failed: {e}")
+    await load_cogs()  # This will now load admin_main.py, which in turn loads flag.py
+
+    # 🔄 Force-sync commands per guild
+    for guild in bot.guilds:
+        try:
+            await bot.tree.sync(guild=guild)
+            logger.info(f"Force-synced commands for guild: {guild.name} ({guild.id})")
+        except Exception as e:
+            logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
 
     for guild in bot.guilds:
         for member in guild.members:

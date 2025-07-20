@@ -7,6 +7,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 class FlagReasonSelect(Select):
     def __init__(self, reasons: list[str]):
         options = [
@@ -23,7 +24,7 @@ class FlagReasonSelect(Select):
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_reason = self.values[0]
         await interaction.response.send_message(
-            f"Selected reason: **{self.values[0]}**", ephemeral=True
+            f"✅ Selected reason: **{self.values[0]}**", ephemeral=True
         )
 
 
@@ -32,7 +33,7 @@ class FlagUserSelect(UserSelect):
         super().__init__(
             placeholder="Select user(s) to flag",
             min_values=1,
-            max_values=5,  # You can increase this if needed
+            max_values=5,
             custom_id="flag_users"
         )
 
@@ -40,7 +41,7 @@ class FlagUserSelect(UserSelect):
         self.view.selected_users = self.values
         selected_names = ", ".join(user.name for user in self.values)
         await interaction.response.send_message(
-            f"Selected users: **{selected_names}**", ephemeral=True
+            f"👤 Selected users: **{selected_names}**", ephemeral=True
         )
 
 
@@ -53,7 +54,7 @@ class FlagView(View):
         self.add_item(FlagReasonSelect(reasons))
         self.add_item(FlagUserSelect())
 
-        # You can add a confirm button here later if needed
+        # Submit button can be added here later
 
 
 async def start(admin_group: app_commands.Group, bot):
@@ -61,17 +62,20 @@ async def start(admin_group: app_commands.Group, bot):
     async def flag_command(interaction: discord.Interaction):
         reasons = getattr(bot, "flag_reasons", [])
         if not reasons:
-            await interaction.response.send_message("No flag reasons found.", ephemeral=True)
+            await interaction.response.send_message("❌ No flag reasons found.", ephemeral=True)
             return
 
         embed = discord.Embed(
-            title="Flag Users",
-            description="Choose a flag reason and one or more users.\n\n📝 **Comment field** will be added later.",
+            title="🚩 Flag Users",
+            description="Select a **reason** and one or more **users** to flag.\n\n📝 A comment field will be added later.",
             color=discord.Color.orange()
         )
-        embed.set_footer(text="Admins only — actions are logged")
+        embed.set_footer(text="Admins only — all actions are logged.")
 
         view = FlagView(reasons)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+        # Properly defer the interaction before sending view
+        await interaction.response.defer(ephemeral=True)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
     admin_group.add_command(flag_command)

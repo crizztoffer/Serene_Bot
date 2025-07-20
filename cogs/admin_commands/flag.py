@@ -91,10 +91,14 @@ class FlagCancelButton(Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        # Disable all buttons to simulate cancel
+        # Disable all controls in the view to prevent further interaction
         for item in self.view.children:
             item.disabled = True
+        
+        # Edit the original ephemeral message to reflect disabled controls
         await interaction.response.edit_message(view=self.view)
+        
+        # Send a follow-up ephemeral message to confirm cancellation
         await interaction.followup.send("Cancelled.", ephemeral=True)
 
 
@@ -115,7 +119,7 @@ class FlagView(View):
         self.add_item(self.cancel_button)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Enable confirm button only if both reason and users selected
+        # Enable confirm button only if both reason and users are selected
         self.confirm_button.disabled = not (self.selected_reason and self.selected_users)
         await interaction.response.edit_message(view=self)
         return True
@@ -129,7 +133,7 @@ async def start(serene_group, bot, interaction: discord.Interaction):
 
     embed = discord.Embed(
         title="🚩 Flag Users",
-        description="Serene Bot will handle the hassle of administering disciplinary actions towards a user or group of users. It does this **by checking each discord user's flag status for the given reason** you specify below, and **if a flag for it already exists, Serene Bot automatically administers the first strike**. If a strike or strikes have already been administered, **Serene Bot will automatically increase the number of strikes** until the third. **After the third strike, the user(s) will be banned from the server**.",
+        description="Serene Bot will handle the hassle of administering disciplinary actions towards a user or group of users. It does this **__by checking each discord user's flag status for the given reason__** you specify below, and **__if a flag for it already exists, Serene Bot automatically administers the first strike__**. If a strike or strikes have already been administered, **__Serene Bot will automatically increase the number of strikes__** until the third. **__After the third strike, the user(s) will be banned from the server__**.",
         color=discord.Color.orange()
     )
     embed.set_footer(text="Admins only — all actions are logged.")

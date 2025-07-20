@@ -118,10 +118,21 @@ async def start(admin_group: app_commands.Group, bot):
     command = app_commands.Command(
         name="flag",
         description="Flag a user for a rule violation.",
-        callback=flag_command
+        callback=flag_command,
+        parameters=[
+            app_commands.Parameter(
+                name="reason",
+                description="Choose a reason from the rules",
+                type=str,
+                autocomplete=autocomplete_flag_reasons,
+            ),
+            app_commands.Parameter(
+                name="user",
+                description="User to flag",
+                type=discord.User,
+            ),
+        ],
     )
-    command.describe(reason="Choose a reason from the rules", user="User to flag")
-    command.autocomplete("reason")(autocomplete_flag_reasons)
-    
+
     admin_group.add_command(command)
     logger.info("Flag command added to '/serene admin' group.")

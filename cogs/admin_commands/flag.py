@@ -20,7 +20,9 @@ class FlagReasonSelect(Select):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_reason = self.values[0]
-        # No message here as requested
+        # Enable confirm button if both reason and users are selected
+        self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
+        await interaction.response.edit_message(view=self.view)
 
 
 class FlagUserSelect(UserSelect):
@@ -34,7 +36,9 @@ class FlagUserSelect(UserSelect):
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_users = self.values
-        # No message here as requested
+        # Enable confirm button if both reason and users are selected
+        self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
+        await interaction.response.edit_message(view=self.view)
 
 
 class FlagConfirmButton(Button):
@@ -50,6 +54,7 @@ class FlagConfirmButton(Button):
         view: FlagView = self.view
 
         if not view.selected_reason or not view.selected_users:
+            # This should ideally not be reached if button is properly disabled
             await interaction.response.send_message(
                 "⚠️ Please select both a reason and at least one user before confirming.",
                 ephemeral=True
@@ -63,16 +68,20 @@ class FlagConfirmButton(Button):
         for user in view.selected_users:
             try:
                 # Example async DB call - replace with your actual method
-                await bot.db.add_flag(user.id, view.selected_reason)
+                # await bot.db.add_flag(user.id, view.selected_reason) # Uncomment and replace
                 flagged_mentions.append(user.mention)
             except Exception as e:
                 logger.error(f"Failed to flag user {user} ({user.id}): {e}")
 
         if flagged_mentions:
             mentions_str = ", ".join(flagged_mentions)
-            await interaction.response.send_message(
-                f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
-                ephemeral=True
+            # Disable all components after confirmation
+            for item in view.children:
+                item.disabled = True
+            await interaction.response.edit_message(
+                content=f"🚩 Flagged {mentions_str} for **{view.selected_reason}**.",
+                view=view,
+                embed=None # Remove the embed as it's no longer needed
             )
             # Optionally, add logging or webhook notification here
         else:
@@ -95,10 +104,12 @@ class FlagCancelButton(Button):
         for item in self.view.children:
             item.disabled = True
 
-        # Edit the original ephemeral message to reflect disabled controls
-        await interaction.response.edit_message(view=self.view)
-
-        # DO NOT send a followup or another response here to avoid InteractionResponded error
+        # Edit the original ephemeral message to reflect disabled controls and update message
+        await interaction.response.edit_message(
+            content="🗑️ Flag operation cancelled.",
+            view=self.view,
+            embed=None # Remove the embed
+        )
 
 
 class FlagView(View):
@@ -117,11 +128,11 @@ class FlagView(View):
         self.add_item(self.confirm_button)
         self.add_item(self.cancel_button)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        # Enable confirm button only if both reason and users are selected
-        self.confirm_button.disabled = not (self.selected_reason and self.selected_users)
-        await interaction.response.edit_message(view=self)
-        return True
+    # Remove interaction_check as its purpose is now handled in select callbacks
+    # async def interaction_check(self, interaction: discord.Interaction) -> bool:
+    #     self.confirm_button.disabled = not (self.selected_reason and self.selected_users)
+    #     await interaction.response.edit_message(view=self)
+    #     return True
 
 
 async def start(serene_group, bot, interaction: discord.Interaction):

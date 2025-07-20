@@ -2,7 +2,7 @@
 
 import discord
 from discord.ext import commands
-from discord import app_commands
+from discord import app_commands, Interaction
 import os
 import importlib.util
 import logging
@@ -20,7 +20,8 @@ class AdminCommands(commands.Cog):
         @app_commands.command(name="admin", description="Perform admin tasks")
         @app_commands.describe(task_name="Choose a task to run")
         @app_commands.autocomplete(task_name=self.autocomplete_tasks)
-        async def task(interaction: discord.Interaction, task_name: str):
+        @app_commands.checks.has_permissions(administrator=True)  # Restrict to admins only
+        async def task(interaction: Interaction, task_name: str):
             try:
                 module_path = os.path.join(os.path.dirname(__file__), "admin_commands", f"{task_name}.py")
                 spec = importlib.util.spec_from_file_location(task_name, module_path)
@@ -33,6 +34,14 @@ class AdminCommands(commands.Cog):
                     await interaction.response.send_message(f"Task '{task_name}' does not have a start() function.", ephemeral=True)
             except Exception as e:
                 await interaction.response.send_message(f"Failed to load task '{task_name}': {e}", ephemeral=True)
+
+        @task.error
+        async def task_error(interaction: Interaction, error):
+            if isinstance(error, app_commands.errors.MissingPermissions):
+                await interaction.response.send_message("You must be an admin to use this command.", ephemeral=True)
+            else:
+                logger.error(f"Error in admin task command: {error}")
+                await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
 
         self.serene_group.add_command(task)
 

@@ -91,8 +91,9 @@ async def load_flag_reasons():
         async with conn.cursor() as cursor:
             await cursor.execute("SELECT reason FROM rule_flagging")
             rows = await cursor.fetchall()
+            logger.info(f"DB rows fetched: {rows}")
             bot.flag_reasons = [row[0] for row in rows]
-            logger.info(f"Loaded {len(bot.flag_reasons)} flag reasons from DB.")
+            logger.info(f"Loaded flag reasons: {bot.flag_reasons}")
     except Exception as e:
         logger.error(f"Failed to load flag reasons: {e}")
         bot.flag_reasons = []

@@ -17,22 +17,26 @@ class AdminCommands(commands.Cog):
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        @app_commands.command(name="admin", description="Admin commands for Serene bot")
-        async def admin_root(interaction: discord.Interaction):
-            await interaction.response.send_message("Use a subcommand under `/serene admin`.", ephemeral=True)
+        # ✅ Define an app_commands.Group to hold all admin subcommands
+        self.admin_group = app_commands.Group(
+            name="admin",
+            description="Admin commands for Serene bot"
+        )
 
-        self.admin_group = admin_root
-
-        # Dynamically load admin tools
+        # ✅ Dynamically load all admin subcommands from the admin_commands/ folder
         self.load_admin_commands()
 
-        # Add admin group under /serene
+        # ✅ Add the admin group under the /serene root group
         self.serene_group.add_command(self.admin_group)
-
         logger.info("'/serene admin' group and subcommands loaded.")
 
     def load_admin_commands(self):
+        """
+        Loads all admin subcommands from the 'admin_commands' directory.
+        Each module must define a `start(admin_group, bot)` function.
+        """
         tools_path = os.path.join(os.path.dirname(__file__), "admin_commands")
+
         for filename in os.listdir(tools_path):
             if filename.endswith(".py") and filename != "__init__.py":
                 module_name = filename[:-3]
@@ -44,13 +48,15 @@ class AdminCommands(commands.Cog):
                     spec.loader.exec_module(module)
 
                     if hasattr(module, "start"):
-                        # Inject subcommand into admin group
                         module.start(self.admin_group, self.bot)
                         logger.info(f"Loaded admin subcommand: {module_name}")
                     else:
                         logger.warning(f"{filename} does not define a 'start()' function.")
                 except Exception as e:
                     logger.error(f"Failed to load admin subcommand '{module_name}': {e}", exc_info=True)
+
+    async def cog_unload(self):
+        logger.info("AdminCommands cog unloaded.")
 
 async def setup(bot):
     await bot.add_cog(AdminCommands(bot))

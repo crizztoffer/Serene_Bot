@@ -1,5 +1,7 @@
 # --- cogs/admin_commands/flag.py ---
 
+from __future__ import annotations # Defer evaluation of type hints
+
 import discord
 from discord import app_commands
 from typing import List

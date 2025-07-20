@@ -97,7 +97,6 @@ class FlagConfirmButton(Button):
                         if not row:
                             logger.info(f"{user.display_name} not in DB. Attempting to add.")
                             # Assumes bot has this method, else you must implement it
-                            # You need to ensure bot.add_user_to_db_if_not_exists is defined and works
                             if hasattr(bot, 'add_user_to_db_if_not_exists'):
                                 await bot.add_user_to_db_if_not_exists(interaction.guild_id, user.display_name, user.id)
                             else:
@@ -193,7 +192,7 @@ class FlagView(View):
         self.reason_select = FlagReasonSelect(reasons)
         self.user_select = FlagUserSelect()
         self.confirm_button = FlagConfirmButton()
-        self.cancel_button = FlagCancel_Button() # Typo fixed here
+        self.cancel_button = FlagCancelButton() # Corrected this line!
 
         self.add_item(self.reason_select)
         self.add_item(self.user_select)

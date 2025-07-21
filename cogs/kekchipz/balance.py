@@ -87,8 +87,8 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Resize the entire image to be 1/4 smaller (0.33 of original size)
         original_width, original_height = base_image.size
-        new_width = int(original_width * 0.33)
-        new_height = int(original_height * 0.33)
+        new_width = int(original_width * 0.42)
+        new_height = int(original_height * 0.42)
         base_image = base_image.resize((new_width, new_height), Image.LANCZOS)
 
         # Load font

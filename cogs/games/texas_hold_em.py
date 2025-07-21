@@ -10,40 +10,90 @@ from itertools import combinations # Import combinations for poker hand evaluati
 from collections import Counter # Import Counter for poker hand evaluation
 import aiohttp
 from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
+import aiomysql # Import aiomysql for database operations
+import logging # Import logging
+
+# Set up logging for this module
+logger = logging.getLogger(__name__)
 
 # --- Game State Storage ---
 # This dictionary will store active Texas Hold 'em games by channel ID.
 active_texasholdem_games = {}
 
-# --- Database Operations (Placeholders) ---
-# These functions are placeholders for actual database interactions.
-# In a real application, you would connect to a database (e.g., MySQL, PostgreSQL, SQLite)
-# to persist user data like "kekchipz" (a fictional currency).
-# For this isolated file, they simply print messages.
+# --- Database Operations ---
+# These functions will now interact with the MySQL database using aiomysql.
 
-async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
+async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_config: dict):
     """
-    Placeholder function to simulate updating a user's kekchipz balance in a database.
-    In a real scenario, this would interact with a database.
+    Updates a user's kekchipz balance in the database.
+    Ensures the balance does not go below zero.
     """
-    print(f"Simulating update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}.")
-    # Example of how you might integrate a real database call:
-    # try:
-    #     conn = await aiomysql.connect(...)\
-    #     async with conn.cursor() as cursor:
-    #         await cursor.execute("UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s", (amount, str(guild_id), str(discord_id)))
-    # except Exception as e:
-    #     print(f"Database update failed: {e}")
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=db_config['host'],
+            user=db_config['user'],
+            password=db_config['password'],
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            # First, get the current kekchipz
+            await cursor.execute(
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            result = await cursor.fetchone()
+            current_kekchipz = result[0] if result else 0
 
-async def get_user_kekchipz(guild_id: int, discord_id: int) -> int:
+            new_kekchipz = current_kekchipz + amount
+            if new_kekchipz < 0:
+                new_kekchipz = 0 # Ensure balance doesn't go negative
+
+            await cursor.execute(
+                "UPDATE discord_users SET kekchipz = %s WHERE guild_id = %s AND discord_id = %s",
+                (new_kekchipz, str(guild_id), str(discord_id))
+            )
+            logger.info(f"DB Update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}. New balance: {new_kekchipz}.")
+    except Exception as e:
+        logger.error(f"DB error in update_user_kekchipz for user {discord_id}: {e}")
+    finally:
+        if conn:
+            await conn.ensure_closed()
+
+async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> int:
     """
-    Placeholder function to simulate fetching a user's kekchipz balance from a database.
+    Fetches a user's kekchipz balance from the database.
     Returns 0 if the user is not found or an error occurs.
     """
-    print(f"Simulating fetch: Getting kekchipz for user {discord_id} in guild {guild_id}.")
-    # In a real scenario, this would query a database.
-    # For now, let's return a dummy value or a default.
-    return 1000 # Example: User starts with 1000 kekchipz for testing
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=db_config['host'],
+            user=db_config['user'],
+            password=db_config['password'],
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            result = await cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                logger.warning(f"User {discord_id} not found in DB for guild {guild_id}. Returning 0 kekchipz.")
+                return 0
+    except Exception as e:
+        logger.error(f"DB error in get_user_kekchipz for user {discord_id}: {e}")
+        return 0 # Return 0 on error
+    finally:
+        if conn:
+            await conn.ensure_closed()
 
 
 # --- Image Generation Function ---
@@ -115,7 +165,7 @@ async def create_card_combo_image(combo_str: str, scale_factor: float = 1.0, ove
                     card_images.append(pil_image)
 
         except aiohttp.ClientError as e:
-            print(f"Failed to fetch PNG for card '{card}' from {png_url}: {e}")
+            logger.error(f"Failed to fetch PNG for card '{card}' from {png_url}: {e}")
             # If the first card fails, ensure default dimensions are set
             if first_card_width is None:
                 first_card_width = default_card_width
@@ -123,7 +173,7 @@ async def create_card_combo_image(combo_str: str, scale_factor: float = 1.0, ove
             # Append a placeholder for failed cards to avoid breaking the layout
             card_images.append(Image.new('RGBA', (int(first_card_width * scale_factor), int(first_card_height * scale_factor)), (255, 0, 0, 128))) # Red transparent placeholder
         except Exception as e:
-            print(f"Error processing PNG for card '{card}' from {png_url}: {e}")
+            logger.error(f"Error processing PNG for card '{card}' from {png_url}: {e}")
             # If the first card fails, ensure default dimensions are set
             if first_card_width is None:
                 first_card_width = default_card_width
@@ -308,7 +358,7 @@ class TexasHoldEmGameView(discord.ui.View):
         Manages the visibility and disabled state of buttons based on game phase.
         Buttons are dynamically added/removed to control their visibility.
         """
-        print(f"Setting button states for phase: {phase}, betting_buttons_visible: {betting_buttons_visible}")
+        logger.info(f"Setting button states for phase: {phase}, betting_buttons_visible: {betting_buttons_visible}")
         self.clear_items() # Clear all existing items from the view
 
         # Define buttons and their callbacks
@@ -379,13 +429,13 @@ class TexasHoldEmGameView(discord.ui.View):
                 self._end_game_buttons() # Enable Play Again, disable others
                 await self.game.game_message.edit(content=f"{self.game.player.display_name}'s turn timed out. Click 'Play Again' to start a new game.", view=self, attachments=[])
             except discord.errors.NotFound:
-                print("WARNING: Game message not found during timeout, likely already deleted.")
+                logger.warning("Game message not found during timeout, likely already deleted.")
             except Exception as e:
-                print(f"WARNING: An error occurred editing game message on timeout: {e}")
+                logger.error(f"An error occurred editing game message on timeout: {e}")
         
         if self.game.channel_id in active_texasholdem_games:
             pass # Keep for Play Again functionality
-        print(f"Texas Hold 'em game in channel {self.game.channel_id} timed out.")
+        logger.info(f"Texas Hold 'em game in channel {self.game.channel_id} timed out.")
 
     # Removed @discord.ui.button decorators from all callbacks
     async def raise_main_callback(self, interaction: discord.Interaction): # Removed button argument as it's not used
@@ -401,7 +451,7 @@ class TexasHoldEmGameView(discord.ui.View):
             # _update_game_message will handle editing the original deferred response with the new view
             await self.game._update_game_message(self)
         except Exception as e:
-            print(f"Error in raise_main_callback: {e}")
+            logger.error(f"Error in raise_main_callback: {e}")
             if not interaction.response.is_done():
                 await interaction.followup.send("An error occurred during your Raise action. Please try again or contact support.", ephemeral=True)
 
@@ -455,7 +505,7 @@ class TexasHoldEmGameView(discord.ui.View):
                 await self.game._update_game_message(self)
 
         except Exception as e:
-            print(f"Error in call_main_callback: {e}")
+            logger.error(f"Error in call_main_callback: {e}")
             if not interaction.response.is_done():
                 await interaction.followup.send("An error occurred during your Call action. Please try again or contact support.", ephemeral=True)
 
@@ -469,8 +519,20 @@ class TexasHoldEmGameView(discord.ui.View):
             await interaction.response.defer() # Defer to allow time for updates
 
             # Player folds, loses minimum bet (pre-flop) or current Gtotal contribution
-            kekchipz_lost = self.game.minimum_bet if self.game.game_phase == "pre_flop" else self.game.g_total / 2 # Assuming half of Gtotal is player's contribution
-            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -int(kekchipz_lost))
+            # Assuming the player's contribution to g_total is half if dealer hasn't raised,
+            # or the amount they would have had to call if dealer raised.
+            # For simplicity, let's assume they lose the minimum bet if pre-flop,
+            # otherwise they lose their current contribution to the pot.
+            # This logic might need refinement based on exact game rules.
+            kekchipz_lost = self.game.minimum_bet
+            if self.game.game_phase != "pre_flop":
+                # This is a simplification. In a real game, it's more complex.
+                # For now, let's say they lose the minimum bet if folding post-flop too.
+                # Or, if we want to be more accurate, they lose what they've put in so far.
+                # For this implementation, let's just use minimum_bet as the base loss on fold.
+                pass # Already set to minimum_bet above
+
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -int(kekchipz_lost), self.game.db_config)
             
             self._end_game_buttons()
             self.game.game_phase = "folded" # Indicate game ended by fold
@@ -479,7 +541,7 @@ class TexasHoldEmGameView(discord.ui.View):
             del active_texasholdem_games[self.game.channel_id]
             self.stop()
         except Exception as e:
-            print(f"Error in fold_main_callback: {e}")
+            logger.error(f"Error in fold_main_callback: {e}")
             if not interaction.response.is_done():
                 await interaction.followup.send("An error occurred during your Fold action. Please try again or contact support.", ephemeral=True)
 
@@ -547,7 +609,7 @@ class TexasHoldEmGameView(discord.ui.View):
                 await self.game._update_game_message(self) # Update the main message with raise info
                 # The raise message will now be part of the main game message content
         except Exception as e:
-            print(f"Error in check_main_callback: {e}")
+            logger.error(f"Error in check_main_callback: {e}")
             if not interaction.response.is_done():
                 await interaction.followup.send("An error occurred during your Check action. Please try again or contact support.", ephemeral=True)
 
@@ -587,7 +649,7 @@ class TexasHoldEmGameView(discord.ui.View):
             
             await self.game._update_game_message(self)
         except Exception as e:
-            print(f"Error in bet_amount_callback: {e}")
+            logger.error(f"Error in bet_amount_callback: {e}")
             if not interaction.response.is_done():
                 await interaction.followup.send("An error occurred during your Bet action. Please try again or contact support.", ephemeral=True)
 
@@ -614,16 +676,16 @@ class TexasHoldEmGameView(discord.ui.View):
             temp_view.add_item(discord.ui.Button(label="Game Ended", style=discord.ButtonStyle.red, disabled=True))
             await self.game.game_message.edit(content=f"Game over for {self.game.player.display_name}. Starting a new game...", view=temp_view, attachments=[])
         except discord.errors.NotFound:
-            print("WARNING: Old game message not found during 'Play Again' cleanup. It might have been deleted manually.")
+            logger.warning("Old game message not found during 'Play Again' cleanup. It might have been deleted manually.")
         except Exception as e:
-            print(f"WARNING: Error editing old game message during 'Play Again' cleanup: {e}")
+            logger.error(f"Error editing old game message during 'Play Again' cleanup: {e}")
 
         # Start a brand new game
         try:
             new_holdem_game = TexasHoldEmGame(interaction.channel.id, interaction.user, self.bot_instance)
             await new_holdem_game.start_game(interaction) # This will send a new message
         except Exception as e:
-            print(f"Error starting new game from Play Again: {e}")
+            logger.error(f"Error starting new game from Play Again: {e}")
             await interaction.followup.send("An error occurred while trying to start a new game. Please try `/serene game texas_hold_em` again.", ephemeral=True)
 
 
@@ -637,6 +699,14 @@ class TexasHoldEmGame:
         self.player = player # Human player
         self.bot_player = bot_instance.user # Serene bot as opponent
         self.bot_instance = bot_instance # Store the bot instance
+        
+        # Database configuration
+        self.db_config = {
+            'host': self.bot_instance.db_host,
+            'user': self.bot_instance.db_user,
+            'password': self.bot_instance.db_password
+        }
+
         self.deck = self._create_standard_deck()
         self.player_hole_cards = []
         self.bot_hole_cards = []
@@ -690,7 +760,7 @@ class TexasHoldEmGame:
         Returns the dealt card (dict with 'title', 'cardNumber', and 'code').
         """
         if not self.deck:
-            print("Warning: Deck is empty, cannot deal more cards.")
+            logger.warning("Deck is empty, cannot deal more cards.")
             return {"title": "No Card", "cardNumber": 0, "code": "NO_CARD"} 
         
         card = random.choice(self.deck)
@@ -798,11 +868,11 @@ class TexasHoldEmGame:
                     font_medium = ImageFont.truetype(font_io, 36) # Increased size
                     font_io.seek(0)
                     font_small = ImageFont.truetype(font_io, 28) # Increased size
-                    print(f"Successfully loaded font from {font_url}")
+                    logger.info(f"Successfully loaded font from {font_url}")
         except aiohttp.ClientError as e:
-            print(f"WARNING: Failed to fetch font from {font_url}: {e}. Using default Pillow font.")
+            logger.warning(f"Failed to fetch font from {font_url}: {e}. Using default Pillow font.")
         except Exception as e:
-            print(f"WARNING: Error loading font from bytes: {e}. Using default Pillow font.")
+            logger.warning(f"Error loading font from bytes: {e}. Using default Pillow font.")
 
         # Define Discord purple color (R, G, B)
         discord_purple = (114, 137, 218)
@@ -831,15 +901,15 @@ class TexasHoldEmGame:
             if comparison > 0:
                 showdown_result_text = f"{player_name} wins with {player_hand_name}!" # Removed emojis
                 # Award kekchipz to player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 200) # Example: 200 kekchipz for winning
+                await update_user_kekchipz(self.player.guild.id, self.player.id, 200, self.db_config) # Example: 200 kekchipz for winning
             elif comparison < 0:
                 showdown_result_text = f"Serene wins with {bot_hand_name}!" # Removed emojis
                 # Deduct kekchipz from player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, -100) # Example: -100 kekchipz for losing
+                await update_user_kekchipz(self.player.guild.id, self.player.id, -100, self.db_config) # Example: -100 kekchipz for losing
             else:
                 showdown_result_text = f"It's a tie with {player_hand_name}!" # Removed emojis
                 # Small kekchipz for tie
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 50) # Example: 50 kekchipz for a tie
+                await update_user_kekchipz(self.player.guild.id, self.player.id, 50, self.db_config) # Example: 50 kekchipz for a tie
 
         # Calculate text dimensions
         showdown_text_width = 0
@@ -962,7 +1032,7 @@ class TexasHoldEmGame:
         Updates the single game message for Texas Hold 'em with the combined image and view.
         This function is used for subsequent edits to the game message after the initial send.
         """
-        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id)
+        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,
             self.bot_player.display_name,
@@ -987,11 +1057,11 @@ class TexasHoldEmGame:
                 # Use 'attachments' keyword argument instead of 'files'
                 await self.game_message.edit(content=message_content, view=view, attachments=[combined_file])
             except discord.errors.NotFound:
-                print("WARNING: Game message not found during edit. This should not happen if initial message was sent correctly.")
+                logger.warning("Game message not found during edit. This should not happen if initial message was sent correctly.")
             except Exception as e:
-                print(f"WARNING: Error editing game message: {e}")
+                logger.error(f"Error editing game message: {e}")
         else:
-            print("ERROR: _update_game_message called but self.game_message is None. This function should only be called after initial message is sent.")
+            logger.error("ERROR: _update_game_message called but self.game_message is None. This function should only be called after initial message is sent.")
 
 
     async def _send_initial_game_message(self, interaction: discord.Interaction, view: TexasHoldEmGameView):
@@ -999,7 +1069,7 @@ class TexasHoldEmGame:
         Sends the initial game message to the channel.
         This function is called once at the start of the game.
         """
-        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id)
+        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,
             self.bot_player.display_name,
@@ -1056,4 +1126,3 @@ async def start(interaction: discord.Interaction, bot_instance: commands.Bot):
     
     # Call the start_game method of the TexasHoldEmGame instance
     await holdem_game.start_game(interaction)
-

@@ -99,7 +99,7 @@ async def _fetch_image_bytes(url: str) -> io.BytesIO | None:
 async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | None:
     """
     Creates a single image by combining multiple card images horizontally,
-    with cards overlapping and scaled down by roughly half.
+    with cards overlapping and scaled down by roughly 1/3 (0.33 multiplier).
     
     Args:
         cards_info (list[dict]): A list of dictionaries, where each dict contains
@@ -118,10 +118,16 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         return byte_arr
 
     card_images = []
-    # Define target size for half-sized cards (original 73x98)
-    target_width = 36
-    target_height = 49
-    overlap_amount = 12 # Roughly 1/3 of the new card width for overlap
+    # Original card size from deckofcardsapi.com is 226x314 pixels
+    original_width = 226
+    original_height = 314
+    scale_multiplier = 0.33
+
+    target_width = int(original_width * scale_multiplier)
+    target_height = int(original_height * scale_multiplier)
+    
+    # Set overlap amount to a raw pixel value of 30
+    overlap_amount = 30 
 
     for card_data in cards_info:
         card_code = card_data['code']
@@ -140,22 +146,28 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
                 # Fallback to a placeholder image
                 placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
                 d = ImageDraw.Draw(placeholder_img)
-                d.text((5, 20), "N/A", fill=(255,255,255), font=ImageFont.load_default())
+                # Adjust text position for smaller placeholder
+                d.text((5, target_height // 2 - 10), "N/A", fill=(255,255,255), font=ImageFont.load_default())
                 card_images.append(placeholder_img)
         else:
             logger.warning(f"Could not fetch image for card code: {card_code}, face_up: {face_up}. Using placeholder.")
             # Fallback for missing images: create a placeholder
             placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
             d = ImageDraw.Draw(placeholder_img)
-            d.text((5, 20), "N/A", fill=(255,255,255), font=ImageFont.load_default())
+            # Adjust text position for smaller placeholder
+            d.text((5, target_height // 2 - 10), "N/A", fill=(255,255,255), font=ImageFont.load_default())
             card_images.append(placeholder_img)
 
     if not card_images:
         return None
 
     # Calculate total width for overlapping cards
-    # (Number of cards * target_width) - ( (Number of cards - 1) * overlap_amount )
+    # Each card contributes its full width, except the last one,
+    # and we subtract (num_cards - 1) * overlap_amount
     total_width = (len(card_images) * target_width) - ((len(card_images) - 1) * overlap_amount) if len(card_images) > 0 else 0
+    if len(card_images) == 1: # If only one card, no overlap calculation needed
+        total_width = target_width
+
     max_height = target_height # All cards are now the same height
 
     # Create a new blank image with enough space

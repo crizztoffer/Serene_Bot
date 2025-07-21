@@ -64,8 +64,8 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Resize the entire image to be 1/4 smaller
         original_width, original_height = base_image.size
-        new_width = int(original_width * 0.25)  # 1/4 smaller means 75% of original size
-        new_height = int(original_height * 0.25)
+        new_width = int(original_width * 0.33)  # 1/4 smaller means 75% of original size
+        new_height = int(original_height * 0.33)
         base_image = base_image.resize((new_width, new_height), Image.LANCZOS) # Use LANCZOS for high-quality downscaling
 
 

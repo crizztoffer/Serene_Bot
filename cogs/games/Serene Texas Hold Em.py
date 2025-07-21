@@ -15,7 +15,7 @@ from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulat
 import aiomysql # Import aiomysql for database operations
 import logging # Import logging
 
-# Explicitly import UI components for clarity and to resolve potential AttributeErrors
+# Explicitly import UI components for clarity
 from discord.ui import View, Select, UserSelect, Button
 
 
@@ -250,57 +250,92 @@ async def _deal_cards(
 
 # --- UI Component Classes ---
 
+class GameModeSelect(Select):
+    def __init__(self):
+        super().__init__(
+            placeholder="Select game mode...",
+            options=[
+                discord.SelectOption(label="Single Player", value="single_player", default=True),
+                discord.SelectOption(label="Multiplayer", value="multiplayer")
+            ],
+            min_values=1,
+            max_values=1,
+            row=0 # Place it at the top row
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        selected_mode = self.values[0]
+        view = self.view # Get reference to the parent view
+
+        if selected_mode == "single_player":
+            view.invite_user_select.disabled = True
+            view.invite_button.disabled = True
+            view.play_button.disabled = False
+            logger.info(f"Game mode set to Single Player by {interaction.user.display_name}.")
+        elif selected_mode == "multiplayer":
+            view.invite_user_select.disabled = False
+            view.invite_button.disabled = True # Invite button disabled until user(s) selected
+            view.play_button.disabled = True
+            logger.info(f"Game mode set to Multiplayer by {interaction.user.display_name}.")
+        
+        # Update the default selection in the select menu itself
+        for option in self.options:
+            option.default = (option.value == selected_mode)
+
+        await interaction.response.edit_message(view=view)
+
+
 class InviteUserSelect(UserSelect):
     def __init__(self):
-        super().__init__(placeholder="Select a player to invite...", min_values=1, max_values=1)
+        # Initially disabled for single player default
+        super().__init__(placeholder="Select a player to invite...", min_values=1, max_values=1, disabled=True, row=1)
 
     async def callback(self, interaction: discord.Interaction):
         selected_user = self.values[0]
-        await interaction.response.send_message(
-            f"You selected {selected_user.mention} to invite.", ephemeral=True
-        )
+        view = self.view # Get reference to the parent view
+
+        # Enable invite button if a user is selected in multiplayer mode
+        if not self.disabled and view.play_button.disabled: # Only enable if in multiplayer mode and play button is disabled
+            view.invite_button.disabled = False
+        else:
+            view.invite_button.disabled = True # Should not happen if logic is correct, but for safety
+
+        await interaction.response.edit_message(view=view)
         logger.info(f"User {interaction.user.display_name} selected {selected_user.display_name} for invite.")
 
 class InviteButton(Button):
     def __init__(self):
-        super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple)
+        # Initially disabled for single player default
+        super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, disabled=True, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        await interaction.response.send_message("Invite button clicked! (Functionality to be added)", ephemeral=True)
-        logger.info(f"User {interaction.user.display_name} clicked the Invite button.")
+        # No message should be sent here as per user's request
+        logger.info(f"User {interaction.user.display_name} clicked the Invite button. (Functionality to be added later)")
+        await interaction.response.defer() # Acknowledge the interaction without sending a message
+
 
 class PlayButton(Button):
     def __init__(self):
-        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green)
-        # We need to access game_state, bot, original_interaction from the parent view.
-        # These will be set by the BetButtonView's __init__ method.
-        self.game_state = None
-        self.bot = None
-        self.original_interaction = None
+        # Initially enabled for single player default
+        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green, disabled=False, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        # Access the parent view to get game_state, bot, original_interaction
         view = self.view # The view property is automatically set by discord.py
         if not view:
             logger.error("PlayButton callback: View is not set.")
-            await interaction.response.send_message("An internal error occurred. Please try again.", ephemeral=True)
+            # Acknowledge the interaction to prevent "Interaction Failed"
+            await interaction.response.defer()
             return
 
-        # Disable the button immediately to prevent multiple clicks
-        self.disabled = True
-        # Disable all other buttons and selects in the view
+        # Disable all UI components on the public message
         for item in view.children:
-            if isinstance(item, Button) and item.label == "Invite to Game":
-                item.disabled = True
-            if isinstance(item, UserSelect):
-                item.disabled = True
+            item.disabled = True
         await interaction.response.edit_message(view=view)
 
-        await interaction.followup.send("You clicked 'Play'! Dealing cards...", ephemeral=True)
-        logger.info(f"Player {interaction.user.display_name} clicked the Play button.")
+        # No "You clicked 'Play'!" message as per user's request
+        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
 
         # Assign the actual player ID to the game state
-        # For simplicity, assuming only one player for now (the one who clicked)
         view.game_state['players_in_game'] = [interaction.user.id]
 
         # Deal cards using the game_state's deck
@@ -314,7 +349,7 @@ class PlayButton(Button):
         view.game_state['player_hands'][interaction.user.id] = dealt_info['player_hands'].get(f"player_0", [])
         view.game_state['dealer_hand'] = dealt_info['dealer_hand']
 
-        # --- Update Public Message (Dealer's hand - both face down) ---
+        # --- Update Public Message (Dealer's hand - image only) ---
         public_cards_info = []
         for card in view.game_state['dealer_hand']:
             public_cards_info.append({'code': card['code'], 'face_up': False})
@@ -325,7 +360,6 @@ class PlayButton(Button):
             updated_public_file = discord.File(updated_combined_image_bytes, filename="dealer_cards_updated.png")
             
             try:
-                # Retrieve the original public message to edit it
                 channel = view.bot.get_channel(view.game_state['channel_id'])
                 if not channel:
                     channel = await view.bot.fetch_channel(view.game_state['channel_id'])
@@ -342,35 +376,49 @@ class PlayButton(Button):
             except Exception as e:
                 logger.error(f"Error updating public message: {e}")
         else:
-            await interaction.followup.send(
-                "Could not create updated dealer's hand image for public display.",
-                ephemeral=True
-            )
+            # If image creation fails, still remove the view
+            try:
+                channel = view.bot.get_channel(view.game_state['channel_id'])
+                if not channel:
+                    channel = await view.bot.fetch_channel(view.game_state['channel_id'])
+                public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
+                await public_message_to_edit.edit(
+                    content="**🃏 Dealer's Hand: (Image failed to load)**",
+                    view=None
+                )
+            except Exception as e:
+                logger.error(f"Error handling image creation failure in public message: {e}")
+            logger.error("Could not create updated dealer's hand image for public display.")
 
-        # --- Send Ephemeral Message to Player (Player's cards face up) ---
+
+        # --- Send Ephemeral Message to Player (Player's cards image + text) ---
         player_hand = view.game_state['player_hands'].get(interaction.user.id, [])
         
         if player_hand:
             player_cards_info = [{'code': card['code'], 'face_up': True} for card in player_hand]
             player_combined_image = await _create_combined_card_image(player_cards_info)
 
+            card_titles = [card['title'] for card in player_hand]
+            player_hand_text = ", ".join(card_titles)
+
             if player_combined_image:
                 player_file = discord.File(player_combined_image, filename="your_hand.png")
                 await interaction.followup.send(
-                    f"👋 {interaction.user.mention}, here is your hand:",
+                    f"👋 {interaction.user.mention}, here is your hand: {player_hand_text}",
                     file=player_file,
                     ephemeral=True # This makes the message private
                 )
                 logger.info(f"Ephemeral message sent to {interaction.user.display_name}")
             else:
                 await interaction.followup.send(
-                    f"Could not display your hand image, {interaction.user.mention}.",
+                    f"Could not display your hand image, {interaction.user.mention}. Your cards: {player_hand_text}",
                     ephemeral=True
                 )
         else:
             await interaction.followup.send(f"You don't have any cards, {interaction.user.mention}.", ephemeral=True)
 
         view.stop() # Stop the view after the button is clicked and actions are performed
+
 
 class BetButtonView(View): # Inherit from View
     def __init__(self, game_state: dict, bot: commands.Bot, original_interaction: discord.Interaction):
@@ -379,17 +427,22 @@ class BetButtonView(View): # Inherit from View
         self.bot = bot
         self.original_interaction = original_interaction # Store the initial interaction
         
-        # Add instances of the custom UI components
-        self.add_item(InviteUserSelect())
-        self.add_item(InviteButton())
-        
-        # Instantiate PlayButton and pass necessary data from the view's context
-        play_button_instance = PlayButton()
-        # Assign game_state, bot, and original_interaction to the PlayButton instance
-        play_button_instance.game_state = game_state
-        play_button_instance.bot = bot
-        play_button_instance.original_interaction = original_interaction
-        self.add_item(play_button_instance)
+        # Instantiate UI components
+        self.game_mode_select = GameModeSelect()
+        self.invite_user_select = InviteUserSelect()
+        self.invite_button = InviteButton()
+        self.play_button = PlayButton()
+
+        # Assign references for PlayButton to access view's context
+        self.play_button.game_state = game_state
+        self.play_button.bot = bot
+        self.play_button.original_interaction = original_interaction
+
+        # Add items to the view in desired order
+        self.add_item(self.game_mode_select)
+        self.add_item(self.invite_user_select)
+        self.add_item(self.invite_button)
+        self.add_item(self.play_button)
 
 
     async def on_timeout(self):
@@ -414,7 +467,7 @@ async def start(interaction: discord.Interaction, bot):
     It now sets up the initial public message with a 'Play' button.
     Card dealing and ephemeral messages are triggered by the button click.
     """
-    await interaction.response.send_message("My Card Game is starting! Click 'Play' to begin.", ephemeral=False)
+    await interaction.response.send_message("My Card Game is starting! Please select a game mode.", ephemeral=False)
     await asyncio.sleep(1)
 
     # --- Game State (In-memory for demonstration) ---
@@ -439,12 +492,12 @@ async def start(interaction: discord.Interaction, bot):
     if initial_combined_image_bytes:
         initial_public_file = discord.File(initial_combined_image_bytes, filename="game_start_placeholder.png")
         public_message = await interaction.followup.send(
-            "**🃏 Game Table: Ready to Play!**\nClick the button below to start the game.",
+            "**🃏 Game Table: Select your game mode:**",
             file=initial_public_file,
             view=view # Attach the view with the button
         )
         game_state['public_message_id'] = public_message.id
-        logger.info(f"Initial public message sent with ID: {public_message.id} and Play button.")
+        logger.info(f"Initial public message sent with ID: {public_message.id} and game mode selection.")
     else:
         await interaction.followup.send(
             "Could not create initial game table image. Game might not proceed as expected.",
@@ -452,7 +505,7 @@ async def start(interaction: discord.Interaction, bot):
             ephemeral=False
         )
 
-    # Wait for the button to be clicked or for the timeout
+    # Wait for the view to stop (e.g., Play button clicked or timeout)
     await view.wait()
     
     # The rest of the game logic (dealing, sending ephemeral messages, updating public message)

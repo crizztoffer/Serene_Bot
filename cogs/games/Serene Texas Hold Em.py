@@ -119,7 +119,7 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         byte_arr = io.BytesIO()
         blank_img.save(byte_arr, format='PNG') # Save as PNG to preserve transparency
         byte_arr.seek(0)
-        return blank_img
+        return byte_arr # Return the BytesIO object here
 
     card_images = []
     # Original card size from deckofcardsapi.com is 226x314 pixels
@@ -385,6 +385,7 @@ class BetButtonView(View): # Inherit from View
         
         # Instantiate PlayButton and pass necessary data from the view's context
         play_button_instance = PlayButton()
+        # Assign game_state, bot, and original_interaction to the PlayButton instance
         play_button_instance.game_state = game_state
         play_button_instance.bot = bot
         play_button_instance.original_interaction = original_interaction

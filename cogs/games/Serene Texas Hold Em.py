@@ -98,7 +98,8 @@ async def _fetch_image_bytes(url: str) -> io.BytesIO | None:
 
 async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | None:
     """
-    Creates a single image by combining multiple card images horizontally.
+    Creates a single image by combining multiple card images horizontally,
+    with cards overlapping and scaled down by roughly half.
     
     Args:
         cards_info (list[dict]): A list of dictionaries, where each dict contains
@@ -117,6 +118,11 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         return byte_arr
 
     card_images = []
+    # Define target size for half-sized cards (original 73x98)
+    target_width = 36
+    target_height = 49
+    overlap_amount = 12 # Roughly 1/3 of the new card width for overlap
+
     for card_data in cards_info:
         card_code = card_data['code']
         face_up = card_data['face_up']
@@ -125,28 +131,32 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         img_bytes = await _fetch_image_bytes(image_url)
         if img_bytes:
             try:
-                card_images.append(Image.open(img_bytes))
+                img = Image.open(img_bytes)
+                # Resize the image
+                img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
+                card_images.append(img)
             except Exception as e:
-                logger.error(f"Failed to open image from bytes for {card_code}: {e}")
+                logger.error(f"Failed to open or resize image from bytes for {card_code}: {e}")
                 # Fallback to a placeholder image
-                placeholder_img = Image.new('RGB', (73, 98), color = (100, 100, 100)) # Standard card size
+                placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
                 d = ImageDraw.Draw(placeholder_img)
-                d.text((5, 40), "N/A", fill=(255,255,255), font=ImageFont.load_default())
+                d.text((5, 20), "N/A", fill=(255,255,255), font=ImageFont.load_default())
                 card_images.append(placeholder_img)
         else:
             logger.warning(f"Could not fetch image for card code: {card_code}, face_up: {face_up}. Using placeholder.")
             # Fallback for missing images: create a placeholder
-            placeholder_img = Image.new('RGB', (73, 98), color = (100, 100, 100)) # Standard card size
+            placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
             d = ImageDraw.Draw(placeholder_img)
-            d.text((5, 40), "N/A", fill=(255,255,255), font=ImageFont.load_default())
+            d.text((5, 20), "N/A", fill=(255,255,255), font=ImageFont.load_default())
             card_images.append(placeholder_img)
 
     if not card_images:
         return None
 
-    # Calculate total width and max height
-    total_width = sum(img.width + 5 for img in card_images) - 5 # Add 5px padding between cards
-    max_height = max(img.height for img in card_images)
+    # Calculate total width for overlapping cards
+    # (Number of cards * target_width) - ( (Number of cards - 1) * overlap_amount )
+    total_width = (len(card_images) * target_width) - ((len(card_images) - 1) * overlap_amount) if len(card_images) > 0 else 0
+    max_height = target_height # All cards are now the same height
 
     # Create a new blank image with enough space
     combined_image = Image.new('RGB', (total_width, max_height), color=(54, 57, 63)) # Discord background color
@@ -154,7 +164,7 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
     x_offset = 0
     for img in card_images:
         combined_image.paste(img, (x_offset, 0))
-        x_offset += img.width + 5 # Add padding
+        x_offset += (target_width - overlap_amount) # Move offset by card width minus overlap
 
     byte_arr = io.BytesIO()
     combined_image.save(byte_arr, format='PNG')

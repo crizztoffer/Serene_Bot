@@ -1,4 +1,4 @@
-# --- cogs/game_main.py ---
+# --- cogs/kekchipz_main.py ---
 
 import discord
 from discord.ext import commands

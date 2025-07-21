@@ -14,7 +14,7 @@ class KekchipzCommands(commands.Cog):
         if self.serene_group is None:
             raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
 
-        @app_commands.command(name="kakchipz", description="Kekchipz commands")
+        @app_commands.command(name="kekchipz", description="Kekchipz commands")
         @app_commands.describe(kekchipz_name="View, request, or give kekchipz")
         @app_commands.autocomplete(kekchipz_name=self.autocomplete_kekchipz)
         async def kekchipz(interaction: discord.Interaction, kekchipz_name: str):

@@ -1,5 +1,3 @@
-# --- bot.py ---
-
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -8,6 +6,8 @@ from dotenv import load_dotenv
 import aiomysql
 import json
 import logging
+import asyncio # Import asyncio for running web server in a separate task
+from aiohttp import web # Import aiohttp for the web server
 
 # Load env vars
 load_dotenv()
@@ -17,6 +17,9 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
+
+# Define the BOT_ENTRY key for validation
+BOT_ENTRY = os.getenv("BOT_ENTRY")
 
 BOT_PREFIX = "!"
 
@@ -68,7 +71,7 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
         logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
     finally:
         if conn:
-            await conn.ensure_closed()
+            conn.close() # Use conn.close() for aiomysql connections
 
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
@@ -99,7 +102,50 @@ async def load_flag_reasons():
         bot.flag_reasons = []
     finally:
         if conn:
-            await conn.ensure_closed()
+            conn.close() # Use conn.close() for aiomysql connections
+
+# --- Web Server Setup ---
+async def settings_saved_handler(request):
+    """
+    Handles POST requests to /settings_saved endpoint.
+    Expects a JSON body with 'guild_id' and 'bot_entry'.
+    """
+    try:
+        data = await request.json()
+        guild_id = data.get('guild_id')
+        bot_entry = data.get('bot_entry')
+        action = data.get('action')
+
+        if bot_entry == BOT_ENTRY:
+            logger.info(f"Received signal: '{action}' for guild ID: {guild_id}")
+            # You can add more logic here, e.g., send a message to a specific Discord channel
+            # For example:
+            # guild = bot.get_guild(int(guild_id))
+            # if guild:
+            #     # Replace 'your-log-channel-id' with an actual channel ID where you want notifications
+            #     log_channel = guild.get_channel(YOUR_LOG_CHANNEL_ID)
+            #     if log_channel:
+            #         await log_channel.send(f"Server settings for guild `{guild.name}` have been saved!")
+            return web.Response(text="Signal received", status=200)
+        else:
+            logger.warning(f"Unauthorized access attempt to /settings_saved. Invalid BOT_ENTRY: {bot_entry}")
+            return web.Response(text="Unauthorized", status=401)
+    except Exception as e:
+        logger.error(f"Error in settings_saved_handler: {e}")
+        return web.Response(text="Internal Server Error", status=500)
+
+async def start_web_server():
+    """Starts the aiohttp web server."""
+    app = web.Application()
+    app.router.add_post('/settings_saved', settings_saved_handler)
+
+    # Get port from environment variable, default to 8080
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port) # Listen on all interfaces
+    await site.start()
+    logger.info(f"Web server started on http://0.0.0.0:{port}")
 
 @bot.event
 async def on_ready():
@@ -140,6 +186,10 @@ async def on_ready():
     # Start background DB check
     hourly_db_check.start()
 
+    # Start the web server in a separate asyncio task
+    bot.loop.create_task(start_web_server())
+
+
 @bot.event
 async def on_member_join(member):
     if not member.bot:
@@ -159,8 +209,8 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("You lack permissions.")
     else:
-        logger.error(f"Command error: {error}")
-        await ctx.send(f"Unexpected error: {error}")
+        logger.error(f"Command error: {e}")
+        await ctx.send(f"Unexpected error: {e}")
 
 @tasks.loop(hours=1)
 async def hourly_db_check():
@@ -179,7 +229,7 @@ async def hourly_db_check():
         logger.error(f"Hourly DB check failed: {e}")
     finally:
         if conn:
-            await conn.ensure_closed()
+            conn.close() # Use conn.close() for aiomysql connections
 
 async def load_cogs():
     if not os.path.exists("cogs"):

@@ -110,8 +110,8 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         io.BytesIO | None: A BytesIO object containing the combined image, or None if an error occurs.
     """
     if not cards_info:
-        # Return a blank image or a placeholder if no cards are provided
-        blank_img = Image.new('RGB', (1, 1), color=(54, 57, 63))
+        # Return a blank transparent image if no cards are provided
+        blank_img = Image.new('RGBA', (1, 1), color=(0, 0, 0, 0)) # Transparent background
         byte_arr = io.BytesIO()
         blank_img.save(byte_arr, format='PNG')
         byte_arr.seek(0)
@@ -122,13 +122,12 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
     original_width = 226
     original_height = 314
     scale_multiplier = 0.33
+    # Fixed overlap amount in pixels
+    overlap_amount = 30 
 
     target_width = int(original_width * scale_multiplier)
     target_height = int(original_height * scale_multiplier)
     
-    # Set overlap amount to a raw pixel value of 30
-    overlap_amount = 30 
-
     for card_data in cards_info:
         card_code = card_data['code']
         face_up = card_data['face_up']
@@ -138,21 +137,24 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         if img_bytes:
             try:
                 img = Image.open(img_bytes)
+                # Convert to RGBA if not already, to ensure transparency can be preserved if needed
+                if img.mode != 'RGBA':
+                    img = img.convert('RGBA')
                 # Resize the image
                 img = img.resize((target_width, target_height), Image.Resampling.LANCZOS)
                 card_images.append(img)
             except Exception as e:
                 logger.error(f"Failed to open or resize image from bytes for {card_code}: {e}")
-                # Fallback to a placeholder image
-                placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
+                # Fallback to a placeholder image with transparent background
+                placeholder_img = Image.new('RGBA', (target_width, target_height), color = (100, 100, 100, 0)) # Transparent
                 d = ImageDraw.Draw(placeholder_img)
                 # Adjust text position for smaller placeholder
                 d.text((5, target_height // 2 - 10), "N/A", fill=(255,255,255), font=ImageFont.load_default())
                 card_images.append(placeholder_img)
         else:
             logger.warning(f"Could not fetch image for card code: {card_code}, face_up: {face_up}. Using placeholder.")
-            # Fallback for missing images: create a placeholder
-            placeholder_img = Image.new('RGB', (target_width, target_height), color = (100, 100, 100))
+            # Fallback for missing images: create a placeholder with transparent background
+            placeholder_img = Image.new('RGBA', (target_width, target_height), color = (100, 100, 100, 0)) # Transparent
             d = ImageDraw.Draw(placeholder_img)
             # Adjust text position for smaller placeholder
             d.text((5, target_height // 2 - 10), "N/A", fill=(255,255,255), font=ImageFont.load_default())
@@ -170,16 +172,16 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
 
     max_height = target_height # All cards are now the same height
 
-    # Create a new blank image with enough space
-    combined_image = Image.new('RGB', (total_width, max_height), color=(54, 57, 63)) # Discord background color
+    # Create a new blank image with enough space, using RGBA for transparency
+    combined_image = Image.new('RGBA', (total_width, max_height), color=(0, 0, 0, 0)) # Transparent background
 
     x_offset = 0
     for img in card_images:
-        combined_image.paste(img, (x_offset, 0))
+        combined_image.paste(img, (x_offset, 0), img) # Use img as mask for transparency
         x_offset += (target_width - overlap_amount) # Move offset by card width minus overlap
 
     byte_arr = io.BytesIO()
-    combined_image.save(byte_arr, format='PNG')
+    combined_image.save(byte_arr, format='PNG') # Save as PNG to preserve transparency
     byte_arr.seek(0)
     return byte_arr
 

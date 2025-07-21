@@ -3,11 +3,13 @@ import asyncio
 import random
 import io
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
+import time # Import the time module for timestamps
 from discord.ext import commands
 import aiomysql
 
 # --- Database Operations (Copied from the.py for self-containment) ---
+# In a real application, these would ideally be imported from a central database module.
 async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
     """
     Placeholder function to simulate updating a user's kekchipz balance in a database.
@@ -63,7 +65,9 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
     Returns:
         io.BytesIO: A BytesIO object containing the generated PNG image.
     """
-    base_image_url = "https://serenekeks.com/kcpz.png"
+    # Append a timestamp to the URL to bust Discord's cache
+    timestamp = int(time.time())
+    base_image_url = f"https://serenekeks.com/kcpz.png?t={timestamp}"
     font_url = "http://serenekeks.com/OpenSans-CondLight.ttf"
 
     try:

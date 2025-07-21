@@ -475,6 +475,8 @@ class TexasHoldEmGameView(discord.ui.View):
             # Case 1: Pre-flop Call (player calls the initial big blind)
             if self.game.game_phase == "pre_flop":
                 self.game.g_total = self.game.minimum_bet * 2 # Player matches big blind
+                # Deduct minimum_bet from player's balance for the call
+                await update_user_kekchipz(interaction.guild.id, interaction.user.id, -self.game.minimum_bet, self.game.db_config)
                 self.game.deal_flop()
                 self._set_button_states("flop") # Transition to flop buttons
                 await self.game._update_game_message(self)
@@ -482,6 +484,8 @@ class TexasHoldEmGameView(discord.ui.View):
 
             # Case 2: Player calls after dealer's raise (post-flop)
             elif self.game.player_action_pending and self.game.dealer_raise_amount > 0:
+                # Deduct dealer_raise_amount from player's balance for the call
+                await update_user_kekchipz(interaction.guild.id, interaction.user.id, -self.game.dealer_raise_amount, self.game.db_config)
                 self.game.g_total += self.game.dealer_raise_amount * 2 # Player matches dealer's raise
                 self.game.dealer_raise_amount = 0 # Reset dealer's raise
                 self.game.player_action_pending = False # Player's action is complete
@@ -526,26 +530,19 @@ class TexasHoldEmGameView(discord.ui.View):
             
             await interaction.response.defer() # Defer to allow time for updates
 
-            # Player folds, loses minimum bet (pre-flop) or current Gtotal contribution
-            # Assuming the player's contribution to g_total is half if dealer hasn't raised,
-            # or the amount they would have had to call if dealer raised.
-            # For simplicity, let's assume they lose the minimum bet if pre-flop,
-            # otherwise they lose their current contribution to the pot.
-            # This logic might need refinement based on exact game rules.
-            kekchipz_lost = self.game.minimum_bet
-            if self.game.game_phase != "pre_flop":
-                # This is a simplification. In a real game, it's more complex.
-                # For now, let's say they lose the minimum bet if folding post-flop too.
-                # Or, if we want to be more accurate, they lose what they've put in so far.
-                # For this implementation, let's just use minimum_bet as the base loss on fold.
-                pass # Already set to minimum_bet above
-
-            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -int(kekchipz_lost), self.game.db_config)
+            # Player folds, loses their implied contribution to the pot (half of Gtotal)
+            # Note: This assumes Gtotal accurately reflects player's contribution + bot's contribution.
+            # If player folds, they lose what they put in.
+            # A more precise implementation would track player's individual bet amount.
+            # For simplicity, we'll assume they lose half of the current pot on fold.
+            kekchipz_lost = int(self.game.g_total / 2)
+            
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -kekchipz_lost, self.game.db_config)
             
             self._end_game_buttons()
             self.game.game_phase = "folded" # Indicate game ended by fold
             await self.game._update_game_message(self, reveal_opponent=True)
-            await interaction.followup.send(f"{self.game.player.display_name} folded. You lost ${int(kekchipz_lost)} kekchipz. Game over.")
+            await interaction.followup.send(f"{self.game.player.display_name} folded. You lost ${kekchipz_lost} kekchipz. Game over.")
             del active_texasholdem_games[self.game.channel_id]
             self.stop()
         except Exception as e:
@@ -635,6 +632,9 @@ class TexasHoldEmGameView(discord.ui.View):
             custom_id = interaction.data['custom_id']
             bet_amount = int(custom_id.split('_')[-1]) # Extract amount from "holdem_bet_X"
             
+            # Deduct the bet amount from the player's balance immediately
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -bet_amount, self.game.db_config)
+
             self.game.handle_player_raise(bet_amount) # This updates g_total and sets betting_buttons_visible to False
 
             # Advance game phase based on current phase
@@ -722,7 +722,7 @@ class TexasHoldEmGame:
         
         # Game state for betting
         self.minimum_bet = 10
-        self.g_total = 0
+        self.g_total = 0 # Represents the total pot
         self.current_bet_buttons_visible = False # Flag to control visibility of $5, $10, $25 buttons
         self.dealer_raise_amount = 0 # Stores the amount dealer raised
         self.player_action_pending = False # True if player needs to respond to dealer's raise
@@ -798,6 +798,7 @@ class TexasHoldEmGame:
 
     def handle_player_raise(self, bet_amount: int):
         """Handles player's raise action."""
+        # The actual deduction from player's balance is now handled in bet_amount_callback
         if self.game_phase == "pre_flop":
             self.g_total = (bet_amount * 2) + self.minimum_bet # Raise amount * 2 + minimum
         else:
@@ -907,17 +908,17 @@ class TexasHoldEmGame:
             comparison = compare_scores(player_best_hand, bot_best_hand)
 
             if comparison > 0:
-                showdown_result_text = f"{player_name} wins with {player_hand_name}!" # Removed emojis
-                # Award kekchipz to player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 200, self.db_config) # Example: 200 kekchipz for winning
+                showdown_result_text = f"{player_name} wins with {player_hand_name}!"
+                # Award kekchipz to player (wins the entire pot)
+                await update_user_kekchipz(self.player.guild.id, self.player.id, self.g_total, self.db_config)
             elif comparison < 0:
-                showdown_result_text = f"Serene wins with {bot_hand_name}!" # Removed emojis
-                # Deduct kekchipz from player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, -100, self.db_config) # Example: -100 kekchipz for losing
+                showdown_result_text = f"Serene wins with {bot_hand_name}!"
+                # Deduct kekchipz from player (loses their implied half of the pot)
+                await update_user_kekchipz(self.player.guild.id, self.player.id, -int(self.g_total / 2), self.db_config)
             else:
-                showdown_result_text = f"It's a tie with {player_hand_name}!" # Removed emojis
-                # Small kekchipz for tie
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 50, self.db_config) # Example: 50 kekchipz for a tie
+                showdown_result_text = f"It's a tie with {player_hand_name}!"
+                # Small kekchipz for tie (player gets their implied half of the pot back)
+                await update_user_kekchipz(self.player.guild.id, self.player.id, int(self.g_total / 2), self.db_config)
 
         # Calculate text dimensions
         showdown_text_width = 0
@@ -1064,7 +1065,7 @@ class TexasHoldEmGame:
         if self.game_message:
             try:
                 # Use 'attachments' keyword argument instead of 'files'
-                await self.game_message.edit(content=message_content, view=view, attachments=[combined_file])
+                await self.game.game_message.edit(content=message_content, view=view, attachments=[combined_file])
             except discord.errors.NotFound:
                 logger.warning("Game message not found during edit. This should not happen if initial message was sent correctly.")
             except Exception as e:

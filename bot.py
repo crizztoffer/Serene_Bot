@@ -37,7 +37,6 @@ logger = logging.getLogger(__name__)
 
 # DB methods
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
-    """Adds a user to the database if they do not already exist."""
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
         return
@@ -74,7 +73,6 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
 async def load_flag_reasons():
-    """Load flag reasons from DB and store on bot."""
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials, cannot load flag reasons.")
         bot.flag_reasons = []
@@ -115,21 +113,31 @@ async def on_ready():
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
 
-    await load_cogs()  # This will now load admin_main.py, which in turn loads flag.py
+    # Load all cogs
+    await load_cogs()
 
-    # 🔄 Force-sync commands per guild
+    # Global sync (optional, helpful to clear cache)
+    try:
+        await bot.tree.sync()
+        logger.info("✅ Globally synced all commands")
+    except Exception as e:
+        logger.error(f"Global sync failed: {e}")
+
+    # Force-sync commands per guild
     for guild in bot.guilds:
         try:
             await bot.tree.sync(guild=guild)
-            logger.info(f"Force-synced commands for guild: {guild.name} ({guild.id})")
+            logger.info(f"✅ Resynced commands for guild: {guild.name} ({guild.id})")
         except Exception as e:
             logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
 
+    # Ensure all users are in DB
     for guild in bot.guilds:
         for member in guild.members:
             if not member.bot:
                 await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
 
+    # Start background DB check
     hourly_db_check.start()
 
 @bot.event
@@ -174,7 +182,6 @@ async def hourly_db_check():
             await conn.ensure_closed()
 
 async def load_cogs():
-    """Loads all cogs from the 'cogs' directory."""
     if not os.path.exists("cogs"):
         os.makedirs("cogs")
     for filename in os.listdir("cogs"):

@@ -27,15 +27,17 @@ class TicTacToeButton(ui.Button):
 
         if view.check_winner("X"):
             await interaction.response.edit_message(view=view)
-            await interaction.followup.send("You win! 🎉", ephemeral=True)
-            await view.give_kekchipz_reward(interaction.user.id, "win") # Reward for winning
+            # --- MODIFICATION: Get new balance and display in message ---
+            new_balance = await view.give_kekchipz_reward(interaction.user.id, "win")
+            await interaction.followup.send(f"You win! 🎉 You earned 50 Kekchipz and now have ${new_balance:,} Kekchipz.", ephemeral=True)
             view.disable_all_buttons()
             return
 
         if view.is_full():
             await interaction.response.edit_message(view=view)
-            await interaction.followup.send("It's a tie!", ephemeral=True)
-            await view.give_kekchipz_reward(interaction.user.id, "tie") # Reward for tying
+            # --- MODIFICATION: Get new balance and display in message ---
+            new_balance = await view.give_kekchipz_reward(interaction.user.id, "tie")
+            await interaction.followup.send(f"It's a tie! You earned 25 Kekchipz and now have ${new_balance:,} Kekchipz.", ephemeral=True)
             view.disable_all_buttons()
             return
 
@@ -47,7 +49,7 @@ class TicTacToeView(ui.View):
     def __init__(self, interaction: discord.Interaction, db_config: dict):
         super().__init__(timeout=300)
         self.interaction = interaction
-        self.db_config = db_config # Store database configuration
+        self.db_config = db_config
         self.board = [["" for _ in range(3)] for _ in range(3)]
         self.current_turn = "X"
         self.add_buttons()
@@ -73,40 +75,59 @@ class TicTacToeView(ui.View):
         ) or all(self.board[i][i] == player for i in range(3)) or \
                all(self.board[i][2 - i] == player for i in range(3))
 
-    async def give_kekchipz_reward(self, discord_id: int, outcome: str):
+    async def give_kekchipz_reward(self, discord_id: int, outcome: str) -> int:
         """
-        Awards kekchipz based on game outcome and updates the database.
+        Awards kekchipz based on game outcome, updates the database,
+        and returns the user's new balance.
         """
         reward_amount = 0
+        outcome_text = ""
         if outcome == "win":
             reward_amount = 50
+            outcome_text = "win"
         elif outcome == "tie":
             reward_amount = 25
+            outcome_text = "tie"
         elif outcome == "lose":
             reward_amount = 5
+            outcome_text = "lose"
         
-        if reward_amount > 0:
-            conn = None
-            try:
-                conn = await aiomysql.connect(
-                    host=self.db_config['host'],
-                    user=self.db_config['user'],
-                    password=self.db_config['password'],
-                    db="serene_users", # Assuming this is the database name
-                    charset='utf8mb4',
-                    autocommit=True
+        new_balance = 0 # Default if update fails
+        conn = None
+        try:
+            conn = await aiomysql.connect(
+                host=self.db_config['host'],
+                user=self.db_config['user'],
+                password=self.db_config['password'],
+                db="serene_users",
+                charset='utf8mb4',
+                autocommit=True
+            )
+            async with conn.cursor() as cursor:
+                # Update balance
+                await cursor.execute(
+                    "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE channel_id = %s AND discord_id = %s",
+                    (reward_amount, str(self.interaction.guild.id), str(discord_id))
                 )
-                async with conn.cursor() as cursor:
-                    await cursor.execute(
-                        "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE channel_id = %s AND discord_id = %s",
-                        (reward_amount, str(self.interaction.guild.id), str(discord_id))
-                    )
-                    print(f"User {discord_id} in guild {self.interaction.guild.id} awarded {reward_amount} kekchipz for {outcome}.")
-            except Exception as e:
-                print(f"Database error while awarding kekchipz: {e}")
-            finally:
-                if conn:
-                    await conn.ensure_closed()
+                print(f"User {discord_id} in guild {self.interaction.guild.id} awarded {reward_amount} kekchipz for {outcome_text}.")
+                
+                # Fetch new balance
+                await cursor.execute(
+                    "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                    (str(self.interaction.guild.id), str(discord_id))
+                )
+                result = await cursor.fetchone()
+                if result:
+                    new_balance = result[0]
+
+        except Exception as e:
+            print(f"Database error while awarding kekchipz: {e}")
+        finally:
+            if conn:
+                await conn.ensure_closed()
+        
+        return new_balance # Return the updated balance
+
 
     async def bot_move(self, interaction: discord.Interaction):
         await asyncio.sleep(1)
@@ -121,15 +142,17 @@ class TicTacToeView(ui.View):
 
         if self.check_winner("O"):
             await interaction.edit_original_response(view=self)
-            await interaction.followup.send("Serene wins! 😈", ephemeral=True)
-            await self.give_kekchipz_reward(interaction.user.id, "lose") # User loses, give 5 kekchipz
+            # --- MODIFICATION: Get new balance and display in message ---
+            new_balance = await self.give_kekchipz_reward(interaction.user.id, "lose")
+            await interaction.followup.send(f"Serene wins! 😈 You earned 5 Kekchipz and now have ${new_balance:,} Kekchipz.", ephemeral=True)
             self.disable_all_buttons()
             return
 
         if self.is_full():
             await interaction.edit_original_response(view=self)
-            await interaction.followup.send("It's a tie!", ephemeral=True)
-            await self.give_kekchipz_reward(interaction.user.id, "tie") # Reward for tying
+            # --- MODIFICATION: Get new balance and display in message ---
+            new_balance = await self.give_kekchipz_reward(interaction.user.id, "tie")
+            await interaction.followup.send(f"It's a tie! You earned 25 Kekchipz and now have ${new_balance:,} Kekchipz.", ephemeral=True)
             self.disable_all_buttons()
             return
 

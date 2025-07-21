@@ -7,41 +7,101 @@ import os # For environment variables like API keys
 import urllib.parse # For URL encoding
 import aiohttp # For asynchronous HTTP requests
 from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
+import aiomysql # Import aiomysql for database interaction
+import logging
+
+# Set up logging for this module
+logger = logging.getLogger(__name__)
 
 # --- Game State Storage ---
 # This dictionary will store active Blackjack games by channel ID.
 # This ensures only one game can run per channel at a time.
 active_blackjack_games = {}
 
-# --- Database Operations (Placeholders) ---
-# These functions are placeholders for actual database interactions.
-# In a real application, you would connect to a database (e.g., MySQL, PostgreSQL, SQLite)
-# to persist user data like "kekchipz" (a fictional currency).
-# For this isolated file, they simply print messages.
+# --- Database Operations ---
+async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, bot_instance: commands.Bot):
+    """
+    Updates a user's kekchipz balance in the database.
+    Ensures the balance does not go below zero.
+    """
+    if not all([bot_instance.db_user, bot_instance.db_password, bot_instance.db_host]):
+        logger.error("Missing DB credentials in bot_instance for update_user_kekchipz.")
+        return
 
-async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
-    """
-    Placeholder function to simulate updating a user's kekchipz balance in a database.
-    In a real scenario, this would interact with a database.
-    """
-    print(f"Simulating update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}.")
-    # Example of how you might integrate a real database call:
-    # try:
-    #     conn = await aiomysql.connect(...)
-    #     async with conn.cursor() as cursor:
-    #         await cursor.execute("UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s", (amount, str(guild_id), str(discord_id)))
-    # except Exception as e:
-    #     print(f"Database update failed: {e}")
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=bot_instance.db_host,
+            user=bot_instance.db_user,
+            password=bot_instance.db_password,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            # First, get the current kekchipz balance
+            await cursor.execute(
+                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            result = await cursor.fetchone()
+            
+            current_kekchipz = result[0] if result else 0
+            new_kekchipz = current_kekchipz + amount
 
-async def get_user_kekchipz(guild_id: int, discord_id: int) -> int:
+            # Ensure kekchipz does not go below zero
+            if new_kekchipz < 0:
+                new_kekchipz = 0
+                logger.info(f"User {discord_id} balance would go negative, setting to 0.")
+
+            await cursor.execute(
+                "UPDATE discord_users SET kekchipz = %s WHERE channel_id = %s AND discord_id = %s",
+                (new_kekchipz, str(guild_id), str(discord_id))
+            )
+            logger.info(f"Updated user {discord_id} in guild {guild_id} kekchipz from {current_kekchipz} to {new_kekchipz} (change: {amount}).")
+    except Exception as e:
+        logger.error(f"DB error in update_user_kekchipz for user {discord_id}: {e}")
+    finally:
+        if conn:
+            await conn.ensure_closed()
+
+async def get_user_kekchipz(guild_id: int, discord_id: int, bot_instance: commands.Bot) -> int:
     """
-    Placeholder function to simulate fetching a user's kekchipz balance from a database.
+    Fetches a user's kekchipz balance from the database.
     Returns 0 if the user is not found or an error occurs.
     """
-    print(f"Simulating fetch: Getting kekchipz for user {discord_id} in guild {guild_id}.")
-    # In a real scenario, this would query a database.
-    # For now, let's return a dummy value or a default.
-    return 1000 # Example: User starts with 1000 kekchipz for testing
+    if not all([bot_instance.db_user, bot_instance.db_password, bot_instance.db_host]):
+        logger.error("Missing DB credentials in bot_instance for get_user_kekchipz.")
+        return 0
+
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=bot_instance.db_host,
+            user=bot_instance.db_user,
+            password=bot_instance.db_password,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            result = await cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                # If user not found, add them with 0 kekchipz and then return 0
+                await bot_instance.add_user_to_db_if_not_exists(guild_id, "UnknownUser", discord_id)
+                return 0
+    except Exception as e:
+        logger.error(f"DB error in get_user_kekchipz for user {discord_id}: {e}")
+        return 0
+    finally:
+        if conn:
+            await conn.ensure_closed()
 
 
 # --- Image Generation Function ---
@@ -113,7 +173,7 @@ async def create_card_combo_image(combo_str: str, scale_factor: float = 1.0, ove
                     card_images.append(pil_image)
 
         except aiohttp.ClientError as e:
-            print(f"Failed to fetch PNG for card '{card}' from {png_url}: {e}")
+            logger.error(f"Failed to fetch PNG for card '{card}' from {png_url}: {e}")
             # If the first card fails, ensure default dimensions are set
             if first_card_width is None:
                 first_card_width = default_card_width
@@ -121,7 +181,7 @@ async def create_card_combo_image(combo_str: str, scale_factor: float = 1.0, ove
             # Append a placeholder for failed cards to avoid breaking the layout
             card_images.append(Image.new('RGBA', (int(first_card_width * scale_factor), int(first_card_height * scale_factor)), (255, 0, 0, 128))) # Red transparent placeholder
         except Exception as e:
-            print(f"Error processing PNG for card '{card}' from {png_url}: {e}")
+            logger.error(f"Error processing PNG for card '{card}' from {png_url}: {e}")
             # If the first card fails, ensure default dimensions are set
             if first_card_width is None:
                 first_card_width = default_card_width
@@ -178,11 +238,11 @@ class BlackjackGameView(discord.ui.View):
             if self.message: # self.message holds the actual discord.Message object
                 await self.message.edit(embed=embed, view=view_to_use, attachments=[player_file, dealer_file])
             else:
-                print("WARNING: self.message is not set. Cannot update game message.")
+                logger.warning("self.message is not set. Cannot update game message.")
         except discord.errors.NotFound:
-            print("WARNING: Game message not found during edit, likely already deleted.")
+            logger.warning("Game message not found during edit, likely already deleted.")
         except Exception as e:
-            print(f"WARNING: An error occurred editing game message: {e}")
+            logger.warning(f"An error occurred editing game message: {e}")
 
     def _set_button_states(self, game_state: str):
         """
@@ -221,19 +281,19 @@ class BlackjackGameView(discord.ui.View):
                     try:
                         await self.message.edit(content="Blackjack game ended due to inactivity (Play Again not pressed).", view=self, embed=self.message.embed)
                     except discord.errors.NotFound:
-                        print("WARNING: Game message not found during play again timeout, likely already deleted.")
+                        logger.warning("Game message not found during play again timeout, likely already deleted.")
                     except Exception as e:
-                        print(f"WARNING: An error occurred editing game message on play again timeout: {e}")
+                        logger.warning(f"An error occurred editing game message on play again timeout: {e}")
                 
                 # Clean up the game state
                 del active_blackjack_games[self.game.channel_id]
                 self.stop() # Stop the view's main timeout as well
-                print(f"Blackjack game in channel {self.game.channel_id} ended due to Play Again timeout.")
+                logger.info(f"Blackjack game in channel {self.game.channel_id} ended due to Play Again timeout.")
         except asyncio.CancelledError:
             # Task was cancelled because "Play Again" was clicked
-            print(f"Play Again timeout task for channel {self.game.channel_id} cancelled.")
+            logger.info(f"Play Again timeout task for channel {self.game.channel_id} cancelled.")
         except Exception as e:
-            print(f"An unexpected error occurred in _handle_play_again_timeout: {e}")
+            logger.error(f"An unexpected error occurred in _handle_play_again_timeout: {e}")
 
 
     async def on_timeout(self):
@@ -245,16 +305,16 @@ class BlackjackGameView(discord.ui.View):
                 await self.message.edit(content="Blackjack game timed out due to inactivity. Click 'Play Again' to start a new game.", view=self, embed=self.message.embed)
 
             except discord.errors.NotFound:
-                print("WARNING: Game message not found during timeout, likely already deleted.")
+                logger.warning("Game message not found during timeout, likely already deleted.")
             except Exception as e:
-                print(f"WARNING: An error occurred editing board message on timeout: {e}")
+                logger.warning(f"An error occurred editing board message on timeout: {e}")
         
         if self.game.channel_id in active_blackjack_games:
             # We don't delete the game from active_blackjack_games here,
             # as we want the "Play Again" button to be functional.
             # The game will be removed when "Play Again" is clicked or a new game starts.
             pass
-        print(f"Blackjack game in channel {self.game.channel_id} timed out.")
+        logger.info(f"Blackjack game in channel {self.game.channel_id} timed out.")
 
 
     @discord.ui.button(label="Hit", style=discord.ButtonStyle.green, custom_id="blackjack_hit")
@@ -278,7 +338,7 @@ class BlackjackGameView(discord.ui.View):
             embed, player_file, dealer_file = await self.game._create_game_embed_with_images()
             embed.set_footer(text="BUST! Serene wins.")
             await self._update_game_message(embed, player_file, dealer_file, self) # Use helper
-            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -50)
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -50, self.bot_instance)
             # Game is over, cancel any pending play_again_timeout_task
             if self.play_again_timeout_task and not self.play_again_timeout_task.done():
                 self.play_again_timeout_task.cancel()
@@ -315,15 +375,19 @@ class BlackjackGameView(discord.ui.View):
 
         result_message = ""
         kekchipz_change = 0
+
+        player_blackjack = self.game.is_blackjack(self.game.player_hand)
+        dealer_blackjack = self.game.is_blackjack(self.game.dealer_hand)
+
         if serene_value > 21:
             result_message = "Serene busts! You win!"
-            kekchipz_change = 100
+            kekchipz_change = 100 if player_blackjack else 50
         elif player_value > serene_value:
             result_message = "You win!"
-            kekchipz_change = 100
+            kekchipz_change = 100 if player_blackjack else 50
         elif serene_value > player_value:
             result_message = "Serene wins!"
-            kekchipz_change = -50
+            kekchipz_change = -100 if dealer_blackjack else -50
         else:
             result_message = "It's a push (tie)!"
             kekchipz_change = 0
@@ -332,7 +396,7 @@ class BlackjackGameView(discord.ui.View):
         embed, player_file, dealer_file = await self.game._create_game_embed_with_images(reveal_dealer=True)
         embed.set_footer(text=result_message)
         await self._update_game_message(embed, player_file, dealer_file, self) # Use helper
-        await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change)
+        await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
         # Game is over, cancel any pending play_again_timeout_task
         if self.play_again_timeout_task and not self.play_again_timeout_task.done():
             self.play_again_timeout_task.cancel()
@@ -366,12 +430,12 @@ class BlackjackGameView(discord.ui.View):
             await self._update_game_message(embed, player_file, dealer_file, self) # Use helper
             active_blackjack_games[self.game.channel_id] = self
         except discord.errors.NotFound:
-            print("WARNING: Original game message not found during 'Play Again' edit.")
+            logger.warning("Original game message not found during 'Play Again' edit.")
             await interaction.followup.send("Could not restart game. Please try `/serene game blackjack` again.", ephemeral=True)
             if self.game.channel_id in active_blackjack_games:
                 del active_blackjack_games[self.game.channel_id]
         except Exception as e:
-            print(f"WARNING: An error occurred during 'Play Again' edit: {e}")
+            logger.error(f"An error occurred during 'Play Again' edit: {e}")
             await interaction.followup.send("An error occurred while restarting the game.", ephemeral=True)
             if self.game.channel_id in active_blackjack_games:
                 del active_blackjack_games[self.channel_id]
@@ -429,7 +493,7 @@ class BlackjackGame:
         """
         if not self.deck:
             # Handle case where deck is empty (e.g., reshuffle or end game)
-            print("Warning: Deck is empty, cannot deal more cards.")
+            logger.warning("Deck is empty, cannot deal more cards.")
             # Return a dummy card with empty image and code for graceful failure
             return {"title": "No Card", "cardNumber": 0, "code": "NO_CARD"} 
         
@@ -460,6 +524,12 @@ class BlackjackGame:
             num_aces -= 1
         return value
 
+    def is_blackjack(self, hand: list[dict]) -> bool:
+        """
+        Checks if a hand is a "true" Blackjack (2 cards, value 21).
+        """
+        return len(hand) == 2 and self.calculate_hand_value(hand) == 21
+
     async def _create_game_embed_with_images(self, reveal_dealer: bool = False) -> tuple[discord.Embed, discord.File]:
         """
         Creates and returns a Discord Embed object and Discord.File objects
@@ -470,8 +540,8 @@ class BlackjackGame:
         player_value = self.calculate_hand_value(self.player_hand)
         serene_value = self.calculate_hand_value(self.dealer_hand)
 
-        # Fetch player's kekchipz
-        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id)
+        # Fetch player's kekchipz using the updated function
+        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.bot_instance)
 
         # Generate player's hand image
         player_card_codes = [card['code'] for card in self.player_hand if 'code' in card]
@@ -583,4 +653,3 @@ async def start(interaction: discord.Interaction, bot_instance: commands.Bot):
     
     # Call the start_game method of the BlackjackGame instance
     await blackjack_game.start_game(interaction)
-

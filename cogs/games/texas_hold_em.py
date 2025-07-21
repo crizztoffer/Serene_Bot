@@ -23,7 +23,7 @@ active_texasholdem_games = {}
 # --- Database Operations ---
 # These functions will now interact with the MySQL database using aiomysql.
 
-async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_config: dict):
+async def update_user_kekchipz(channel_id: int, discord_id: int, amount: int, db_config: dict):
     """
     Updates a user's kekchipz balance in the database.
     Ensures the balance does not go below zero.
@@ -41,8 +41,8 @@ async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_c
         async with conn.cursor() as cursor:
             # First, get the current kekchipz
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
-                (str(guild_id), str(discord_id))
+                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(channel_id), str(discord_id))
             )
             result = await cursor.fetchone()
             current_kekchipz = result[0] if result else 0
@@ -52,17 +52,17 @@ async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_c
                 new_kekchipz = 0 # Ensure balance doesn't go negative
 
             await cursor.execute(
-                "UPDATE discord_users SET kekchipz = %s WHERE guild_id = %s AND discord_id = %s",
-                (new_kekchipz, str(guild_id), str(discord_id))
+                "UPDATE discord_users SET kekchipz = %s WHERE channel_id = %s AND discord_id = %s",
+                (new_kekchipz, str(channel_id), str(discord_id))
             )
-            logger.info(f"DB Update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}. New balance: {new_kekchipz}.")
+            logger.info(f"DB Update: User {discord_id} in channel {channel_id} kekchipz changed by {amount}. New balance: {new_kekchipz}.")
     except Exception as e:
         logger.error(f"DB error in update_user_kekchipz for user {discord_id}: {e}")
     finally:
         if conn:
             await conn.ensure_closed()
 
-async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> int:
+async def get_user_kekchipz(channel_id: int, discord_id: int, db_config: dict) -> int:
     """
     Fetches a user's kekchipz balance from the database.
     Returns 0 if the user is not found or an error occurs.
@@ -79,14 +79,14 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> 
         )
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
-                (str(guild_id), str(discord_id))
+                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(channel_id), str(discord_id))
             )
             result = await cursor.fetchone()
             if result:
                 return result[0]
             else:
-                logger.warning(f"User {discord_id} not found in DB for guild {guild_id}. Returning 0 kekchipz.")
+                logger.warning(f"User {discord_id} not found in DB for channel {channel_id}. Returning 0 kekchipz.")
                 return 0
     except Exception as e:
         logger.error(f"DB error in get_user_kekchipz for user {discord_id}: {e}")
@@ -532,7 +532,7 @@ class TexasHoldEmGameView(discord.ui.View):
                 # For this implementation, let's just use minimum_bet as the base loss on fold.
                 pass # Already set to minimum_bet above
 
-            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -int(kekchipz_lost), self.game.db_config)
+            await update_user_kekchipz(interaction.channel.id, interaction.user.id, -int(kekchipz_lost), self.game.db_config)
             
             self._end_game_buttons()
             self.game.game_phase = "folded" # Indicate game ended by fold
@@ -901,15 +901,15 @@ class TexasHoldEmGame:
             if comparison > 0:
                 showdown_result_text = f"{player_name} wins with {player_hand_name}!" # Removed emojis
                 # Award kekchipz to player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 200, self.db_config) # Example: 200 kekchipz for winning
+                await update_user_kekchipz(self.channel_id, self.player.id, 200, self.db_config) # Example: 200 kekchipz for winning
             elif comparison < 0:
                 showdown_result_text = f"Serene wins with {bot_hand_name}!" # Removed emojis
                 # Deduct kekchipz from player
-                await update_user_kekchipz(self.player.guild.id, self.player.id, -100, self.db_config) # Example: -100 kekchipz for losing
+                await update_user_kekchipz(self.channel_id, self.player.id, -100, self.db_config) # Example: -100 kekchipz for losing
             else:
                 showdown_result_text = f"It's a tie with {player_hand_name}!" # Removed emojis
                 # Small kekchipz for tie
-                await update_user_kekchipz(self.player.guild.id, self.player.id, 50, self.db_config) # Example: 50 kekchipz for a tie
+                await update_user_kekchipz(self.channel_id, self.player.id, 50, self.db_config) # Example: 50 kekchipz for a tie
 
         # Calculate text dimensions
         showdown_text_width = 0
@@ -1032,7 +1032,7 @@ class TexasHoldEmGame:
         Updates the single game message for Texas Hold 'em with the combined image and view.
         This function is used for subsequent edits to the game message after the initial send.
         """
-        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.db_config)
+        player_kekchipz = await get_user_kekchipz(self.channel_id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,
             self.bot_player.display_name,
@@ -1069,7 +1069,7 @@ class TexasHoldEmGame:
         Sends the initial game message to the channel.
         This function is called once at the start of the game.
         """
-        player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.db_config)
+        player_kekchipz = await get_user_kekchipz(self.channel_id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,
             self.bot_player.display_name,

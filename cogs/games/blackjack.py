@@ -335,10 +335,12 @@ class BlackjackGameView(discord.ui.View):
 
         if player_value > 21:
             self._set_button_states("game_over") # Set buttons for game over
-            embed, player_file, dealer_file = await self.game._create_game_embed_with_images()
-            embed.set_footer(text="BUST! Serene wins.")
+            kekchipz_change = -50 # Player busts, loses 50
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
+            new_player_kekchipz = await get_user_kekchipz(interaction.guild.id, interaction.user.id, self.bot_instance)
+            embed, player_file, dealer_file = await self.game._create_game_embed_with_images() # Re-create embed for updated kekchipz in description
+            embed.set_footer(text=f"BUST! Serene wins. You lost ${abs(kekchipz_change)}. Your kekchipz balance is: ${new_player_kekchipz}")
             await self._update_game_message(embed, player_file, dealer_file, self) # Use helper
-            await update_user_kekchipz(interaction.guild.id, interaction.user.id, -50, self.bot_instance)
             # Game is over, cancel any pending play_again_timeout_task
             if self.play_again_timeout_task and not self.play_again_timeout_task.done():
                 self.play_again_timeout_task.cancel()
@@ -380,23 +382,35 @@ class BlackjackGameView(discord.ui.View):
         dealer_blackjack = self.game.is_blackjack(self.game.dealer_hand)
 
         if serene_value > 21:
-            result_message = "Serene busts! You win!"
+            # Player wins because dealer busts
             kekchipz_change = 100 if player_blackjack else 50
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
+            new_player_kekchipz = await get_user_kekchipz(interaction.guild.id, interaction.user.id, self.bot_instance)
+            result_message = f"Serene busts! You won ${kekchipz_change}! Your kekchipz balance is: ${new_player_kekchipz}"
         elif player_value > serene_value:
-            result_message = "You win!"
+            # Player wins
             kekchipz_change = 100 if player_blackjack else 50
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
+            new_player_kekchipz = await get_user_kekchipz(interaction.guild.id, interaction.user.id, self.bot_instance)
+            result_message = f"You won ${kekchipz_change}! Your kekchipz balance is: ${new_player_kekchipz}"
         elif serene_value > player_value:
-            result_message = "Serene wins!"
+            # Serene wins
             kekchipz_change = -100 if dealer_blackjack else -50
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
+            new_player_kekchipz = await get_user_kekchipz(interaction.guild.id, interaction.user.id, self.bot_instance)
+            result_message = f"Serene wins! You lost ${abs(kekchipz_change)}. Your kekchipz balance is: ${new_player_kekchipz}"
         else:
-            result_message = "It's a push (tie)!"
+            # Push (tie)
             kekchipz_change = 0
+            await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance) # Still call to update, though change is 0
+            new_player_kekchipz = await get_user_kekchipz(interaction.guild.id, interaction.user.id, self.bot_instance)
+            result_message = f"It's a push (tie)! Your kekchipz balance is: ${new_player_kekchipz}"
 
         self._set_button_states("game_over") # Set buttons for game over
+        # Re-create embed to ensure the kekchipz balance in the description is also updated
         embed, player_file, dealer_file = await self.game._create_game_embed_with_images(reveal_dealer=True)
         embed.set_footer(text=result_message)
         await self._update_game_message(embed, player_file, dealer_file, self) # Use helper
-        await update_user_kekchipz(interaction.guild.id, interaction.user.id, kekchipz_change, self.bot_instance)
         # Game is over, cancel any pending play_again_timeout_task
         if self.play_again_timeout_task and not self.play_again_timeout_task.done():
             self.play_again_timeout_task.cancel()

@@ -51,7 +51,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
     try:
         # Fetch the player's kekchipz balance
         balance = await get_user_kekchipz(guild_id, discord_id)
-        # --- MODIFICATION: Only show the kekchipz amount ---
+        # Only show the kekchipz amount
         balance_text = f"${balance}"
 
         # Fetch the base image
@@ -62,10 +62,16 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
                 if base_image.mode != 'RGBA':
                     base_image = base_image.convert('RGBA')
 
+        # Resize the entire image to be 1/4 smaller
+        original_width, original_height = base_image.size
+        new_width = int(original_width * 0.75)  # 1/4 smaller means 75% of original size
+        new_height = int(original_height * 0.75)
+        base_image = base_image.resize((new_width, new_height), Image.LANCZOS) # Use LANCZOS for high-quality downscaling
+
+
         # Load font
         font = ImageFont.load_default() # Default font in case of failure
-        # --- MODIFICATION: Slightly larger font size ---
-        font_size = 60 # Adjust font size as needed
+        font_size = 72 # Slightly larger font size
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(font_url) as response:
@@ -80,18 +86,17 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         draw = ImageDraw.Draw(base_image)
 
-        # --- MODIFICATION: Define text color #0066ff (RGBA) ---
-        text_color = (0, 102, 255, 255) # RGBA for #0066ff
+        # Define text color: #0066ff converted to RGBA (0, 128, 255, 255)
+        text_color = (0, 128, 255, 255) # RGBA for #0066ff
 
         # Calculate text size and position to center it
-        # Use textbbox for accurate measurement
         bbox = draw.textbbox((0,0), balance_text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
         # Center the text
         x = (base_image.width - text_width) // 2
-        y = (base_image.height - text_height) // 2
+        y = (base_image.height - text_height) // 2.5
 
         # Draw the text on the image
         draw.text((x, y), balance_text, font=font, fill=text_color)
@@ -105,7 +110,6 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
     except aiohttp.ClientError as e:
         print(f"Error fetching base image from {base_image_url}: {e}")
-        # Return an empty BytesIO or a placeholder image if fetching fails
         return io.BytesIO(Image.new('RGBA', (400, 200), (255, 0, 0, 128)).save(io.BytesIO(), format='PNG'))
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
@@ -117,25 +121,25 @@ async def start(interaction: discord.Interaction, bot: commands.Bot):
     Serves as the entry point for the kekchipz balance display.
     This function is called by game_main.py when the 'kekchipz' command is invoked.
     """
-    # --- MODIFICATION: Make defer non-ephemeral ---
-    await interaction.response.defer(ephemeral=False) # Acknowledge the interaction immediately
+    # Defer the response without ephemeral, so it's visible while the image is generated
+    await interaction.response.defer(ephemeral=False) 
 
     try:
         image_bytes = await create_kekchipz_balance_image(
             interaction.guild.id,
             interaction.user.id,
-            interaction.user.display_name
+            interaction.user.display_name # player_display_name is still passed but not used in balance_text for image
         )
         
         # Create a Discord File object from the BytesIO stream
         discord_file = discord.File(image_bytes, filename="kekchipz_balance.png")
 
-        # --- MODIFICATION: Remove content text and make message non-ephemeral ---
+        # Send the message without ephemeral and without the "Here is..." text
         await interaction.followup.send(
             file=discord_file,
-            ephemeral=False # Make it visible to everyone in the channel
+            ephemeral=False # Ensure it's visible to everyone in the channel
         )
     except Exception as e:
         print(f"Error sending kekchipz balance message: {e}")
-        # --- Keep error messages ephemeral for user feedback ---
+        # Keep this ephemeral for error messages, as they are likely only relevant to the user who triggered the command
         await interaction.followup.send("An error occurred while trying to display your kekchipz balance.", ephemeral=True)

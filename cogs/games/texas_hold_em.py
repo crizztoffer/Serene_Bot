@@ -1064,8 +1064,8 @@ class TexasHoldEmGame:
 
         if self.game_message:
             try:
-                # Use 'attachments' keyword argument instead of 'files'
-                await self.game.game_message.edit(content=message_content, view=view, attachments=[combined_file])
+                # Corrected: Removed the extra '.game' from self.game.game_message
+                await self.game_message.edit(content=message_content, view=view, attachments=[combined_file])
             except discord.errors.NotFound:
                 logger.warning("Game message not found during edit. This should not happen if initial message was sent correctly.")
             except Exception as e:

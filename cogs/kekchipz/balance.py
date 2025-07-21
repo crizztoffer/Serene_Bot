@@ -64,14 +64,14 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Resize the entire image to be 1/4 smaller
         original_width, original_height = base_image.size
-        new_width = int(original_width * 0.5)  # 1/4 smaller means 75% of original size
-        new_height = int(original_height * 0.5)
+        new_width = int(original_width * 0.25)  # 1/4 smaller means 75% of original size
+        new_height = int(original_height * 0.25)
         base_image = base_image.resize((new_width, new_height), Image.LANCZOS) # Use LANCZOS for high-quality downscaling
 
 
         # Load font
         font = ImageFont.load_default() # Default font in case of failure
-        font_size = 72 # Slightly larger font size
+        font_size = 36 # Slightly larger font size
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(font_url) as response:
@@ -96,7 +96,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Center the text
         x = (base_image.width - text_width) // 2
-        y = (base_image.height - text_height) // 4
+        y = (base_image.height - text_height) // 8
 
         # Draw the text on the image
         draw.text((x, y), balance_text, font=font, fill=text_color)

@@ -15,6 +15,10 @@ from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulat
 import aiomysql # Import aiomysql for database operations
 import logging # Import logging
 
+# Explicitly import UI components for clarity and to resolve potential AttributeErrors
+from discord.ui import View, Select, UserSelect, Button
+
+
 # Configure logging for this game module
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -243,7 +247,7 @@ async def _deal_cards(
 
     return {"player_hands": player_hands, "dealer_hand": dealer_hand}
 
-class BetButtonView(discord.ui.View):
+class BetButtonView(View): # Inherit from View
     def __init__(self, game_state: dict, bot: commands.Bot, original_interaction: discord.Interaction):
         super().__init__(timeout=180) # Timeout after 3 minutes if no interaction
         self.game_state = game_state
@@ -252,30 +256,30 @@ class BetButtonView(discord.ui.View):
         # The decorators below handle adding the items to the view automatically.
         # No need for self.add_item() calls here for decorated methods.
 
-    @discord.ui.user_select(placeholder="Select a player to invite...")
-    async def user_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+    @UserSelect(placeholder="Select a player to invite...") # Use UserSelect directly
+    async def user_select(self, interaction: discord.Interaction, select: UserSelect): # Use UserSelect directly
         selected_user = select.values[0] # Get the first selected user
         await interaction.response.send_message(f"You selected {selected_user.mention} to invite.", ephemeral=True)
         # In a real game, you'd add logic here to send an actual invite.
         logger.info(f"User {interaction.user.display_name} selected {selected_user.display_name} for invite.")
 
-    @discord.ui.button(label="Invite to Game", style=discord.ButtonStyle.blurple)
-    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @Button(label="Invite to Game", style=discord.ButtonStyle.blurple) # Use Button directly
+    async def invite_button(self, interaction: discord.Interaction, button: Button): # Use Button directly
         # This button's functionality is primarily driven by the user_select above it.
         # For now, it just acknowledges the click.
         await interaction.response.send_message("Invite button clicked! (Functionality to be added)", ephemeral=True)
         logger.info(f"User {interaction.user.display_name} clicked the Invite button.")
 
-    @discord.ui.button(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green)
-    async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @Button(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green) # Use Button directly
+    async def play_button(self, interaction: discord.Interaction, button: Button): # Use Button directly
         # Disable the button immediately to prevent multiple clicks
         button.disabled = True
         # Disable all other buttons and selects too
         for item in self.children:
             # Check if the item is the invite button or user select
-            if isinstance(item, discord.ui.Button) and item.label == "Invite to Game":
+            if isinstance(item, Button) and item.label == "Invite to Game": # Use Button directly
                 item.disabled = True
-            if isinstance(item, discord.ui.UserSelect):
+            if isinstance(item, UserSelect): # Use UserSelect directly
                 item.disabled = True
         await interaction.response.edit_message(view=self)
 

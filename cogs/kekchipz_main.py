@@ -18,7 +18,7 @@ class KekchipzCommands(commands.Cog):
         logger.info(f"In kekchipz_main.py cog_load: serene_group = {serene_group}")
 
         if serene_group is None:
-            raise commands.ExtensionFailed(self.qualified_name, "/serene group not found")
+            raise RuntimeError("/serene group not found")
 
         @app_commands.command(name="kekchipz", description="Kekchipz commands")
         @app_commands.describe(kekchipz_name="View, request, or give kekchipz")

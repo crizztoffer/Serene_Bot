@@ -3,25 +3,17 @@ import asyncio
 import random
 import io
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont  # Pillow library for image manipulation
-from discord.ext import commands  # <-- ADD THIS LINE
-import aiomysql # Added for database interaction
+from PIL import Image, ImageDraw, ImageFont
+from discord.ext import commands
+import aiomysql
 
 # --- Database Operations (Copied from the.py for self-containment) ---
-# In a real application, these would ideally be imported from a central database module.
 async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
     """
     Placeholder function to simulate updating a user's kekchipz balance in a database.
     In a real scenario, this would interact with a database.
     """
     print(f"Simulating update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}.")
-    # Example of how you might integrate a real database call:
-    # try:
-    #     conn = await aiomysql.connect(...)\
-    #     async with conn.cursor() as cursor:
-    #         await cursor.execute("UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s", (amount, str(guild_id), str(discord_id)))
-    # except Exception as e:
-    #     print(f"Database update failed: {e}")
 
 async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> int:
     """
@@ -35,7 +27,7 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> 
             host=db_config['host'],
             user=db_config['user'],
             password=db_config['password'],
-            db="serene_users", # Assuming this is the database name
+            db="serene_users",
             charset='utf8mb4',
             autocommit=True
         )
@@ -49,10 +41,10 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> 
                 return result[0]
             else:
                 print(f"User {discord_id} not found in DB for guild {guild_id}. Returning 0.")
-                return 0 # Or handle initial user setup if not found
+                return 0
     except Exception as e:
         print(f"Database error in get_user_kekchipz: {e}")
-        return 0 # Return 0 on error
+        return 0
     finally:
         if conn:
             await conn.ensure_closed()
@@ -72,13 +64,14 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
         io.BytesIO: A BytesIO object containing the generated PNG image.
     """
     base_image_url = "https://serenekeks.com/kcpz.png"
-    font_url = "http://serenekeks.com/OpenSans-CondBold.ttf"
+    font_url = "http://serenekeks.com/OpenSans-CondLight.ttf"
 
     try:
         # Fetch the player's kekchipz balance from the actual DB
         balance = await get_user_kekchipz(guild_id, discord_id, db_config)
-        # Only show the kekchipz amount
-        balance_text = f"${balance}"
+        
+        # --- MODIFICATION: Format balance with commas and no cents ---
+        balance_text = f"${balance:,}" # Formats integer with commas (e.g., 1000 -> 1,000)
 
         # Fetch the base image
         async with aiohttp.ClientSession() as session:
@@ -92,12 +85,11 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
         original_width, original_height = base_image.size
         new_width = int(original_width * 0.33)
         new_height = int(original_height * 0.33)
-        base_image = base_image.resize((new_width, new_height), Image.LANCZOS) # Use LANCZOS for high-quality downscaling
-
+        base_image = base_image.resize((new_width, new_height), Image.LANCZOS)
 
         # Load font
-        font = ImageFont.load_default() # Default font in case of failure
-        font_size = 36 # Retained font size
+        font = ImageFont.load_default()
+        font_size = 36
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(font_url) as response:
@@ -112,8 +104,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         draw = ImageDraw.Draw(base_image)
 
-        # Define text color: #0066ff converted to RGBA (0, 128, 255, 255)
-        text_color = (0, 128, 255, 255) # Retained text color
+        text_color = (0, 128, 255, 255) # RGBA for #0066ff
 
         # Calculate text size and position to center it
         bbox = draw.textbbox((0,0), balance_text, font=font)
@@ -122,7 +113,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Center the text, with Y position adjusted to 1/6th of image height
         x = (base_image.width - text_width) // 2
-        y = (base_image.height - text_height) // 6 # Retained Y position adjustment
+        y = (base_image.height - text_height) // 6
 
         # Draw the text on the image
         draw.text((x, y), balance_text, font=font, fill=text_color)
@@ -130,7 +121,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
         # Save the modified image to a BytesIO object
         img_byte_arr = io.BytesIO()
         base_image.save(img_byte_arr, format='PNG')
-        img_byte_arr.seek(0) # Rewind to the beginning of the stream
+        img_byte_arr.seek(0)
 
         return img_byte_arr
 
@@ -147,10 +138,8 @@ async def start(interaction: discord.Interaction, bot: commands.Bot):
     Serves as the entry point for the kekchipz balance display.
     This function is called by game_main.py when the 'kekchipz' command is invoked.
     """
-    # Defer the response without ephemeral, so it's visible while the image is generated
-    await interaction.response.defer(ephemeral=False) 
+    await interaction.response.defer(ephemeral=False)
 
-    # Prepare database configuration to pass to the image creation function
     db_config = {
         'host': bot.db_host,
         'user': bot.db_user,
@@ -161,19 +150,16 @@ async def start(interaction: discord.Interaction, bot: commands.Bot):
         image_bytes = await create_kekchipz_balance_image(
             interaction.guild.id,
             interaction.user.id,
-            interaction.user.display_name, # player_display_name is still passed but not used in balance_text for image
-            db_config # Pass the db_config here
+            interaction.user.display_name,
+            db_config
         )
         
-        # Create a Discord File object from the BytesIO stream
         discord_file = discord.File(image_bytes, filename="kekchipz_balance.png")
 
-        # Send the message without ephemeral and without the "Here is..." text
         await interaction.followup.send(
             file=discord_file,
-            ephemeral=False # Ensure it's visible to everyone in the channel
+            ephemeral=False
         )
     except Exception as e:
         print(f"Error sending kekchipz balance message: {e}")
-        # Keep this ephemeral for error messages, as they are likely only relevant to the user who triggered the command
         await interaction.followup.send("An error occurred while trying to display your kekchipz balance.", ephemeral=True)

@@ -113,7 +113,7 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         # Return a blank transparent image if no cards are provided
         blank_img = Image.new('RGBA', (1, 1), color=(0, 0, 0, 0)) # Transparent background
         byte_arr = io.BytesIO()
-        blank_img.save(byte_arr, format='PNG')
+        blank_img.save(byte_arr, format='PNG') # Save as PNG to preserve transparency
         byte_arr.seek(0)
         return blank_img
 
@@ -249,9 +249,8 @@ class BetButtonView(discord.ui.View):
         self.game_state = game_state
         self.bot = bot
         self.original_interaction = original_interaction # Store the initial interaction
-        self.add_item(self.user_select)
-        self.add_item(self.invite_button)
-        self.add_item(self.play_button) # Play button is already added as a decorator
+        # The decorators below handle adding the items to the view automatically.
+        # No need for self.add_item() calls here for decorated methods.
 
     @discord.ui.user_select(placeholder="Select a player to invite...")
     async def user_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
@@ -273,9 +272,10 @@ class BetButtonView(discord.ui.View):
         button.disabled = True
         # Disable all other buttons and selects too
         for item in self.children:
-            if item.label == "Invite to Game": # Disable invite button
+            # Check if the item is the invite button or user select
+            if isinstance(item, discord.ui.Button) and item.label == "Invite to Game":
                 item.disabled = True
-            if isinstance(item, discord.ui.UserSelect): # Disable user select
+            if isinstance(item, discord.ui.UserSelect):
                 item.disabled = True
         await interaction.response.edit_message(view=self)
 

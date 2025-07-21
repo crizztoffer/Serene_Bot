@@ -117,7 +117,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         # Center the text, with Y position adjusted to 1/6th of image height
         x = (base_image.width - text_width) // 2
-        y = (base_image.height - text_height) // 6
+        y = (base_image.height - text_height) // 5
 
         # Draw the text on the image
         draw.text((x, y), balance_text, font=font, fill=text_color)

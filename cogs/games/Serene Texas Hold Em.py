@@ -115,7 +115,7 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
         byte_arr = io.BytesIO()
         blank_img.save(byte_arr, format='PNG')
         byte_arr.seek(0)
-        return byte_arr
+        return blank_img
 
     card_images = []
     # Original card size from deckofcardsapi.com is 226x314 pixels
@@ -249,11 +249,34 @@ class BetButtonView(discord.ui.View):
         self.game_state = game_state
         self.bot = bot
         self.original_interaction = original_interaction # Store the initial interaction
+        self.add_item(self.user_select)
+        self.add_item(self.invite_button)
+        self.add_item(self.play_button) # Play button is already added as a decorator
+
+    @discord.ui.user_select(placeholder="Select a player to invite...")
+    async def user_select(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        selected_user = select.values[0] # Get the first selected user
+        await interaction.response.send_message(f"You selected {selected_user.mention} to invite.", ephemeral=True)
+        # In a real game, you'd add logic here to send an actual invite.
+        logger.info(f"User {interaction.user.display_name} selected {selected_user.display_name} for invite.")
+
+    @discord.ui.button(label="Invite to Game", style=discord.ButtonStyle.blurple)
+    async def invite_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # This button's functionality is primarily driven by the user_select above it.
+        # For now, it just acknowledges the click.
+        await interaction.response.send_message("Invite button clicked! (Functionality to be added)", ephemeral=True)
+        logger.info(f"User {interaction.user.display_name} clicked the Invite button.")
 
     @discord.ui.button(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green)
     async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Disable the button immediately to prevent multiple clicks
         button.disabled = True
+        # Disable all other buttons and selects too
+        for item in self.children:
+            if item.label == "Invite to Game": # Disable invite button
+                item.disabled = True
+            if isinstance(item, discord.ui.UserSelect): # Disable user select
+                item.disabled = True
         await interaction.response.edit_message(view=self)
 
         await interaction.followup.send("You clicked 'Play'! Dealing cards...", ephemeral=True)
@@ -265,13 +288,13 @@ class BetButtonView(discord.ui.View):
 
         # Deal cards using the game_state's deck
         dealt_info = await _deal_cards(
-            self.game_state['deck'], # Removed interaction from here
+            self.game_state['deck'],
             num_players=1, # Only the command invoker for now
             cards_per_player=2,
             deal_dealer=True,
             dealer_hidden_cards=2 # Both dealer cards hidden initially
         )
-        self.game_state['player_hands'][interaction.user.id] = dealt_info['player_hands'].get(f"player_0", []) # Get the hand for the actual player
+        self.game_state['player_hands'][interaction.user.id] = dealt_info['player_hands'].get(f"player_0", [])
         self.game_state['dealer_hand'] = dealt_info['dealer_hand']
 
         # --- Update Public Message (Dealer's hand - both face down) ---
@@ -294,7 +317,7 @@ class BetButtonView(discord.ui.View):
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand:**",
                     attachments=[updated_public_file], # Replace existing file
-                    view=None # Remove the button from the public message
+                    view=None # Remove all buttons and selects from the public message
                 )
                 logger.info(f"Public message {self.game_state['public_message_id']} updated with dealer's cards.")
             except discord.NotFound:
@@ -398,6 +421,3 @@ async def start(interaction: discord.Interaction, bot):
     # The rest of the game logic (dealing, sending ephemeral messages, updating public message)
     # is now handled within the BetButtonView's callback (play_button method)
     
-    await asyncio.sleep(2)
-    await interaction.followup.send("Game flow initiated by button click. Check your private messages!", ephemeral=True)
-

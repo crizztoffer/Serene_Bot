@@ -3,7 +3,8 @@ import asyncio
 import random
 import io
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
+from PIL import Image, ImageDraw, ImageFont  # Pillow library for image manipulation
+from discord.ext import commands  # <-- ADD THIS LINE
 
 # --- Database Operations (Copied from the.py for self-containment) ---
 # In a real application, these would ideally be imported from a central database module.

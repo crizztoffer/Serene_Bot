@@ -123,7 +123,7 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
     original_height = 314
     scale_multiplier = 0.33
     # Fixed overlap amount in pixels
-    overlap_amount = 30 
+    overlap_amount = 60 # Increased overlap to make card numbers more visible
 
     target_width = int(original_width * scale_multiplier)
     target_height = int(original_height * scale_multiplier)

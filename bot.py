@@ -104,6 +104,59 @@ async def load_flag_reasons():
         if conn:
             conn.close() # Use conn.close() for aiomysql connections
 
+async def post_and_save_embed(guild_id, rules_json, rules_channel_id):
+    """
+    Helper function to post a new Discord embed and save its details to bot_messages table.
+    """
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True,
+            cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn.cursor() as cursor:
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                logger.warning(f"Bot not in guild {guild_id}. Cannot post rules embed.")
+                return
+
+            rules_channel = guild.get_channel(int(rules_channel_id))
+            if not rules_channel:
+                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
+                return
+
+            try:
+                embed_data_list = json.loads(rules_json)
+                if not isinstance(embed_data_list, list) or not embed_data_list:
+                    raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
+                embed_data = embed_data_list[0]
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
+                return
+
+            new_embed = discord.Embed.from_dict(embed_data)
+            sent_message = await rules_channel.send(embed=new_embed)
+            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
+
+            await cursor.execute(
+                "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
+                (str(guild_id), rules_json, str(sent_message.id))
+            )
+            logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
+
+    except discord.errors.Forbidden:
+        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
+    except Exception as e:
+        logger.error(f"Error posting and saving embed for guild {guild_id}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
 # --- Web Server Setup ---
 async def settings_saved_handler(request):
     """
@@ -205,14 +258,7 @@ async def settings_saved_handler(request):
                         except discord.errors.NotFound:
                             logger.warning(f"Message {existing_message_id} not found in channel {rules_channel_id}. Re-posting new message.")
                             # Message not found, proceed to post new message
-                            new_embed = discord.Embed.from_dict(embed_data)
-                            sent_message = await rules_channel.send(embed=new_embed)
-                            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
-                            await cursor.execute(
-                                "UPDATE bot_messages SET message = %s, message_id = %s WHERE guild_id = %s",
-                                (new_rules_json, str(sent_message.id), str(guild_id))
-                            )
-                            logger.info(f"Updated bot_messages table with new message_id for guild {guild_id}.")
+                            await post_and_save_embed(guild_id, new_rules_json, rules_channel_id) # Reuse helper
                         except discord.errors.Forbidden:
                             logger.error(f"Bot lacks permissions to edit/send messages in channel {rules_channel_id} for guild {guild_id}.")
                             return web.Response(text="Bot lacks Discord permissions", status=403)
@@ -224,23 +270,7 @@ async def settings_saved_handler(request):
                 else:
                     # No row exists in bot_messages, post new embed
                     logger.info(f"No existing bot_messages entry for guild {guild_id}. Posting new embed.")
-                    try:
-                        new_embed = discord.Embed.from_dict(embed_data)
-                        sent_message = await rules_channel.send(embed=new_embed)
-                        logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
-
-                        # Insert into bot_messages table
-                        await cursor.execute(
-                            "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
-                            (str(guild_id), new_rules_json, str(sent_message.id))
-                        )
-                        logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
-                    except discord.errors.Forbidden:
-                        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
-                        return web.Response(text="Bot lacks Discord permissions", status=403)
-                    except Exception as discord_e:
-                        logger.error(f"Error sending new embed to Discord for guild {guild_id}: {discord_e}")
-                        return web.Response(text="Discord API error", status=500)
+                    await post_and_save_embed(guild_id, new_rules_json, rules_channel_id) # Reuse helper
 
             return web.Response(text="Signal received and settings processed", status=200)
         else:
@@ -301,6 +331,54 @@ async def on_ready():
         for member in guild.members:
             if not member.bot:
                 await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
+
+    # --- New: Check and post rules embed on startup if missing ---
+    conn_on_ready = None
+    try:
+        conn_on_ready = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True,
+            cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn_on_ready.cursor() as cursor:
+            for guild in bot.guilds:
+                # 1. Check bot_guild_settings for this guild
+                await cursor.execute(
+                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
+                    (str(guild.id),)
+                )
+                settings_row = await cursor.fetchone()
+
+                if settings_row:
+                    # 2. Check bot_messages for this guild
+                    await cursor.execute(
+                        "SELECT message_id FROM bot_messages WHERE guild_id = %s",
+                        (str(guild.id),)
+                    )
+                    bot_messages_row = await cursor.fetchone()
+
+                    if not bot_messages_row:
+                        # Case: Entry in bot_guild_settings but not in bot_messages
+                        new_rules_json = settings_row.get('rules')
+                        rules_channel_id = settings_row.get('rules_channel')
+
+                        if new_rules_json and rules_channel_id:
+                            logger.info(f"Detected missing rules embed for guild {guild.id} on startup. Attempting to post.")
+                            # Call the helper function to post and save the embed
+                            await post_and_save_embed(str(guild.id), new_rules_json, rules_channel_id)
+                        else:
+                            logger.warning(f"Guild {guild.id} has settings but missing rules JSON or channel ID. Skipping rules embed post on startup.")
+                # else: No settings for this guild, nothing to do.
+    except Exception as e:
+        logger.error(f"Error during startup rules embed check: {e}", exc_info=True)
+    finally:
+        if conn_on_ready:
+            conn_on_ready.close()
+    # --- End new section ---
 
     # Start background DB check
     hourly_db_check.start()

@@ -265,8 +265,7 @@ class BetButtonView(discord.ui.View):
 
         # Deal cards using the game_state's deck
         dealt_info = await _deal_cards(
-            interaction, # Pass the current interaction for logging/context within _deal_cards if needed
-            self.game_state['deck'],
+            self.game_state['deck'], # Removed interaction from here
             num_players=1, # Only the command invoker for now
             cards_per_player=2,
             deal_dealer=True,

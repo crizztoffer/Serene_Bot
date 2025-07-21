@@ -209,8 +209,8 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.MissingPermissions):
         await ctx.send("You lack permissions.")
     else:
-        logger.error(f"Command error: {e}")
-        await ctx.send(f"Unexpected error: {e}")
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"Unexpected error: {error}")
 
 @tasks.loop(hours=1)
 async def hourly_db_check():
@@ -235,7 +235,7 @@ async def load_cogs():
     if not os.path.exists("cogs"):
         os.makedirs("cogs")
     for filename in os.listdir("cogs"):
-        if filename.endswith(".py"):
+        if filename.endswith(".py") and filename != "__init__.py": # Added condition to exclude __init__.py
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
                 logger.info(f"Loaded cog {filename}")

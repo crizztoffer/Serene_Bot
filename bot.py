@@ -110,6 +110,7 @@ async def settings_saved_handler(request):
     Handles POST requests to /settings_saved endpoint.
     Expects a JSON body with 'guild_id' and 'bot_entry'.
     """
+    conn = None # Initialize conn to None
     try:
         data = await request.json()
         guild_id = data.get('guild_id')
@@ -118,21 +119,139 @@ async def settings_saved_handler(request):
 
         if bot_entry == BOT_ENTRY:
             logger.info(f"Received signal: '{action}' for guild ID: {guild_id}")
-            # You can add more logic here, e.g., send a message to a specific Discord channel
-            # For example:
-            # guild = bot.get_guild(int(guild_id))
-            # if guild:
-            #     # Replace 'your-log-channel-id' with an actual channel ID where you want notifications
-            #     log_channel = guild.get_channel(YOUR_LOG_CHANNEL_ID)
-            #     if log_channel:
-            #         await log_channel.send(f"Server settings for guild `{guild.name}` have been saved!")
-            return web.Response(text="Signal received", status=200)
+
+            # Fetch settings from the database (bot_guild_settings)
+            if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+                logger.error("Missing DB credentials for fetching settings.")
+                return web.Response(text="Internal Server Error: DB credentials missing", status=500)
+
+            conn = await aiomysql.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db="serene_users", # Assuming 'serene_users' is the database where 'bot_guild_settings' and 'bot_messages' tables reside
+                charset='utf8mb4',
+                autocommit=True,
+                cursorclass=aiomysql.cursors.DictCursor # To get results as dictionaries
+            )
+            async with conn.cursor() as cursor:
+                # 1. Get the rules from bot_guild_settings
+                await cursor.execute(
+                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
+                    (str(guild_id),)
+                )
+                settings_row = await cursor.fetchone()
+
+                if not settings_row:
+                    logger.warning(f"No settings found for guild ID: {guild_id} in bot_guild_settings.")
+                    return web.Response(text="No settings found for guild", status=404)
+
+                new_rules_json = settings_row.get('rules')
+                rules_channel_id = settings_row.get('rules_channel')
+
+                if not new_rules_json or not rules_channel_id:
+                    logger.warning(f"Missing 'rules' JSON or 'rules_channel' for guild ID: {guild_id}. Cannot process embed.")
+                    return web.Response(text="Missing rules data or channel", status=400)
+
+                # Parse the new rules JSON
+                try:
+                    # Discord API expects an array of embeds, usually just one
+                    embed_data_list = json.loads(new_rules_json)
+                    if not isinstance(embed_data_list, list) or not embed_data_list:
+                        raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
+                    embed_data = embed_data_list[0] # Take the first embed
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
+                    return web.Response(text="Invalid rules JSON format", status=400)
+
+                # 2. Check bot_messages table
+                await cursor.execute(
+                    "SELECT message, message_id FROM bot_messages WHERE guild_id = %s",
+                    (str(guild_id),)
+                )
+                bot_messages_row = await cursor.fetchone()
+
+                guild = bot.get_guild(int(guild_id))
+                if not guild:
+                    logger.error(f"Bot is not in guild with ID: {guild_id}")
+                    return web.Response(text="Bot not in specified guild", status=404)
+
+                rules_channel = guild.get_channel(int(rules_channel_id))
+                if not rules_channel:
+                    logger.error(f"Rules channel with ID {rules_channel_id} not found in guild {guild_id}.")
+                    return web.Response(text="Rules channel not found", status=404)
+
+                if bot_messages_row:
+                    # Row exists, compare messages
+                    existing_message_json = bot_messages_row.get('message')
+                    existing_message_id = bot_messages_row.get('message_id')
+
+                    if existing_message_json != new_rules_json:
+                        logger.info(f"Rules content changed for guild {guild_id}. Attempting to update message.")
+                        try:
+                            # Fetch the existing message
+                            message_to_edit = await rules_channel.fetch_message(int(existing_message_id))
+                            # Construct new embed
+                            new_embed = discord.Embed.from_dict(embed_data)
+                            await message_to_edit.edit(embed=new_embed)
+                            logger.info(f"Successfully updated Discord message {existing_message_id} in channel {rules_channel_id} for guild {guild_id}.")
+
+                            # Update bot_messages table with the new JSON
+                            await cursor.execute(
+                                "UPDATE bot_messages SET message = %s WHERE guild_id = %s",
+                                (new_rules_json, str(guild_id))
+                            )
+                            logger.info(f"Updated bot_messages table for guild {guild_id}.")
+                        except discord.errors.NotFound:
+                            logger.warning(f"Message {existing_message_id} not found in channel {rules_channel_id}. Re-posting new message.")
+                            # Message not found, proceed to post new message
+                            new_embed = discord.Embed.from_dict(embed_data)
+                            sent_message = await rules_channel.send(embed=new_embed)
+                            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
+                            await cursor.execute(
+                                "UPDATE bot_messages SET message = %s, message_id = %s WHERE guild_id = %s",
+                                (new_rules_json, str(sent_message.id), str(guild_id))
+                            )
+                            logger.info(f"Updated bot_messages table with new message_id for guild {guild_id}.")
+                        except discord.errors.Forbidden:
+                            logger.error(f"Bot lacks permissions to edit/send messages in channel {rules_channel_id} for guild {guild_id}.")
+                            return web.Response(text="Bot lacks Discord permissions", status=403)
+                        except Exception as discord_e:
+                            logger.error(f"Error interacting with Discord API for guild {guild_id}: {discord_e}")
+                            return web.Response(text="Discord API error", status=500)
+                    else:
+                        logger.info(f"Rules content is identical for guild {guild_id}. No update needed.")
+                else:
+                    # No row exists in bot_messages, post new embed
+                    logger.info(f"No existing bot_messages entry for guild {guild_id}. Posting new embed.")
+                    try:
+                        new_embed = discord.Embed.from_dict(embed_data)
+                        sent_message = await rules_channel.send(embed=new_embed)
+                        logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
+
+                        # Insert into bot_messages table
+                        await cursor.execute(
+                            "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
+                            (str(guild_id), new_rules_json, str(sent_message.id))
+                        )
+                        logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
+                    except discord.errors.Forbidden:
+                        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
+                        return web.Response(text="Bot lacks Discord permissions", status=403)
+                    except Exception as discord_e:
+                        logger.error(f"Error sending new embed to Discord for guild {guild_id}: {discord_e}")
+                        return web.Response(text="Discord API error", status=500)
+
+            return web.Response(text="Signal received and settings processed", status=200)
         else:
             logger.warning(f"Unauthorized access attempt to /settings_saved. Invalid BOT_ENTRY: {bot_entry}")
             return web.Response(text="Unauthorized", status=401)
     except Exception as e:
-        logger.error(f"Error in settings_saved_handler: {e}")
+        logger.error(f"Overall error in settings_saved_handler for guild {guild_id}: {e}", exc_info=True)
         return web.Response(text="Internal Server Error", status=500)
+    finally:
+        if conn:
+            conn.close() # Ensure database connection is closed
 
 async def start_web_server():
     """Starts the aiohttp web server."""

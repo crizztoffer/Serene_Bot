@@ -187,19 +187,17 @@ async def _create_combined_card_image(cards_info: list[dict]) -> io.BytesIO | No
 
 
 async def _deal_cards(
-    interaction: discord.Interaction, # Interaction is not directly used for display in this func, but for context
     deck: list[dict],
     num_players: int,
     cards_per_player: int,
     deal_dealer: bool = True,
-    dealer_hidden_cards: int = 2 # Changed to 2 as per new requirement
+    dealer_hidden_cards: int = 2
 ) -> dict:
     """
     Deals cards to a specified number of players and optionally to a dealer.
     Ensures no duplicate cards are dealt.
     
     Args:
-        interaction (discord.Interaction): The Discord interaction object.
         deck (list[dict]): The shuffled deck of cards. This list will be modified (cards popped).
         num_players (int): The number of players to deal to (excluding the dealer).
         cards_per_player (int): The number of cards each player receives.
@@ -218,7 +216,9 @@ async def _deal_cards(
         for i in range(num_players):
             # For simplicity, we'll assume the interaction.user is player 0
             # In a real multi-player game, you'd iterate through a list of actual players
-            current_player_id = interaction.user.id if i == 0 else f"other_player_{i}"
+            # We don't have interaction.user here, so we'll use a placeholder for now.
+            # The actual user ID will be passed from the calling context (e.g., button callback)
+            current_player_id = f"player_{i}" # Placeholder for player ID
 
             if not deck:
                 logger.warning("Not enough cards in the deck to deal to player(s).")
@@ -243,91 +243,162 @@ async def _deal_cards(
 
     return {"player_hands": player_hands, "dealer_hand": dealer_hand}
 
+class BetButtonView(discord.ui.View):
+    def __init__(self, game_state: dict, bot: commands.Bot, original_interaction: discord.Interaction):
+        super().__init__(timeout=180) # Timeout after 3 minutes if no interaction
+        self.game_state = game_state
+        self.bot = bot
+        self.original_interaction = original_interaction # Store the initial interaction
+
+    @discord.ui.button(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green)
+    async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Disable the button immediately to prevent multiple clicks
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+
+        await interaction.followup.send("You clicked 'Play'! Dealing cards...", ephemeral=True)
+        logger.info(f"Player {interaction.user.display_name} clicked the Play button.")
+
+        # Assign the actual player ID to the game state
+        # For simplicity, assuming only one player for now (the one who clicked)
+        self.game_state['players_in_game'] = [interaction.user.id]
+
+        # Deal cards using the game_state's deck
+        dealt_info = await _deal_cards(
+            interaction, # Pass the current interaction for logging/context within _deal_cards if needed
+            self.game_state['deck'],
+            num_players=1, # Only the command invoker for now
+            cards_per_player=2,
+            deal_dealer=True,
+            dealer_hidden_cards=2 # Both dealer cards hidden initially
+        )
+        self.game_state['player_hands'][interaction.user.id] = dealt_info['player_hands'].get(f"player_0", []) # Get the hand for the actual player
+        self.game_state['dealer_hand'] = dealt_info['dealer_hand']
+
+        # --- Update Public Message (Dealer's hand - both face down) ---
+        public_cards_info = []
+        for card in self.game_state['dealer_hand']:
+            public_cards_info.append({'code': card['code'], 'face_up': False})
+        
+        updated_combined_image_bytes = await _create_combined_card_image(public_cards_info)
+
+        if updated_combined_image_bytes:
+            updated_public_file = discord.File(updated_combined_image_bytes, filename="dealer_cards_updated.png")
+            
+            try:
+                # Retrieve the original public message to edit it
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                
+                public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message_to_edit.edit(
+                    content="**🃏 Dealer's Hand:**",
+                    attachments=[updated_public_file], # Replace existing file
+                    view=None # Remove the button from the public message
+                )
+                logger.info(f"Public message {self.game_state['public_message_id']} updated with dealer's cards.")
+            except discord.NotFound:
+                logger.error(f"Public message with ID {self.game_state['public_message_id']} not found during update.")
+            except Exception as e:
+                logger.error(f"Error updating public message: {e}")
+        else:
+            await interaction.followup.send(
+                "Could not create updated dealer's hand image for public display.",
+                ephemeral=True
+            )
+
+        # --- Send Ephemeral Message to Player (Player's cards face up) ---
+        player_hand = self.game_state['player_hands'].get(interaction.user.id, [])
+        
+        if player_hand:
+            player_cards_info = [{'code': card['code'], 'face_up': True} for card in player_hand]
+            player_combined_image = await _create_combined_card_image(player_cards_info)
+
+            if player_combined_image:
+                player_file = discord.File(player_combined_image, filename="your_hand.png")
+                await interaction.followup.send(
+                    f"👋 {interaction.user.mention}, here is your hand:",
+                    file=player_file,
+                    ephemeral=True # This makes the message private
+                )
+                logger.info(f"Ephemeral message sent to {interaction.user.display_name}")
+            else:
+                await interaction.followup.send(
+                    f"Could not display your hand image, {interaction.user.mention}.",
+                    ephemeral=True
+                )
+        else:
+            await interaction.followup.send(f"You don't have any cards, {interaction.user.mention}.", ephemeral=True)
+
+        self.stop() # Stop the view after the button is clicked and actions are performed
+
+    async def on_timeout(self):
+        # This method is called when the view times out
+        logger.info("BetButtonView timed out.")
+        if self.game_state['public_message_id']:
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                public_message = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message.edit(content="Game setup timed out. Please start a new game.", view=None)
+            except discord.NotFound:
+                logger.error(f"Public message with ID {self.game_state['public_message_id']} not found on timeout.")
+            except Exception as e:
+                logger.error(f"Error updating public message on timeout: {e}")
+
 
 async def start(interaction: discord.Interaction, bot):
     """
     This function is the entry point for 'My Card Game'.
-    It's the minimum required for game_main.py to recognize this file as a game.
-    It now sets up the initial public message with dealer's face-down cards
-    and then sends the player's cards in an ephemeral message.
+    It now sets up the initial public message with a 'Play' button.
+    Card dealing and ephemeral messages are triggered by the button click.
     """
-    await interaction.response.send_message("My Card Game has started!", ephemeral=False)
+    await interaction.response.send_message("My Card Game is starting! Click 'Play' to begin.", ephemeral=False)
     await asyncio.sleep(1)
-    await interaction.followup.send("Setting up the game table...", ephemeral=False)
 
     # --- Game State (In-memory for demonstration) ---
     game_state = {
         'deck': _create_standard_deck(),
         'player_hands': {},
         'dealer_hand': [],
-        'community_cards': [], # No community cards initially
-        'public_message_id': None, # To store the ID of the public message
-        'channel_id': interaction.channel_id # To retrieve the public message later
+        'community_cards': [],
+        'public_message_id': None,
+        'channel_id': interaction.channel_id
     }
-    random.shuffle(game_state['deck']) # Shuffle the deck
+    random.shuffle(game_state['deck'])
 
-    # --- Initial Deal ---
-    # Deal 2 cards to 1 player and 2 to the dealer
-    dealt_info = await _deal_cards(
-        interaction, # Pass interaction for logging/context, not for direct message sending within _deal_cards
-        game_state['deck'],
-        num_players=1, # Only the command invoker for now
-        cards_per_player=2,
-        deal_dealer=True,
-        dealer_hidden_cards=2 # Both dealer cards hidden initially
-    )
-    game_state['player_hands'] = dealt_info['player_hands']
-    game_state['dealer_hand'] = dealt_info['dealer_hand']
+    # --- Send Initial Public Message (Placeholder for dealer's hand) with button ---
+    # Initially, display a blank image or a game logo if preferred, or just a message.
+    # For now, we'll send a blank transparent image as a placeholder for the dealer's cards.
+    initial_public_cards_info = [] # No cards to display yet, just the button
+    initial_combined_image_bytes = await _create_combined_card_image(initial_public_cards_info) # Creates a 1x1 transparent image
 
-    # --- Send Initial Public Message (Dealer's hand - both face down) ---
-    public_cards_info = []
-    # Both dealer cards are face down
-    for card in game_state['dealer_hand']:
-        public_cards_info.append({'code': card['code'], 'face_up': False})
-    
-    # No community cards below them initially, so only dealer cards are combined
-    combined_image_bytes = await _create_combined_card_image(public_cards_info)
+    view = BetButtonView(game_state, bot, interaction)
 
-    if combined_image_bytes:
-        public_file = discord.File(combined_image_bytes, filename="dealer_cards.png")
+    if initial_combined_image_bytes:
+        initial_public_file = discord.File(initial_combined_image_bytes, filename="game_start_placeholder.png")
         public_message = await interaction.followup.send(
-            "**🃏 Dealer's Hand:**",
-            file=public_file
+            "**🃏 Game Table: Ready to Play!**\nClick the button below to start the game.",
+            file=initial_public_file,
+            view=view # Attach the view with the button
         )
         game_state['public_message_id'] = public_message.id
-        logger.info(f"Public message sent with ID: {public_message.id}")
+        logger.info(f"Initial public message sent with ID: {public_message.id} and Play button.")
     else:
         await interaction.followup.send(
-            "Could not create initial dealer's hand image.",
-            ephemeral=False # This message should still be public if image fails
+            "Could not create initial game table image. Game might not proceed as expected.",
+            view=view, # Still attach the view even if image fails
+            ephemeral=False
         )
 
-    await asyncio.sleep(1) # Small pause before sending player's ephemeral message
-
-    # --- Send Ephemeral Message to Player (Player's cards face up) ---
-    player_id = interaction.user.id
-    player_hand = game_state['player_hands'].get(player_id, [])
+    # Wait for the button to be clicked or for the timeout
+    await view.wait()
     
-    if player_hand:
-        player_cards_info = [{'code': card['code'], 'face_up': True} for card in player_hand]
-        player_combined_image = await _create_combined_card_image(player_cards_info)
-
-        if player_combined_image:
-            player_file = discord.File(player_combined_image, filename="your_hand.png")
-            await interaction.followup.send(
-                f"👋 {interaction.user.mention}, here is your hand:",
-                file=player_file,
-                ephemeral=True # This makes the message private
-            )
-            logger.info(f"Ephemeral message sent to {interaction.user.display_name}")
-        else:
-            await interaction.followup.send(
-                f"Could not display your hand image, {interaction.user.mention}.",
-                ephemeral=True
-            )
-    else:
-        await interaction.followup.send(f"You don't have any cards, {interaction.user.mention}.", ephemeral=True)
-
-
+    # The rest of the game logic (dealing, sending ephemeral messages, updating public message)
+    # is now handled within the BetButtonView's callback (play_button method)
+    
     await asyncio.sleep(2)
-    await interaction.followup.send("Thanks for playing My Card Game!", ephemeral=False)
+    await interaction.followup.send("Game flow initiated by button click. Check your private messages!", ephemeral=True)
+

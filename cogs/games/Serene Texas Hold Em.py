@@ -20,7 +20,7 @@ from discord.ui import View, Button
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - '%(message)s')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s') # Corrected this line
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
@@ -166,4 +166,3 @@ async def start(interaction: discord.Interaction, bot):
         ephemeral=False # Visible to everyone in the channel
     )
     logger.info(f"Initial game session button sent for room ID: {game_session_room_id}")
-

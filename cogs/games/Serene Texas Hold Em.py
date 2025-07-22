@@ -271,6 +271,7 @@ class GameModeSelect(Select):
             view.invite_user_select.disabled = True
             view.invite_button.disabled = True
             view.play_button.disabled = False
+            view.selected_user_id = None # Clear selected user if switching to single player
             logger.info(f"Game mode set to Single Player by {interaction.user.display_name}.")
         elif selected_mode == "multiplayer":
             view.invite_user_select.disabled = False
@@ -293,15 +294,17 @@ class InviteUserSelect(UserSelect):
     async def callback(self, interaction: discord.Interaction):
         selected_user = self.values[0]
         view = self.view # Get reference to the parent view
+        view.selected_user_id = selected_user.id # Store the selected user's ID
 
         # Enable invite button if a user is selected in multiplayer mode
-        if not self.disabled and view.play_button.disabled: # Only enable if in multiplayer mode and play button is disabled
+        # This condition is crucial: only enable if in multiplayer mode and play button is disabled
+        if not self.disabled and view.play_button.disabled:
             view.invite_button.disabled = False
         else:
             view.invite_button.disabled = True # Should not happen if logic is correct, but for safety
 
         await interaction.response.edit_message(view=view)
-        logger.info(f"User {interaction.user.display_name} selected {selected_user.display_name} for invite.")
+        logger.info(f"User {interaction.user.display_name} selected {selected_user.display_name} for invite. Selected user ID: {view.selected_user_id}")
 
 class InviteButton(Button):
     def __init__(self):
@@ -309,9 +312,143 @@ class InviteButton(Button):
         super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, disabled=True, row=2)
 
     async def callback(self, interaction: discord.Interaction):
-        # No message should be sent here as per user's request
-        logger.info(f"User {interaction.user.display_name} clicked the Invite button. (Functionality to be added later)")
-        await interaction.response.defer() # Acknowledge the interaction without sending a message
+        view = self.view
+        if not view:
+            logger.error("InviteButton callback: View is not set.")
+            await interaction.response.defer()
+            return
+
+        invited_user_id = view.selected_user_id
+        if not invited_user_id:
+            # We should not send an ephemeral message here as per user's request
+            logger.warning("Invite button clicked without a selected user.")
+            await interaction.response.defer() # Acknowledge the interaction silently
+            return
+
+        # Disable the invite button immediately after click
+        self.disabled = True
+        await interaction.response.edit_message(view=view)
+        
+        logger.info(f"User {interaction.user.display_name} clicked the Invite button for user ID: {invited_user_id}.")
+
+        # --- Database connection and channel retrieval ---
+        DB_USER = os.getenv("DB_USER")
+        DB_PASSWORD = os.getenv("DB_PASSWORD")
+        DB_HOST = os.getenv("DB_HOST")
+        
+        notif_channel_id = None
+        conn = None
+        try:
+            conn = await aiomysql.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db="serene_users",
+                charset='utf8mb4',
+                autocommit=True
+            )
+            async with conn.cursor() as cur:
+                guild_id = interaction.guild_id # Get the guild ID from the interaction
+                if guild_id:
+                    await cur.execute("SELECT notif_channel FROM bot_guild_settings WHERE guild_id = %s", (str(guild_id),))
+                    result = await cur.fetchone()
+                    if result:
+                        notif_channel_id = result[0]
+                        logger.info(f"Retrieved notif_channel_id: {notif_channel_id} for guild {guild_id}")
+                    else:
+                        logger.warning(f"No notif_channel found for guild_id: {guild_id}")
+                else:
+                    logger.warning("Interaction has no guild_id. Cannot fetch notif_channel.")
+
+        except Exception as e:
+            logger.error(f"Database error when fetching notif_channel: {e}")
+            # Re-enable invite button if DB error occurs
+            self.disabled = False
+            await interaction.response.edit_message(view=view)
+            await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True) # Ephemeral for critical error
+            return
+        finally:
+            if conn:
+                conn.close()
+
+        if not notif_channel_id:
+            # Re-enable invite button if no channel found
+            self.disabled = False
+            await interaction.response.edit_message(view=view)
+            await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True) # Ephemeral for critical error
+            return
+
+        # --- Send invite message with user-specific buttons ---
+        try:
+            notif_channel = view.bot.get_channel(int(notif_channel_id))
+            if not notif_channel:
+                notif_channel = await view.bot.fetch_channel(int(notif_channel_id))
+            
+            # Get the invited user object
+            invited_user = await view.bot.fetch_user(invited_user_id)
+            if not invited_user:
+                self.disabled = False # Re-enable if user not found
+                await interaction.response.edit_message(view=view)
+                await interaction.followup.send("Could not find the invited user.", ephemeral=True) # Ephemeral for critical error
+                return
+
+            # Create a new view for the invite message
+            # This view will be attached to the invite message sent to the notif_channel
+            invite_message_view = discord.ui.View(timeout=300) # Timeout for invite buttons (5 minutes)
+
+            # Accept Button (links to game channel)
+            game_channel_jump_url = interaction.channel.jump_url
+            accept_button = discord.ui.Button(
+                label="Accept & Join Game", 
+                style=discord.ButtonStyle.link, 
+                url=game_channel_jump_url,
+                row=0
+            )
+            invite_message_view.add_item(accept_button)
+
+            # Deny Button (user-specific custom_id)
+            # This button will have a custom_id that includes the invited user's ID
+            deny_button = discord.ui.Button(
+                label="Deny", 
+                style=discord.ButtonStyle.red, 
+                custom_id=f"deny_invite_{invited_user_id}",
+                row=0
+            )
+            invite_message_view.add_item(deny_button)
+
+            # Define the callback for the deny button
+            async def deny_callback(deny_interaction: discord.Interaction):
+                # Ensure only the invited user can click deny
+                if deny_interaction.user.id == invited_user_id:
+                    # No message on click as per user's request, but we need to acknowledge
+                    await deny_interaction.response.defer() 
+                    logger.info(f"Invite denied by {deny_interaction.user.display_name}.")
+                    # Update the invite message to disable buttons after denial
+                    for item in invite_message_view.children:
+                        item.disabled = True
+                    await deny_interaction.message.edit(content=f"{deny_interaction.user.mention} has denied the game invite.", view=invite_message_view)
+                    invite_message_view.stop() # Stop the invite view
+                else:
+                    await deny_interaction.response.send_message("This invite is not for you!", ephemeral=True)
+            
+            deny_button.callback = deny_callback # Assign the callback to the deny button
+
+            # Send the invite message
+            await notif_channel.send(
+                f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em in {interaction.channel.mention}!",
+                view=invite_message_view
+            )
+            logger.info(f"Invite sent to {invited_user.display_name} in channel {notif_channel.name}.")
+
+        except Exception as e:
+            logger.error(f"Error sending invite message: {e}")
+            # Re-enable invite button if sending fails
+            self.disabled = False
+            await interaction.response.edit_message(view=view) # Update the view to re-enable the button
+            await interaction.followup.send("Failed to send invite message.", ephemeral=True) # Ephemeral for critical error
+            return
+
+        await interaction.response.defer() # Acknowledge the initial interaction silently
 
 
 class PlayButton(Button):
@@ -426,6 +563,7 @@ class BetButtonView(View): # Inherit from View
         self.game_state = game_state
         self.bot = bot
         self.original_interaction = original_interaction # Store the initial interaction
+        self.selected_user_id = None # To store the ID of the user selected for invite
         
         # Instantiate UI components
         self.game_mode_select = GameModeSelect()
@@ -443,6 +581,11 @@ class BetButtonView(View): # Inherit from View
         self.add_item(self.invite_user_select)
         self.add_item(self.invite_button)
         self.add_item(self.play_button)
+
+        # Set initial states based on default single player
+        self.invite_user_select.disabled = True
+        self.invite_button.disabled = True
+        self.play_button.disabled = False
 
 
     async def on_timeout(self):

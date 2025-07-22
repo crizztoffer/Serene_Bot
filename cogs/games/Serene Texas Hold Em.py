@@ -268,24 +268,11 @@ class GameModeSelect(Select):
         selected_mode = self.values[0]
         view = self.view # Get reference to the parent view
 
-        if selected_mode == "single_player":
-            view.invite_user_select.disabled = True
-            view.invite_button.disabled = True
-            view.play_button.disabled = False
-            view.selected_users_for_invite = [] # Clear selected users if switching to single player
-            view.game_state['invited_players_status'] = {} # Clear invited players status
-            logger.info(f"Game mode set to Single Player by {interaction.user.display_name}.")
-        elif selected_mode == "multiplayer":
-            view.invite_user_select.disabled = False
-            view.invite_button.disabled = True # Invite button disabled until user(s) selected
-            view.play_button.disabled = True
-            logger.info(f"Game mode set to Multiplayer by {interaction.user.display_name}.")
-        
         # Update the default selection in the select menu itself
         for option in self.options:
             option.default = (option.value == selected_mode)
 
-        await interaction.response.edit_message(view=view)
+        await view._update_button_states() # Call centralized update
 
 
 class InviteUserSelect(UserSelect):
@@ -296,15 +283,9 @@ class InviteUserSelect(UserSelect):
     async def callback(self, interaction: discord.Interaction):
         view = self.view # Get reference to the parent view
         view.selected_users_for_invite = self.values # Store the selected user objects
+        
+        await view._update_button_states() # Call centralized update
 
-        # Enable invite button if users are selected in multiplayer mode
-        if not self.disabled and view.game_mode_select.values[0] == "multiplayer" and len(self.values) > 0:
-            view.invite_button.disabled = False
-        else:
-            view.invite_button.disabled = True
-
-        await interaction.response.edit_message(view=view)
-        logger.info(f"User {interaction.user.display_name} selected {len(self.values)} users for invite.")
 
 class InviteButton(Button):
     def __init__(self):
@@ -362,11 +343,13 @@ class InviteButton(Button):
             await interaction.response.defer() # Acknowledge the interaction silently
             return
 
-        # Disable all UI components on the public message (except the play button which will be enabled later)
+        # Disable main UI components immediately after invite is clicked
         view.game_mode_select.disabled = True
         view.invite_user_select.disabled = True
         self.disabled = True # Disable the invite button itself
-        view.play_button.disabled = True # Keep play button disabled until all respond
+        view.play_button.disabled = True # Main Play button disabled
+        view.invite_other_players_button.disabled = True # Will be re-enabled by _update_button_states
+        view.play_single_player_button.disabled = True # Will be re-enabled by _update_button_states
         await interaction.response.edit_message(view=view)
         
         logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
@@ -464,7 +447,7 @@ class InviteButton(Button):
                         # Mark countdown as finished
                         view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0 
                         await view._update_public_game_status_message()
-                        await view._check_all_players_responded()
+                        await view._check_all_players_responded() # This will call _update_button_states
                     else:
                         await deny_interaction.response.send_message("This invite is not for you!", ephemeral=True)
                 
@@ -513,21 +496,41 @@ class InviteButton(Button):
                 }
                 # Continue trying to send invites to other users
         
-        # Update public message with initial waiting statuses
+        # Update public message with initial waiting statuses and button states
         await view._update_public_game_status_message()
+        await view._update_button_states() # Ensure buttons are updated after invites sent
         await interaction.response.defer() # Acknowledge the initial interaction silently
 
 
-class PlayButton(Button):
+class InviteOtherPlayersButton(Button):
     def __init__(self):
-        # Initially enabled for single player default
-        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green, disabled=False, row=3) # Moved to row 3
+        super().__init__(label="Invite Other Players", style=discord.ButtonStyle.secondary, disabled=True, row=3)
 
     async def callback(self, interaction: discord.Interaction):
-        view = self.view # The view property is automatically set by discord.py
+        view = self.view
+        await interaction.response.defer() # Acknowledge the interaction
+
+        # Re-enable relevant selection components
+        view.game_mode_select.disabled = False
+        view.invite_user_select.disabled = False
+        view.invite_button.disabled = (len(view.selected_users_for_invite) == 0) # Enable if users already selected
+        
+        # Disable this button and Play Single Player button
+        self.disabled = True
+        view.play_single_player_button.disabled = True
+        view.play_button.disabled = True # Ensure main play button is disabled
+
+        await view._update_button_states() # Update the message
+
+
+class PlaySinglePlayerButton(Button):
+    def __init__(self):
+        super().__init__(label="Play Single Player", style=discord.ButtonStyle.green, disabled=True, row=4)
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view
         if not view:
-            logger.error("PlayButton callback: View is not set.")
-            # Acknowledge the interaction to prevent "Interaction Failed"
+            logger.error("PlaySinglePlayerButton callback: View is not set.")
             await interaction.response.defer()
             return
 
@@ -536,39 +539,21 @@ class PlayButton(Button):
             item.disabled = True
         await interaction.response.edit_message(view=view)
 
-        # No "You clicked 'Play'!" message as per user's request
-        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
+        logger.info(f"Player {interaction.user.display_name} clicked Play Single Player. Starting game flow.")
 
-        # Assign the actual player ID to the game state
-        # In multiplayer, this should include all accepted players + initiator
-        if view.game_mode_select.values[0] == "multiplayer":
-            # Collect accepted players. Initiator is always a player.
-            accepted_players = [
-                user_id for user_id, status_info in view.game_state['invited_players_status'].items() 
-                if status_info['status'] == 'accepted'
-            ]
-            if interaction.user.id not in accepted_players: # Ensure initiator is in the list
-                accepted_players.append(interaction.user.id)
-            view.game_state['players_in_game'] = accepted_players
-            num_players_to_deal = len(accepted_players)
-        else: # Single player
-            view.game_state['players_in_game'] = [interaction.user.id]
-            num_players_to_deal = 1
-
+        # Force single player game
+        view.game_state['players_in_game'] = [interaction.user.id]
+        num_players_to_deal = 1
 
         # Deal cards using the game_state's deck
         dealt_info = await _deal_cards(
             view.game_state['deck'],
-            num_players=num_players_to_deal, # Use dynamic player count
+            num_players=num_players_to_deal,
             cards_per_player=2,
             deal_dealer=True,
-            dealer_hidden_cards=2 # Both dealer cards hidden initially
+            dealer_hidden_cards=2
         )
-        # Assign hands to actual user IDs
-        player_idx = 0
-        for player_id in view.game_state['players_in_game']:
-            view.game_state['player_hands'][player_id] = dealt_info['player_hands'].get(f"player_{player_idx}", [])
-            player_idx += 1
+        view.game_state['player_hands'][interaction.user.id] = dealt_info['player_hands'].get(f"player_0", [])
         view.game_state['dealer_hand'] = dealt_info['dealer_hand']
 
         # --- Update Public Message (Dealer's hand - image only) ---
@@ -666,22 +651,83 @@ class BetButtonView(View): # Inherit from View
         self.invite_user_select = InviteUserSelect()
         self.invite_button = InviteButton()
         self.play_button = PlayButton()
+        self.invite_other_players_button = InviteOtherPlayersButton() # New button
+        self.play_single_player_button = PlaySinglePlayerButton() # New button
 
-        # Assign references for PlayButton to access view's context
+        # Assign references for buttons to access view's context
         self.play_button.game_state = game_state
         self.play_button.bot = bot
         self.play_button.original_interaction = original_interaction
+        self.invite_other_players_button.view = self # self-reference
+        self.play_single_player_button.view = self # self-reference
+
 
         # Add items to the view in desired order
         self.add_item(self.game_mode_select)
         self.add_item(self.invite_user_select)
         self.add_item(self.invite_button)
-        self.add_item(self.play_button)
+        self.add_item(self.play_button) # Main Play button
+        self.add_item(self.invite_other_players_button) # New button
+        self.add_item(self.play_single_player_button) # New button
 
         # Set initial states based on default single player
         self.invite_user_select.disabled = True
         self.invite_button.disabled = True
-        self.play_button.disabled = False
+        # Call _update_button_states to set initial visibility correctly
+        self.bot.loop.create_task(self._update_button_states())
+
+
+    async def _update_button_states(self):
+        """Centralized function to manage button states based on game mode and invite status."""
+        current_mode = self.game_mode_select.values[0]
+
+        if current_mode == "single_player":
+            self.game_mode_select.disabled = False
+            self.invite_user_select.disabled = True
+            self.invite_button.disabled = True
+            self.play_button.disabled = False # Always enabled for single player selection
+            self.invite_other_players_button.disabled = True
+            self.play_single_player_button.disabled = True
+        elif current_mode == "multiplayer":
+            # Initial multiplayer state: only invite components active
+            if not self.game_state['invited_players_status']: # No invites sent yet
+                self.game_mode_select.disabled = False # Can still change mode
+                self.invite_user_select.disabled = False
+                self.invite_button.disabled = (len(self.selected_users_for_invite) == 0)
+                self.play_button.disabled = True # Main play button disabled
+                self.invite_other_players_button.disabled = True
+                self.play_single_player_button.disabled = True
+            else: # Invites have been sent, manage based on response status
+                num_accepted = sum(1 for status_info in self.game_state['invited_players_status'].values() if status_info['status'] == 'accepted')
+                num_waiting = sum(1 for status_info in self.game_state['invited_players_status'].values() if status_info['status'] == 'waiting')
+                
+                # Lock game mode selection after invites are sent
+                self.game_mode_select.disabled = True
+                self.invite_user_select.disabled = True
+                self.invite_button.disabled = True # Original invite button disabled
+
+                if num_waiting == 0: # All invited players have responded (accepted/denied/timed out)
+                    if num_accepted >= 1:
+                        self.play_button.disabled = False # Enable main Play button
+                        self.invite_other_players_button.disabled = True # Hide these
+                        self.play_single_player_button.disabled = True # Hide these
+                    else: # All responded, but no one accepted
+                        self.play_button.disabled = True # Main Play button remains disabled
+                        self.invite_other_players_button.disabled = False # Show "Invite other"
+                        self.play_single_player_button.disabled = False # Show "Play Single"
+                else: # Still waiting on some players
+                    self.play_button.disabled = True # Main Play button disabled
+                    self.invite_other_players_button.disabled = False # Show "Invite other"
+                    self.play_single_player_button.disabled = False # Show "Play Single"
+
+        # After updating button states, edit the message
+        try:
+            await self.original_interaction.edit_original_response(view=self)
+        except discord.NotFound:
+            logger.warning("Original interaction message not found when updating button states.")
+        except Exception as e:
+            logger.error(f"Error editing original response to update button states: {e}")
+
 
     async def _update_public_game_status_message(self):
         """Updates the public message with the current status of invited players, including countdown."""
@@ -741,20 +787,10 @@ class BetButtonView(View): # Inherit from View
             logger.error(f"Error updating public message with player status: {e}")
 
     async def _check_all_players_responded(self):
-        """Checks if all invited players have responded and enables the Play button if so."""
-        if not self.game_state['invited_players_status']: # No players invited
-            return
-
-        all_responded = True
-        for status_info in self.game_state['invited_players_status'].values():
-            if status_info['status'] == 'waiting':
-                all_responded = False
-                break
-        
-        if all_responded:
-            self.play_button.disabled = False
-            await self.original_interaction.edit_original_response(view=self) # Update the view to enable play button
-            logger.info("All invited players have responded. Play button enabled.")
+        """Checks if all invited players have responded and updates button states accordingly."""
+        # This function now primarily triggers the _update_button_states
+        # as the complex logic is centralized there.
+        await self._update_button_states()
 
 
     async def on_timeout(self):

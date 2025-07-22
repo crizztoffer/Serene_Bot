@@ -104,9 +104,10 @@ async def load_flag_reasons():
         if conn:
             conn.close() # Use conn.close() for aiomysql connections
 
-async def post_and_save_embed(guild_id, rules_json, rules_channel_id):
+async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
     """
     Helper function to post a new Discord embed and save its details to bot_messages table.
+    Expects rules_json_bytes to be bytes, will decode it.
     """
     conn = None
     try:
@@ -130,8 +131,14 @@ async def post_and_save_embed(guild_id, rules_json, rules_channel_id):
                 logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
                 return
 
+            # Decode rules_json_bytes to string
+            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
+            logger.debug(f"post_and_save_embed: Decoded rules_json_str for guild {guild_id}: {rules_json_str[:200]}...") # Log first 200 chars
+            logger.debug(f"post_and_save_embed: Type of rules_json_str: {type(rules_json_str)}")
+
+
             try:
-                embed_data_list = json.loads(rules_json)
+                embed_data_list = json.loads(rules_json_str)
                 if not isinstance(embed_data_list, list) or not embed_data_list:
                     raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
                 embed_data = embed_data_list[0]
@@ -145,7 +152,7 @@ async def post_and_save_embed(guild_id, rules_json, rules_channel_id):
 
             await cursor.execute(
                 "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
-                (str(guild_id), rules_json, str(sent_message.id))
+                (str(guild_id), rules_json_str, str(sent_message.id))
             )
             logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
 
@@ -158,6 +165,19 @@ async def post_and_save_embed(guild_id, rules_json, rules_channel_id):
             conn.close()
 
 # --- Web Server Setup ---
+
+# CORS headers for preflight and actual requests
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': 'https://serenekeks.com', # Replace with your actual domain
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400' # Cache preflight for 24 hours
+}
+
+async def cors_preflight_handler(request):
+    """Handles CORS OPTIONS preflight requests."""
+    return web.Response(status=200, headers=CORS_HEADERS)
+
 async def settings_saved_handler(request):
     """
     Handles POST requests to /settings_saved endpoint.
@@ -176,7 +196,7 @@ async def settings_saved_handler(request):
             # Fetch settings from the database (bot_guild_settings)
             if not all([DB_USER, DB_PASSWORD, DB_HOST]):
                 logger.error("Missing DB credentials for fetching settings.")
-                return web.Response(text="Internal Server Error: DB credentials missing", status=500)
+                return web.Response(text="Internal Server Error: DB credentials missing", status=500, headers=CORS_HEADERS)
 
             conn = await aiomysql.connect(
                 host=DB_HOST,
@@ -197,25 +217,31 @@ async def settings_saved_handler(request):
 
                 if not settings_row:
                     logger.warning(f"No settings found for guild ID: {guild_id} in bot_guild_settings.")
-                    return web.Response(text="No settings found for guild", status=404)
+                    return web.Response(text="No settings found for guild", status=404, headers=CORS_HEADERS)
 
-                new_rules_json = settings_row.get('rules')
+                new_rules_json_bytes = settings_row.get('rules')
                 rules_channel_id = settings_row.get('rules_channel')
 
-                if not new_rules_json or not rules_channel_id:
+                if not new_rules_json_bytes or not rules_channel_id:
                     logger.warning(f"Missing 'rules' JSON or 'rules_channel' for guild ID: {guild_id}. Cannot process embed.")
-                    return web.Response(text="Missing rules data or channel", status=400)
+                    return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
+
+                # Decode new_rules_json from bytes to string
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
+                logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
+                logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
+
 
                 # Parse the new rules JSON
                 try:
                     # Discord API expects an array of embeds, usually just one
-                    embed_data_list = json.loads(new_rules_json)
+                    embed_data_list = json.loads(new_rules_json_str)
                     if not isinstance(embed_data_list, list) or not embed_data_list:
                         raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
                     embed_data = embed_data_list[0] # Take the first embed
                 except (json.JSONDecodeError, ValueError) as e:
                     logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
-                    return web.Response(text="Invalid rules JSON format", status=400)
+                    return web.Response(text="Invalid rules JSON format", status=400, headers=CORS_HEADERS)
 
                 # 2. Check bot_messages table
                 await cursor.execute(
@@ -227,19 +253,25 @@ async def settings_saved_handler(request):
                 guild = bot.get_guild(int(guild_id))
                 if not guild:
                     logger.error(f"Bot is not in guild with ID: {guild_id}")
-                    return web.Response(text="Bot not in specified guild", status=404)
+                    return web.Response(text="Bot not in specified guild", status=404, headers=CORS_HEADERS)
 
                 rules_channel = guild.get_channel(int(rules_channel_id))
                 if not rules_channel:
                     logger.error(f"Rules channel with ID {rules_channel_id} not found in guild {guild_id}.")
-                    return web.Response(text="Rules channel not found", status=404)
+                    return web.Response(text="Rules channel not found", status=404, headers=CORS_HEADERS)
 
                 if bot_messages_row:
                     # Row exists, compare messages
-                    existing_message_json = bot_messages_row.get('message')
+                    existing_message_json_bytes = bot_messages_row.get('message')
                     existing_message_id = bot_messages_row.get('message_id')
 
-                    if existing_message_json != new_rules_json:
+                    # Decode existing_message_json from bytes to string
+                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_bytes
+                    logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...") # Log first 200 chars
+                    logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
+
+
+                    if existing_message_json_str != new_rules_json_str:
                         logger.info(f"Rules content changed for guild {guild_id}. Attempting to update message.")
                         try:
                             # Fetch the existing message
@@ -252,33 +284,33 @@ async def settings_saved_handler(request):
                             # Update bot_messages table with the new JSON
                             await cursor.execute(
                                 "UPDATE bot_messages SET message = %s WHERE guild_id = %s",
-                                (new_rules_json, str(guild_id))
+                                (new_rules_json_str, str(guild_id))
                             )
                             logger.info(f"Updated bot_messages table for guild {guild_id}.")
                         except discord.errors.NotFound:
                             logger.warning(f"Message {existing_message_id} not found in channel {rules_channel_id}. Re-posting new message.")
                             # Message not found, proceed to post new message
-                            await post_and_save_embed(guild_id, new_rules_json, rules_channel_id) # Reuse helper
+                            await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id) # Reuse helper
                         except discord.errors.Forbidden:
                             logger.error(f"Bot lacks permissions to edit/send messages in channel {rules_channel_id} for guild {guild_id}.")
-                            return web.Response(text="Bot lacks Discord permissions", status=403)
+                            return web.Response(text="Bot lacks Discord permissions", status=403, headers=CORS_HEADERS)
                         except Exception as discord_e:
                             logger.error(f"Error interacting with Discord API for guild {guild_id}: {discord_e}")
-                            return web.Response(text="Discord API error", status=500)
+                            return web.Response(text="Discord API error", status=500, headers=CORS_HEADERS)
                     else:
                         logger.info(f"Rules content is identical for guild {guild_id}. No update needed.")
                 else:
                     # No row exists in bot_messages, post new embed
                     logger.info(f"No existing bot_messages entry for guild {guild_id}. Posting new embed.")
-                    await post_and_save_embed(guild_id, new_rules_json, rules_channel_id) # Reuse helper
+                    await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id) # Reuse helper
 
-            return web.Response(text="Signal received and settings processed", status=200)
+            return web.Response(text="Signal received and settings processed", status=200, headers=CORS_HEADERS)
         else:
             logger.warning(f"Unauthorized access attempt to /settings_saved. Invalid BOT_ENTRY: {bot_entry}")
-            return web.Response(text="Unauthorized", status=401)
+            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
     except Exception as e:
         logger.error(f"Overall error in settings_saved_handler for guild {guild_id}: {e}", exc_info=True)
-        return web.Response(text="Internal Server Error", status=500)
+        return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
     finally:
         if conn:
             conn.close() # Ensure database connection is closed
@@ -286,6 +318,8 @@ async def settings_saved_handler(request):
 async def start_web_server():
     """Starts the aiohttp web server."""
     app = web.Application()
+    # Add OPTIONS handler for CORS preflight
+    app.router.add_options('/settings_saved', cors_preflight_handler)
     app.router.add_post('/settings_saved', settings_saved_handler)
 
     # Get port from environment variable, default to 8080
@@ -363,13 +397,13 @@ async def on_ready():
 
                     if not bot_messages_row:
                         # Case: Entry in bot_guild_settings but not in bot_messages
-                        new_rules_json = settings_row.get('rules')
+                        new_rules_json_bytes = settings_row.get('rules')
                         rules_channel_id = settings_row.get('rules_channel')
 
-                        if new_rules_json and rules_channel_id:
+                        if new_rules_json_bytes and rules_channel_id:
                             logger.info(f"Detected missing rules embed for guild {guild.id} on startup. Attempting to post.")
                             # Call the helper function to post and save the embed
-                            await post_and_save_embed(str(guild.id), new_rules_json, rules_channel_id)
+                            await post_and_save_embed(str(guild.id), new_rules_json_bytes, rules_channel_id)
                         else:
                             logger.warning(f"Guild {guild.id} has settings but missing rules JSON or channel ID. Skipping rules embed post on startup.")
                 # else: No settings for this guild, nothing to do.

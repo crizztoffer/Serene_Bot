@@ -1,4 +1,4 @@
-# --- cogs/games/my_card_game.py ---
+# --- cogs/games/Serene Texas Hold Em.py ---
 
 import discord
 from discord.ext import commands

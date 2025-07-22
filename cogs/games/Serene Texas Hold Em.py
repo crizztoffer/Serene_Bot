@@ -14,6 +14,7 @@ import aiohttp
 from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
 import aiomysql # Import aiomysql for database operations
 import logging # Import logging
+import time # Import time for Unix timestamps
 
 # Explicitly import UI components for clarity
 from discord.ui import View, Select, UserSelect, Button
@@ -310,6 +311,44 @@ class InviteButton(Button):
         # Initially disabled for single player default
         super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, disabled=True, row=2)
 
+    async def _handle_invite_timeout(self, invited_user_id: int, invite_message_view: discord.ui.View, invite_message_obj: discord.Message, invited_user_mention: str, inviter_mention: str):
+        """Handles the automatic denial of an invite after a timeout."""
+        countdown_seconds = 30
+        view = self.view # Get the parent view (BetButtonView)
+
+        # Wait for the full countdown duration
+        await asyncio.sleep(countdown_seconds)
+
+        # After countdown, check if status is still 'waiting'
+        # Access the dictionary for the user's status
+        user_status_info = view.game_state['invited_players_status'].get(invited_user_id)
+
+        if user_status_info and user_status_info.get('status') == 'waiting':
+            logger.info(f"Invite for {invited_user_id} timed out. Automatically declining.")
+            user_status_info['status'] = 'denied'
+            # Mark countdown as finished
+            user_status_info['countdown_end_time'] = 0 
+
+            # Disable buttons on the invite message
+            for item in invite_message_view.children:
+                item.disabled = True
+            
+            try:
+                await invite_message_obj.edit(
+                    content=f"{invited_user_mention} did not respond to {inviter_mention}'s game invite in time and it has been automatically declined.",
+                    view=invite_message_view
+                )
+            except discord.NotFound:
+                logger.warning(f"Invite message {invite_message_obj.id} not found for timeout update.")
+            except Exception as e:
+                logger.error(f"Error updating invite message on timeout for {invited_user_id}: {e}")
+
+            invite_message_view.stop() # Stop the invite view to clean up its listeners
+
+            await view._update_public_game_status_message()
+            await view._check_all_players_responded()
+
+
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if not view:
@@ -379,9 +418,6 @@ class InviteButton(Button):
             await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True) # Ephemeral for critical error
             return
 
-        # Initialize invited_players_status in game_state
-        view.game_state['invited_players_status'] = {user.id: 'waiting' for user in invited_users}
-
         # --- Send invite messages with user-specific buttons ---
         for invited_user in invited_users:
             try:
@@ -424,7 +460,9 @@ class InviteButton(Button):
                         invite_message_view.stop() # Stop the invite view
 
                         # Update main game state and public message
-                        view.game_state['invited_players_status'][invited_user.id] = 'denied'
+                        view.game_state['invited_players_status'][invited_user.id]['status'] = 'denied'
+                        # Mark countdown as finished
+                        view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0 
                         await view._update_public_game_status_message()
                         await view._check_all_players_responded()
                     else:
@@ -432,17 +470,47 @@ class InviteButton(Button):
                 
                 deny_button.callback = deny_callback # Assign the callback to the deny button
 
+                # Calculate the Unix timestamp for 30 seconds from now
+                countdown_end_timestamp = int(time.time() + 30)
+
+                initial_invite_content = (
+                    f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em in {interaction.channel.mention}!\n"
+                    f"Please respond by <t:{countdown_end_timestamp}:R>."
+                )
+                
                 # Send the invite message
-                await notif_channel.send(
-                    f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em in {interaction.channel.mention}!",
+                invite_message_obj = await notif_channel.send(
+                    initial_invite_content,
                     view=invite_message_view
                 )
                 logger.info(f"Invite sent to {invited_user.display_name} in channel {notif_channel.name}.")
 
+                # Store the invite message ID and countdown end time in game_state
+                view.game_state['invited_players_status'][invited_user.id] = {
+                    'status': 'waiting',
+                    'invite_message_id': invite_message_obj.id,
+                    'countdown_end_time': countdown_end_timestamp
+                }
+
+                # Start the timeout task for this specific invite
+                view.bot.loop.create_task(
+                    self._handle_invite_timeout(
+                        invited_user.id, 
+                        invite_message_view, 
+                        invite_message_obj, 
+                        invited_user.mention, 
+                        interaction.user.mention
+                    )
+                )
+
             except Exception as e:
                 logger.error(f"Error sending invite message to {invited_user.display_name}: {e}")
                 # Mark this specific user as failed in status
-                view.game_state['invited_players_status'][invited_user.id] = 'failed'
+                view.game_state['invited_players_status'][invited_user.id] = {
+                    'status': 'failed',
+                    'invite_message_id': None,
+                    'countdown_end_time': 0 # Mark as finished
+                }
                 # Continue trying to send invites to other users
         
         # Update public message with initial waiting statuses
@@ -476,8 +544,8 @@ class PlayButton(Button):
         if view.game_mode_select.values[0] == "multiplayer":
             # Collect accepted players. Initiator is always a player.
             accepted_players = [
-                user_id for user_id, status in view.game_state['invited_players_status'].items() 
-                if status == 'accepted'
+                user_id for user_id, status_info in view.game_state['invited_players_status'].items() 
+                if status_info['status'] == 'accepted'
             ]
             if interaction.user.id not in accepted_players: # Ensure initiator is in the list
                 accepted_players.append(interaction.user.id)
@@ -590,7 +658,8 @@ class BetButtonView(View): # Inherit from View
         self.bot = bot
         self.original_interaction = original_interaction # Store the initial interaction
         self.selected_users_for_invite = [] # To store the list of user objects selected for invite
-        self.game_state['invited_players_status'] = {} # {user_id: 'waiting'/'accepted'/'denied'}
+        # Initialize invited_players_status with a more detailed structure
+        self.game_state['invited_players_status'] = {} # {user_id: {'status': 'waiting'/'accepted'/'denied'/'failed', 'invite_message_id': None, 'countdown_end_time': 0}}
 
         # Instantiate UI components
         self.game_mode_select = GameModeSelect()
@@ -615,30 +684,43 @@ class BetButtonView(View): # Inherit from View
         self.play_button.disabled = False
 
     async def _update_public_game_status_message(self):
-        """Updates the public message with the current status of invited players."""
+        """Updates the public message with the current status of invited players, including countdown."""
         if not self.game_state['public_message_id']:
             logger.warning("No public message ID to update status.")
             return
 
         status_lines = []
-        for user_id, status in self.game_state['invited_players_status'].items():
+        for user_id, status_info in self.game_state['invited_players_status'].items():
+            status = status_info['status']
+            countdown_end_time = status_info.get('countdown_end_time', 0)
+            
             try:
                 user = await self.bot.fetch_user(user_id)
-                emoji = "⏳" # Waiting
-                if status == 'accepted':
-                    emoji = "✅" # Ready
+                emoji = ""
+                status_text = status.capitalize()
+                
+                if status == 'waiting':
+                    # Use Discord's relative timestamp for the public status message
+                    emoji = "⏳"
+                    status_text = f"Waiting (responds by <t:{countdown_end_time}:R>)"
+                elif status == 'accepted':
+                    emoji = "✅"
+                    status_text = "Accepted"
                 elif status == 'denied':
-                    emoji = "❌" # Denied
+                    emoji = "❌"
+                    status_text = "Denied"
                 elif status == 'failed':
-                    emoji = "⚠️" # Failed to send invite
-                status_lines.append(f"{emoji} {user.mention} ({status.capitalize()})")
+                    emoji = "⚠️"
+                    status_text = "Failed to send invite"
+                
+                status_lines.append(f"{emoji} {user.mention} ({status_text})")
             except discord.NotFound:
                 status_lines.append(f"❓ Unknown User (ID: {user_id}) ({status.capitalize()})")
             except Exception as e:
                 logger.error(f"Error fetching user {user_id} for status update: {e}")
                 status_lines.append(f"❓ Error User (ID: {user_id}) ({status.capitalize()})")
         
-        status_text = "\n".join(status_lines) if status_lines else "No players invited yet."
+        status_text_combined = "\n".join(status_lines) if status_lines else "No players invited yet."
         
         try:
             channel = self.bot.get_channel(self.game_state['channel_id'])
@@ -648,18 +730,9 @@ class BetButtonView(View): # Inherit from View
             public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
             
             # Preserve the image if it exists, otherwise send without it
-            attachments = public_message_to_edit.attachments
-            if attachments:
-                # Re-download the attachment to re-send it, as discord.File needs a file-like object
-                # This is a workaround as discord.py doesn't directly support re-using Attachment objects
-                # without re-fetching content. For simplicity, we'll just update text for now
-                # or regenerate the placeholder if the image was a placeholder.
-                # If the image was the initial placeholder, we don't need to re-send it.
-                pass # We'll just update the content, the image stays.
-
+            # For simplicity, we'll just update the content, the image stays.
             await public_message_to_edit.edit(
-                content=f"**🃏 Game Table: Player Status**\n{status_text}",
-                # attachments=attachments # Re-adding attachments can be complex. Let's just update content.
+                content=f"**🃏 Game Table: Player Status**\n{status_text_combined}",
             )
             logger.info(f"Public message {self.game_state['public_message_id']} updated with player statuses.")
         except discord.NotFound:
@@ -673,8 +746,8 @@ class BetButtonView(View): # Inherit from View
             return
 
         all_responded = True
-        for status in self.game_state['invited_players_status'].values():
-            if status == 'waiting':
+        for status_info in self.game_state['invited_players_status'].values():
+            if status_info['status'] == 'waiting':
                 all_responded = False
                 break
         
@@ -717,7 +790,8 @@ async def start(interaction: discord.Interaction, bot):
         'community_cards': [],
         'public_message_id': None,
         'channel_id': interaction.channel_id,
-        'invited_players_status': {} # Initialize here
+        # Initialize with the new structure for invited_players_status
+        'invited_players_status': {} 
     }
     random.shuffle(game_state['deck'])
 

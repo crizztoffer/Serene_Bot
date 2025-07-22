@@ -465,6 +465,29 @@ class StartGameButton(Button): # Renamed from PlayButton
 
         # No need to stop the view here, as GameBoardView should persist.
 
+        # --- New: Delete invite messages when the game starts ---
+        invite_channel = view.bot.get_channel(int(os.getenv("NOTIF_CHANNEL_ID"))) # Assuming NOTIF_CHANNEL_ID is set as an env var
+        if not invite_channel:
+            try:
+                invite_channel = await view.bot.fetch_channel(int(os.getenv("NOTIF_CHANNEL_ID")))
+            except (discord.NotFound, ValueError):
+                logger.error("Notification channel for invite message deletion not found or invalid.")
+                invite_channel = None
+
+        if invite_channel:
+            for user_id, status_info in view.game_state['invited_players_status'].items():
+                invite_message_id = status_info.get('invite_message_id')
+                if invite_message_id:
+                    try:
+                        message_to_delete = await invite_channel.fetch_message(invite_message_id)
+                        await message_to_delete.delete()
+                        logger.info(f"Deleted invite message {invite_message_id} for user {user_id}.")
+                    except discord.NotFound:
+                        logger.warning(f"Invite message {invite_message_id} for user {user_id} not found, already deleted?")
+                    except Exception as e:
+                        logger.error(f"Error deleting invite message {invite_message_id} for user {user_id}: {e}")
+        # --- End new deletion logic ---
+
 
 class ShowMyCardsButton(Button):
     def __init__(self, game_state: dict, bot: commands.Bot):
@@ -637,6 +660,9 @@ class InviteButton(Button):
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True)
             return
+
+        # Set the notification channel ID in the environment for later use
+        os.environ["NOTIF_CHANNEL_ID"] = str(notif_channel_id)
 
         for invited_user in invited_users:
             try:

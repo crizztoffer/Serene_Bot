@@ -390,11 +390,9 @@ class StartGameButton(Button): # Renamed from PlayButton
         # Disable and remove this button after it's clicked
         self.disabled = True
         view.remove_item(self)
-        # Also disable the "Show Me My Cards Again" button until cards are dealt
-        view.show_my_cards_button.disabled = True
-        await interaction.response.edit_message(view=view) # Update the message to remove the button and disable other
+        await interaction.response.edit_message(view=view) # Update the message to remove the button
 
-        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
+        logger.info(f"Player {interaction.user.user.display_name} clicked the Play button. Starting game flow.")
 
         # If players_in_game is not set yet, default to the interacting user for single player
         if 'players_in_game' not in view.game_state or not view.game_state['players_in_game']:
@@ -434,15 +432,16 @@ class StartGameButton(Button): # Renamed from PlayButton
                 
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
                 
-                # Enable the "Show Me My Cards Again" button now that cards are dealt
-                view.show_my_cards_button.disabled = False
+                # Add and enable the "Show Me My Cards Again" button now that cards are dealt
+                view.add_item(view.show_my_cards_button) # Add the item to the view
+                view.show_my_cards_button.disabled = False # Enable it
 
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards:**",
                     attachments=[updated_public_file],
                     view=view # Keep the existing GameBoardView
                 )
-                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealt cards.")
+                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealt cards and 'Show Me My Cards Again' button.")
             except discord.NotFound:
                 logger.error(f"Public message with ID {view.game_state['public_message_id']} not found during update.")
             except Exception as e:
@@ -453,10 +452,12 @@ class StartGameButton(Button): # Renamed from PlayButton
                 if not channel:
                     channel = await view.bot.fetch_channel(view.game_state['channel_id'])
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
-                view.show_my_cards_button.disabled = False # Enable even if image fails
+                # Add and enable even if image fails
+                view.add_item(view.show_my_cards_button)
+                view.show_my_cards_button.disabled = False
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards: (Image failed to load)**",
-                    view=view # Keep the existing GameBoardView
+                    view=view
                 )
             except Exception as e:
                 logger.error(f"Error handling image creation failure in public message: {e}")
@@ -513,10 +514,10 @@ class GameBoardView(View): # This view will hold the game board and in-game butt
         self.add_item(self.start_game_button)
         self.start_game_button.disabled = True # Disabled until setup is complete
 
-        # Add the ShowMyCardsButton
+        # Instantiate ShowMyCardsButton, but DO NOT add it to the view yet
         self.show_my_cards_button = ShowMyCardsButton(game_state, bot)
-        self.add_item(self.show_my_cards_button)
-        self.show_my_cards_button.disabled = True # Disabled until cards are dealt
+        # self.add_item(self.show_my_cards_button) # Removed this line
+        # self.show_my_cards_button.disabled = True # This will be set when added
 
 
 class InviteButton(Button):
@@ -859,7 +860,7 @@ class BetButtonView(View): # Inherit from View
 
                 game_board_view = GameBoardView(self.game_state, self.bot)
                 game_board_view.start_game_button.disabled = False
-                game_board_view.show_my_cards_button.disabled = True # Disable until cards are dealt
+                # The show_my_cards_button is not added to GameBoardView yet, so no need to disable it here.
                 
                 try:
                     channel = self.bot.get_channel(self.game_state['channel_id'])
@@ -896,7 +897,7 @@ class BetButtonView(View): # Inherit from View
             # Transition to GameBoardView and enable its StartGameButton
             game_board_view = GameBoardView(self.game_state, self.bot)
             game_board_view.start_game_button.disabled = False
-            game_board_view.show_my_cards_button.disabled = True # Disable until cards are dealt
+            # The show_my_cards_button is not added to GameBoardView yet, so no need to disable it here.
 
             try:
                 channel = self.bot.get_channel(self.game_state['channel_id'])

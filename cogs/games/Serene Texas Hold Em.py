@@ -313,7 +313,7 @@ class InviteButton(Button):
 
     async def _handle_invite_timeout(self, invited_user_id: int, invite_message_view: discord.ui.View, invite_message_obj: discord.Message, invited_user_mention: str, inviter_mention: str):
         """Handles the automatic denial of an invite after a timeout."""
-        countdown_seconds = 30
+        countdown_seconds = 60 # Changed from 30 to 60 seconds
         view = self.view # Get the parent view (BetButtonView)
 
         # Wait for the full countdown duration
@@ -362,11 +362,14 @@ class InviteButton(Button):
             await interaction.response.defer() # Acknowledge the interaction silently
             return
 
-        # Disable all UI components on the public message (except the play button which will be enabled later)
-        view.game_mode_select.disabled = True
-        view.invite_user_select.disabled = True
-        self.disabled = True # Disable the invite button itself
-        view.play_button.disabled = True # Keep play button disabled until all respond
+        # Remove the game mode select, user select, and invite button from the view
+        # This effectively "hides" them from the public message.
+        view.remove_item(view.game_mode_select)
+        view.remove_item(view.invite_user_select)
+        view.remove_item(self) # Remove the invite button itself
+
+        # The play button remains, but stays disabled until all invites are handled
+        view.play_button.disabled = True 
         await interaction.response.edit_message(view=view)
         
         logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
@@ -402,7 +405,10 @@ class InviteButton(Button):
 
         except Exception as e:
             logger.error(f"Database error when fetching notif_channel: {e}")
-            # Re-enable invite button if DB error occurs
+            # Re-add and re-enable invite button if DB error occurs, as the flow is broken
+            view.add_item(view.game_mode_select)
+            view.add_item(view.invite_user_select)
+            view.add_item(self)
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True) # Ephemeral for critical error
@@ -412,7 +418,10 @@ class InviteButton(Button):
                 conn.close()
 
         if not notif_channel_id:
-            # Re-enable invite button if no channel found
+            # Re-add and re-enable invite button if no channel found
+            view.add_item(view.game_mode_select)
+            view.add_item(view.invite_user_select)
+            view.add_item(self)
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True) # Ephemeral for critical error
@@ -426,7 +435,7 @@ class InviteButton(Button):
                     notif_channel = await view.bot.fetch_channel(int(notif_channel_id))
                 
                 # Create a new view for each invite message
-                invite_message_view = discord.ui.View(timeout=300) # Timeout for invite buttons (5 minutes)
+                invite_message_view = discord.ui.View(timeout=60) # Timeout for invite buttons (60 seconds)
 
                 # Accept Button (links to game channel)
                 game_channel_jump_url = interaction.channel.jump_url
@@ -470,8 +479,8 @@ class InviteButton(Button):
                 
                 deny_button.callback = deny_callback # Assign the callback to the deny button
 
-                # Calculate the Unix timestamp for 30 seconds from now
-                countdown_end_timestamp = int(time.time() + 30)
+                # Calculate the Unix timestamp for 60 seconds from now
+                countdown_end_timestamp = int(time.time() + 60) # Changed from 30 to 60 seconds
 
                 initial_invite_content = (
                     f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em in {interaction.channel.mention}!\n"

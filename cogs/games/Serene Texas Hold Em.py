@@ -17,7 +17,7 @@ import logging # Import logging
 import time # Import time for Unix timestamps
 
 # Explicitly import UI components for clarity
-from discord.ui import View, Select, UserSelect, Button
+from discord.ui import View, Select, UserSelect, Button, Modal, TextInput
 
 
 # Configure logging for this game module
@@ -376,6 +376,104 @@ class InviteUserSelect(UserSelect):
         await interaction.response.edit_message(view=view)
         logger.info(f"User {interaction.user.display_name} selected {len(self.values)} users for invite.")
 
+class CallButton(Button):
+    def __init__(self, game_state: dict, bot: commands.Bot):
+        super().__init__(label="Call", style=discord.ButtonStyle.blurple, row=2)
+        self.game_state = game_state
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view # This will be GameBoardView
+        player_id = interaction.user.id
+
+        if player_id != view.game_state['players_in_round'][view.game_state['current_player_turn_index']]:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        # Logic for Call/Check
+        amount_to_call = view.game_state['round_cost'] - view.game_state['player_bets_current_round'].get(player_id, 0)
+        
+        if amount_to_call > view.game_state['player_chips'].get(player_id, 0):
+            await interaction.response.send_message("You don't have enough chips to call!", ephemeral=True)
+            return
+
+        view.game_state['player_chips'][player_id] -= amount_to_call
+        view.game_state['pot'] += amount_to_call
+        view.game_state['player_bets_current_round'][player_id] = view.game_state['round_cost']
+        logger.info(f"{interaction.user.display_name} called for {amount_to_call}. New chips: {view.game_state['player_chips'][player_id]}")
+        
+        await interaction.response.defer() # Acknowledge the interaction
+        await view._next_player_turn() # Move to the next player's turn
+
+class BetRaiseButton(Button):
+    def __init__(self, game_state: dict, bot: commands.Bot):
+        # Label will be updated dynamically
+        super().__init__(label="Bet", style=discord.ButtonStyle.green, row=2)
+        self.game_state = game_state
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view # This will be GameBoardView
+        player_id = interaction.user.id
+
+        if player_id != view.game_state['players_in_round'][view.game_state['current_player_turn_index']]:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+        
+        # For now, just a placeholder. Actual bet amount input will come later.
+        # For demonstration, let's assume a fixed bet for now.
+        bet_amount = 10 # Example fixed bet
+        
+        current_bet_for_player = view.game_state['player_bets_current_round'].get(player_id, 0)
+        amount_to_match_and_bet = view.game_state['round_cost'] - current_bet_for_player + bet_amount
+
+        if amount_to_match_and_bet > view.game_state['player_chips'].get(player_id, 0):
+            await interaction.response.send_message("You don't have enough chips to make that bet/raise!", ephemeral=True)
+            return
+
+        view.game_state['player_chips'][player_id] -= amount_to_match_and_bet
+        view.game_state['pot'] += amount_to_match_and_bet
+        view.game_state['current_bet'] = view.game_state['round_cost'] + bet_amount # Update current_bet
+        view.game_state['round_cost'] = view.game_state['current_bet'] # Round cost becomes the new current bet
+        view.game_state['player_bets_current_round'][player_id] = view.game_state['round_cost'] # Player has now bet this amount
+        view.game_state['last_better_id'] = player_id # Set the last better
+        view.game_state['round_bet_made'] = True # A bet has been made in this round
+        
+        logger.info(f"{interaction.user.display_name} bet/raised for {bet_amount}. New chips: {view.game_state['player_chips'][player_id]}")
+
+        await interaction.response.defer() # Acknowledge the interaction
+        await view._next_player_turn() # Move to the next player's turn
+
+class FoldButton(Button):
+    def __init__(self, game_state: dict, bot: commands.Bot):
+        super().__init__(label="Fold", style=discord.ButtonStyle.red, row=2)
+        self.game_state = game_state
+        self.bot = bot
+
+    async def callback(self, interaction: discord.Interaction):
+        view = self.view # This will be GameBoardView
+        player_id = interaction.user.id
+
+        if player_id != view.game_state['players_in_round'][view.game_state['current_player_turn_index']]:
+            await interaction.response.send_message("It's not your turn!", ephemeral=True)
+            return
+
+        if player_id in view.game_state['players_in_round']:
+            view.game_state['players_in_round'].remove(player_id)
+            logger.info(f"{interaction.user.display_name} folded.")
+            await interaction.response.send_message("You have folded from the game.", ephemeral=True)
+            
+            # If only one player remains, end the round/game
+            if len(view.game_state['players_in_round']) <= 1:
+                logger.info("Only one player remains, ending round/game.")
+                await view._end_round() # Or end game directly if it's the last player
+                return
+            
+            await view._next_player_turn() # Move to the next player's turn
+        else:
+            await interaction.response.send_message("You are not an active player in this round.", ephemeral=True)
+
+
 class StartGameButton(Button): # Renamed from PlayButton
     def __init__(self):
         super().__init__(label="Play ($10.00 Minimum)", style=discord.ButtonStyle.green, row=0) # Row 0 for GameBoardView
@@ -401,6 +499,9 @@ class StartGameButton(Button): # Renamed from PlayButton
         else:
             num_players_to_deal = len(view.game_state['players_in_game'])
 
+        # Initialize player chips for all players in game
+        for player_id in view.game_state['players_in_game']:
+            view.game_state['player_chips'][player_id] = 1000 # Starting chips example
 
         dealt_info = await _deal_cards(
             view.game_state['deck'],
@@ -411,6 +512,7 @@ class StartGameButton(Button): # Renamed from PlayButton
         )
         player_idx = 0
         for player_id in view.game_state['players_in_game']:
+            # Ensure player_hands is correctly mapped to actual player_ids
             view.game_state['player_hands'][player_id] = dealt_info['player_hands'].get(f"player_{player_idx}", [])
             player_idx += 1
         view.game_state['dealer_hand'] = dealt_info['dealer_hand']
@@ -432,16 +534,24 @@ class StartGameButton(Button): # Renamed from PlayButton
                 
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
                 
-                # Add and enable the "Show Me My Cards Again" button now that cards are dealt
-                view.add_item(view.show_my_cards_button) # Add the item to the view
-                view.show_my_cards_button.disabled = False # Enable it
+                # Add and enable the action buttons
+                view.add_item(view.look_at_my_cards_button)
+                view.add_item(view.call_button)
+                view.add_item(view.bet_raise_button)
+                view.add_item(view.fold_button)
+                
+                # Enable them
+                view.look_at_my_cards_button.disabled = False
+                view.call_button.disabled = False
+                view.bet_raise_button.disabled = False
+                view.fold_button.disabled = False
 
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards:**",
                     attachments=[updated_public_file],
                     view=view # Keep the existing GameBoardView
                 )
-                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealt cards and 'Show Me My Cards Again' button.")
+                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealt cards and action buttons.")
             except discord.NotFound:
                 logger.error(f"Public message with ID {view.game_state['public_message_id']} not found during update.")
             except Exception as e:
@@ -453,8 +563,16 @@ class StartGameButton(Button): # Renamed from PlayButton
                     channel = await view.bot.fetch_channel(view.game_state['channel_id'])
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
                 # Add and enable even if image fails
-                view.add_item(view.show_my_cards_button)
-                view.show_my_cards_button.disabled = False
+                view.add_item(view.look_at_my_cards_button)
+                view.add_item(view.call_button)
+                view.add_item(view.bet_raise_button)
+                view.add_item(view.fold_button)
+
+                view.look_at_my_cards_button.disabled = False
+                view.call_button.disabled = False
+                view.bet_raise_button.disabled = False
+                view.fold_button.disabled = False
+
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards: (Image failed to load)**",
                     view=view
@@ -465,7 +583,7 @@ class StartGameButton(Button): # Renamed from PlayButton
 
         # No need to stop the view here, as GameBoardView should persist.
 
-        # --- New: Delete invite messages when the game starts ---
+        # --- Delete invite messages when the game starts ---
         invite_channel = view.bot.get_channel(int(os.getenv("NOTIF_CHANNEL_ID"))) # Assuming NOTIF_CHANNEL_ID is set as an env var
         if not invite_channel:
             try:
@@ -486,12 +604,15 @@ class StartGameButton(Button): # Renamed from PlayButton
                         logger.warning(f"Invite message {invite_message_id} for user {user_id} not found, already deleted?")
                     except Exception as e:
                         logger.error(f"Error deleting invite message {invite_message_id} for user {user_id}: {e}")
-        # --- End new deletion logic ---
+        # --- End deletion logic ---
+
+        # Initialize the first betting round
+        await view._start_betting_round()
 
 
-class ShowMyCardsButton(Button):
+class LookAtMyCardsButton(Button): # Renamed from ShowMyCardsButton
     def __init__(self, game_state: dict, bot: commands.Bot):
-        super().__init__(label="Show Me My Cards Again", style=discord.ButtonStyle.primary, row=1) # Moved to row 1 to make space for StartGameButton
+        super().__init__(label="Look At My Cards", style=discord.ButtonStyle.primary, row=1) # Renamed label
         self.game_state = game_state
         self.bot = bot
 
@@ -537,10 +658,297 @@ class GameBoardView(View): # This view will hold the game board and in-game butt
         self.add_item(self.start_game_button)
         self.start_game_button.disabled = True # Disabled until setup is complete
 
-        # Instantiate ShowMyCardsButton, but DO NOT add it to the view yet
-        self.show_my_cards_button = ShowMyCardsButton(game_state, bot)
-        # self.add_item(self.show_my_cards_button) # Removed this line
-        # self.show_my_cards_button.disabled = True # This will be set when added
+        # Instantiate action buttons, initially disabled
+        self.look_at_my_cards_button = LookAtMyCardsButton(game_state, bot) # Renamed
+        self.call_button = CallButton(game_state, bot)
+        self.bet_raise_button = BetRaiseButton(game_state, bot)
+        self.fold_button = FoldButton(game_state, bot)
+
+        # DO NOT add action buttons here. They are added and enabled by StartGameButton.callback
+        # self.add_item(self.look_at_my_cards_button)
+        # self.add_item(self.call_button)
+        # self.add_item(self.bet_raise_button)
+        # self.add_item(self.fold_button)
+
+        self.look_at_my_cards_button.disabled = True
+        self.call_button.disabled = True
+        self.bet_raise_button.disabled = True
+        self.fold_button.disabled = True
+
+        # New game state variables for betting rounds
+        self.game_state['current_round'] = 'pre_flop' # 'pre_flop', 'flop', 'turn', 'river', 'showdown'
+        self.game_state['current_bet'] = 0 # The current highest bet in the round
+        self.game_state['round_cost'] = 0 # How much the current player needs to put in to call
+        self.game_state['pot'] = 0
+        self.game_state['players_in_round'] = [] # List of user_ids currently active in the betting round
+        self.game_state['player_bets_current_round'] = {} # {user_id: amount_bet_this_round}
+        self.game_state['current_player_turn_index'] = 0 # Index in players_in_round
+        self.game_state['last_better_id'] = None # To track who made the last aggressive action
+        self.game_state['current_player_message_id'] = None # To update "Waiting for..." message
+        # self.game_state['player_chips'] = {} # Initialized in StartGameButton.callback now
+        self.game_state['round_bet_made'] = False # True if someone has bet/raised in the current round
+
+    async def _update_action_buttons(self):
+        """Updates the labels and states of the action buttons based on current game state."""
+        # Determine Call/Check label
+        if self.game_state['round_cost'] == 0:
+            self.call_button.label = "Check"
+            self.call_button.style = discord.ButtonStyle.blurple
+        else:
+            self.call_button.label = f"Call (${self.game_state['round_cost']})"
+            self.call_button.style = discord.ButtonStyle.blurple # Can change style if needed
+
+        # Determine Bet/Raise label
+        if self.game_state['round_bet_made']:
+            self.bet_raise_button.label = "Raise"
+            self.bet_raise_button.style = discord.ButtonStyle.green
+        else:
+            self.bet_raise_button.label = "Bet"
+            self.bet_raise_button.style = discord.ButtonStyle.green
+        
+        # Re-add items to ensure order and update (Discord.py views re-render based on items in self.children)
+        self.clear_items()
+        self.add_item(self.start_game_button) # This might be removed if game started
+        self.add_item(self.look_at_my_cards_button)
+        self.add_item(self.call_button)
+        self.add_item(self.bet_raise_button)
+        self.add_item(self.fold_button)
+
+        # Ensure buttons are enabled for the current player, disabled for others
+        current_player_id = self.game_state['players_in_round'][self.game_state['current_player_turn_index']]
+        for item in self.children:
+            if isinstance(item, Button) and item.label not in ["Play ($10.00 Minimum)"]: # Don't disable Play button if it's still there
+                item.disabled = (item.custom_id != f"call_button_{current_player_id}" and # Placeholder custom_ids
+                                 item.custom_id != f"bet_raise_button_{current_player_id}" and
+                                 item.custom_id != f"fold_button_{current_player_id}" and
+                                 item.custom_id != f"look_at_my_cards_button_{current_player_id}") # Placeholder custom_id
+
+        # Update custom_ids with current player to ensure only they can click
+        self.call_button.custom_id = f"call_button_{current_player_id}"
+        self.bet_raise_button.custom_id = f"bet_raise_button_{current_player_id}"
+        self.fold_button.custom_id = f"fold_button_{current_player_id}"
+        self.look_at_my_cards_button.custom_id = f"look_at_my_cards_button_{current_player_id}"
+
+        # Get the public message to edit
+        try:
+            channel = self.bot.get_channel(self.game_state['channel_id'])
+            if not channel:
+                channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+            public_message = await channel.fetch_message(self.game_state['public_message_id'])
+            await public_message.edit(view=self)
+        except Exception as e:
+            logger.error(f"Error updating action buttons on public message: {e}")
+
+
+    async def _update_current_player_message(self):
+        """Updates the 'Waiting for [username]...' message."""
+        current_player_id = self.game_state['players_in_round'][self.game_state['current_player_turn_index']]
+        try:
+            current_player_user = await self.bot.fetch_user(current_player_id)
+            message_content = f"Waiting for {current_player_user.mention}..."
+            
+            channel = self.bot.get_channel(self.game_state['channel_id'])
+            if not channel:
+                channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+
+            if self.game_state['current_player_message_id']:
+                player_message = await channel.fetch_message(self.game_state['current_player_message_id'])
+                await player_message.edit(content=message_content)
+            else:
+                player_message = await channel.send(content=message_content)
+                self.game_state['current_player_message_id'] = player_message.id
+            logger.info(f"Updated current player message to: {message_content}")
+        except Exception as e:
+            logger.error(f"Error updating current player message: {e}")
+
+    async def _start_betting_round(self):
+        """Initializes a new betting round."""
+        self.game_state['current_bet'] = 0
+        self.game_state['round_cost'] = 0
+        self.game_state['last_better_id'] = None
+        self.game_state['round_bet_made'] = False
+        self.game_state['player_bets_current_round'] = {player_id: 0 for player_id in self.game_state['players_in_game']}
+        
+        # Reset players_in_round to all active players at the start of a new round
+        # In a real game, this would be players who haven't folded yet.
+        self.game_state['players_in_round'] = list(self.game_state['players_in_game']) # All players start in the round
+        self.game_state['current_player_turn_index'] = 0 # Start with the first player in the order
+
+        logger.info(f"Starting {self.game_state['current_round']} betting round.")
+        await self._update_current_player_message()
+        await self._update_action_buttons()
+
+
+    async def _next_player_turn(self):
+        """Advances to the next player's turn and updates the UI."""
+        self.game_state['current_player_turn_index'] = (self.game_state['current_player_turn_index'] + 1) % len(self.game_state['players_in_round'])
+        
+        # Check if the round should end (all players have called or folded to the last bettor)
+        await self._check_round_end()
+        if self.game_state['current_round'] == 'showdown': # If round ended and moved to showdown, stop
+            return
+
+        await self._update_current_player_message()
+        await self._update_action_buttons()
+
+    async def _check_round_end(self):
+        """
+        Checks if the current betting round has ended.
+        A round ends when:
+        1. All players have folded (only one player remains).
+        2. All active players have called the current_bet, or checked if no bet was made,
+           AND the turn has returned to the last player who made an aggressive action (bet/raise),
+           or all players have acted if no aggressive action was made.
+        """
+        active_players_count = len(self.game_state['players_in_round'])
+
+        if active_players_count <= 1:
+            logger.info("Only one or zero players remaining in round. Ending round.")
+            await self._end_round()
+            return
+
+        # Check if all players have acted and matched the current bet
+        all_called_or_checked = True
+        for player_id in self.game_state['players_in_round']:
+            if self.game_state['player_bets_current_round'].get(player_id, 0) < self.game_state['round_cost']:
+                all_called_or_checked = False
+                break
+        
+        # Determine if the turn has come back to the last bettor, or if everyone has acted
+        turn_returned_to_last_bettor = False
+        if self.game_state['last_better_id']:
+            current_player_id = self.game_state['players_in_round'][self.game_state['current_player_turn_index']]
+            if current_player_id == self.game_state['last_better_id'] and all_called_or_checked:
+                turn_returned_to_last_bettor = True
+        elif all_called_or_checked and self.game_state['current_player_turn_index'] == 0 and self.game_state['round_bet_made'] == False:
+            # If no bet was made, and everyone checked, and turn is back to first player
+            turn_returned_to_last_bettor = True
+
+
+        if all_called_or_checked and (self.game_state['last_better_id'] is None or turn_returned_to_last_bettor):
+            logger.info("Betting round ended. Moving to next phase.")
+            await self._end_round()
+        else:
+            logger.info("Betting round continues.")
+
+
+    async def _end_round(self):
+        """Progresses the game to the next stage (Flop, Turn, River, Showdown)."""
+        current_round = self.game_state['current_round']
+        logger.info(f"Ending {current_round} round.")
+
+        # Clear current round's bets for next round
+        self.game_state['player_bets_current_round'] = {player_id: 0 for player_id in self.game_state['players_in_game']}
+        self.game_state['current_bet'] = 0
+        self.game_state['round_cost'] = 0
+        self.game_state['last_better_id'] = None
+        self.game_state['round_bet_made'] = False
+
+        if current_round == 'pre_flop':
+            self.game_state['current_round'] = 'flop'
+            await self._deal_flop()
+        elif current_round == 'flop':
+            self.game_state['current_round'] = 'turn'
+            await self._deal_turn()
+        elif current_round == 'turn':
+            self.game_state['current_round'] = 'river'
+            await self._deal_river()
+        elif current_round == 'river':
+            self.game_state['current_round'] = 'showdown'
+            await self._showdown()
+        else:
+            logger.warning("Unknown round state or game should end.")
+            # For now, just disable buttons and end view
+            self.clear_items()
+            await self._update_public_game_status_message(final_message="Game Over!")
+            self.stop()
+
+    async def _deal_flop(self):
+        """Deals the three community cards (flop) and starts a new betting round."""
+        logger.info("Dealing flop...")
+        for _ in range(3):
+            if self.game_state['deck']:
+                self.game_state['community_cards'].append(self.game_state['deck'].pop(0))
+        
+        await self._update_public_board_display(f"**🃏 Flop: Community Cards**")
+        await self._start_betting_round()
+
+    async def _deal_turn(self):
+        """Deals the fourth community card (turn) and starts a new betting round."""
+        logger.info("Dealing turn...")
+        if self.game_state['deck']:
+            self.game_state['community_cards'].append(self.game_state['deck'].pop(0))
+        
+        await self._update_public_board_display(f"**🃏 Turn: Community Cards**")
+        await self._start_betting_round()
+
+    async def _deal_river(self):
+        """Deals the fifth community card (river) and starts a new betting round."""
+        logger.info("Dealing river...")
+        if self.game_state['deck']:
+            self.game_state['community_cards'].append(self.game_state['deck'].pop(0))
+        
+        await self._update_public_board_display(f"**🃏 River: Community Cards**")
+        await self._start_betting_round()
+
+    async def _showdown(self):
+        """Handles the showdown phase (determining winner, distributing pot)."""
+        logger.info("Proceeding to showdown!")
+        # For now, just update message and disable buttons.
+        # Actual hand evaluation and pot distribution logic will go here.
+        self.clear_items() # Remove all buttons
+        await self._update_public_board_display(f"**🎉 Showdown! Game Over!**")
+        # Delete the "Waiting for..." message
+        if self.game_state['current_player_message_id']:
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                message_to_delete = await channel.fetch_message(self.game_state['current_player_message_id'])
+                await message_to_delete.delete()
+                self.game_state['current_player_message_id'] = None
+            except Exception as e:
+                logger.error(f"Error deleting current player message: {e}")
+        self.stop() # Stop the view
+
+    async def _update_public_board_display(self, content_prefix: str):
+        """Updates the public message with the new board image and content."""
+        dealer_public_cards_info = []
+        for card in self.game_state['dealer_hand']:
+            dealer_public_cards_info.append({'code': card['code'], 'face_up': False}) # Dealer's cards remain hidden until showdown
+
+        community_cards_info = [{'code': card['code'], 'face_up': True} for card in self.game_state['community_cards']]
+
+        updated_public_board_image_bytes = await _create_public_board_image(dealer_public_cards_info, community_cards_info)
+
+        if updated_public_board_image_bytes:
+            updated_public_file = discord.File(updated_public_board_image_bytes, filename="game_board_updated.png")
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message_to_edit.edit(
+                    content=f"{content_prefix}\nPot: ${self.game_state['pot']}",
+                    attachments=[updated_public_file],
+                    view=self # Keep the current view
+                )
+                logger.info(f"Public message {self.game_state['public_message_id']} updated with new board image.")
+            except Exception as e:
+                logger.error(f"Error updating public message with new board image: {e}")
+        else:
+            logger.error("Could not create updated public board image.")
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message_to_edit.edit(
+                    content=f"{content_prefix}\nPot: ${self.game_state['pot']} (Image failed to load)",
+                    view=self
+                )
+            except Exception as e:
+                logger.error(f"Error handling image creation failure in public message update: {e}")
 
 
 class InviteButton(Button):
@@ -974,7 +1382,8 @@ async def start(interaction: discord.Interaction, bot):
         'public_message_id': None,
         'channel_id': interaction.channel_id,
         'invited_players_status': {},
-        'players_in_game': [] # Initialize players_in_game here
+        'players_in_game': [], # Initialize players_in_game here
+        'player_chips': {}, # Initialize player chips here
     }
     random.shuffle(game_state['deck'])
 

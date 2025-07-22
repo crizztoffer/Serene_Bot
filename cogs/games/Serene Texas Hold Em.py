@@ -392,7 +392,7 @@ class StartGameButton(Button): # Renamed from PlayButton
         view.remove_item(self)
         await interaction.response.edit_message(view=view) # Update the message to remove the button
 
-        logger.info(f"Player {interaction.user.user.display_name} clicked the Play button. Starting game flow.")
+        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
 
         # If players_in_game is not set yet, default to the interacting user for single player
         if 'players_in_game' not in view.game_state or not view.game_state['players_in_game']:

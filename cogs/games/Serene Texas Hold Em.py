@@ -338,10 +338,12 @@ class InviteButton(Button):
                     content=f"{invited_user_mention} did not respond to {inviter_mention}'s game invite in time and it has been automatically declined.",
                     view=invite_message_view
                 )
+                # Delete the invite message after it's updated to show timeout
+                await invite_message_obj.delete(delay=5) # Delete after 5 seconds to allow user to see the message
             except discord.NotFound:
-                logger.warning(f"Invite message {invite_message_obj.id} not found for timeout update.")
+                logger.warning(f"Invite message {invite_message_obj.id} not found for timeout update or deletion.")
             except Exception as e:
-                logger.error(f"Error updating invite message on timeout for {invited_user_id}: {e}")
+                logger.error(f"Error updating/deleting invite message on timeout for {invited_user_id}: {e}")
 
             invite_message_view.stop() # Stop the invite view to clean up its listeners
 
@@ -362,14 +364,16 @@ class InviteButton(Button):
             await interaction.response.defer() # Acknowledge the interaction silently
             return
 
-        # Remove the game mode select, user select, and invite button from the view
+        # Remove the game mode select, user select, invite button, AND play button from the view
         # This effectively "hides" them from the public message.
         view.remove_item(view.game_mode_select)
         view.remove_item(view.invite_user_select)
         view.remove_item(self) # Remove the invite button itself
+        view.remove_item(view.play_button) # Remove the play button as well
 
-        # The play button remains, but stays disabled until all invites are handled
-        view.play_button.disabled = True 
+        # The play button will be re-added and enabled by _check_all_players_responded
+        # if all players accept, or if it's single player.
+        # For now, we update the message with the reduced view.
         await interaction.response.edit_message(view=view)
         
         logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
@@ -405,10 +409,11 @@ class InviteButton(Button):
 
         except Exception as e:
             logger.error(f"Database error when fetching notif_channel: {e}")
-            # Re-add and re-enable invite button if DB error occurs, as the flow is broken
+            # Re-add and re-enable invite button and other components if DB error occurs, as the flow is broken
             view.add_item(view.game_mode_select)
             view.add_item(view.invite_user_select)
             view.add_item(self)
+            view.add_item(view.play_button) # Re-add play button
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True) # Ephemeral for critical error
@@ -418,10 +423,11 @@ class InviteButton(Button):
                 conn.close()
 
         if not notif_channel_id:
-            # Re-add and re-enable invite button if no channel found
+            # Re-add and re-enable invite button and other components if no channel found
             view.add_item(view.game_mode_select)
             view.add_item(view.invite_user_select)
             view.add_item(self)
+            view.add_item(view.play_button) # Re-add play button
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True) # Ephemeral for critical error
@@ -474,6 +480,8 @@ class InviteButton(Button):
                         view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0 
                         await view._update_public_game_status_message()
                         await view._check_all_players_responded()
+                        # Delete the invite message after it's denied
+                        await deny_interaction.message.delete(delay=5) # Delete after 5 seconds
                     else:
                         await deny_interaction.response.send_message("This invite is not for you!", ephemeral=True)
                 
@@ -752,6 +760,14 @@ class BetButtonView(View): # Inherit from View
     async def _check_all_players_responded(self):
         """Checks if all invited players have responded and enables the Play button if so."""
         if not self.game_state['invited_players_status']: # No players invited
+            # If no players were invited (e.g., single player mode), ensure play button is visible and enabled
+            # This check is important if the game starts directly without invites
+            if self.game_mode_select.values[0] == "single_player":
+                if self.play_button not in self.children: # Only add if not already present
+                    self.add_item(self.play_button)
+                self.play_button.disabled = False
+                await self.original_interaction.edit_original_response(view=self)
+                logger.info("Single player mode: Play button enabled.")
             return
 
         all_responded = True
@@ -761,6 +777,8 @@ class BetButtonView(View): # Inherit from View
                 break
         
         if all_responded:
+            if self.play_button not in self.children: # Only add if not already present
+                self.add_item(self.play_button)
             self.play_button.disabled = False
             await self.original_interaction.edit_original_response(view=self) # Update the view to enable play button
             logger.info("All invited players have responded. Play button enabled.")

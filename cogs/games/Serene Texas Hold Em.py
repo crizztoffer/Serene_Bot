@@ -338,14 +338,17 @@ class GameModeSelect(Select):
         if selected_mode == "single_player":
             view.invite_user_select.disabled = True
             view.invite_button.disabled = True
-            view.play_button.disabled = False
+            # The StartGameButton is now on GameBoardView, not BetButtonView.
+            # Its state will be managed when BetButtonView transitions to GameBoardView.
             view.selected_users_for_invite = [] # Clear selected users if switching to single player
             view.game_state['invited_players_status'] = {} # Clear invited players status
             logger.info(f"Game mode set to Single Player by {interaction.user.display_name}.")
+            # Immediately trigger transition to GameBoardView for single player
+            await view._check_all_players_responded()
         elif selected_mode == "multiplayer":
             view.invite_user_select.disabled = False
             view.invite_button.disabled = True # Invite button disabled until user(s) selected
-            view.play_button.disabled = True
+            # StartGameButton is on GameBoardView, not BetButtonView.
             logger.info(f"Game mode set to Multiplayer by {interaction.user.display_name}.")
         
         # Update the default selection in the select menu itself
@@ -373,35 +376,32 @@ class InviteUserSelect(UserSelect):
         await interaction.response.edit_message(view=view)
         logger.info(f"User {interaction.user.display_name} selected {len(self.values)} users for invite.")
 
-class PlayButton(Button):
+class StartGameButton(Button): # Renamed from PlayButton
     def __init__(self):
-        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green, row=3)
+        super().__init__(label="Play ($10.00 Minimum)", style=discord.ButtonStyle.green, row=0) # Row 0 for GameBoardView
 
     async def callback(self, interaction: discord.Interaction):
-        view = self.view
+        view = self.view # This will be GameBoardView
         if not view:
-            logger.error("PlayButton callback: View is not set.")
+            logger.error("StartGameButton callback: View is not set.")
             await interaction.response.defer()
             return
 
-        for item in view.children:
-            item.disabled = True
-        await interaction.response.edit_message(view=view)
+        # Disable and remove this button after it's clicked
+        self.disabled = True
+        view.remove_item(self)
+        # Also disable the "Show Me My Cards Again" button until cards are dealt
+        view.show_my_cards_button.disabled = True
+        await interaction.response.edit_message(view=view) # Update the message to remove the button and disable other
 
         logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
 
-        if view.game_mode_select.values[0] == "multiplayer":
-            accepted_players = [
-                user_id for user_id, status_info in view.game_state['invited_players_status'].items() 
-                if status_info['status'] == 'accepted'
-            ]
-            if interaction.user.id not in accepted_players:
-                accepted_players.append(interaction.user.id)
-            view.game_state['players_in_game'] = accepted_players
-            num_players_to_deal = len(accepted_players)
-        else:
+        # If players_in_game is not set yet, default to the interacting user for single player
+        if 'players_in_game' not in view.game_state or not view.game_state['players_in_game']:
             view.game_state['players_in_game'] = [interaction.user.id]
             num_players_to_deal = 1
+        else:
+            num_players_to_deal = len(view.game_state['players_in_game'])
 
 
         dealt_info = await _deal_cards(
@@ -421,10 +421,11 @@ class PlayButton(Button):
         for card in view.game_state['dealer_hand']:
             dealer_public_cards_info.append({'code': card['code'], 'face_up': False})
         
+        # Update the public board image with dealt cards
         updated_public_board_image_bytes = await _create_public_board_image(dealer_public_cards_info, view.game_state['community_cards'])
 
         if updated_public_board_image_bytes:
-            updated_public_file = discord.File(updated_public_board_image_bytes, filename="game_board.png")
+            updated_public_file = discord.File(updated_public_board_image_bytes, filename="game_board_dealt.png")
             
             try:
                 channel = view.bot.get_channel(view.game_state['channel_id'])
@@ -433,14 +434,15 @@ class PlayButton(Button):
                 
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
                 
-                game_board_view = GameBoardView(view.game_state, view.bot)
+                # Enable the "Show Me My Cards Again" button now that cards are dealt
+                view.show_my_cards_button.disabled = False
 
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards:**",
                     attachments=[updated_public_file],
-                    view=game_board_view
+                    view=view # Keep the existing GameBoardView
                 )
-                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealer's cards and 'Show Me My Cards Again' button.")
+                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealt cards.")
             except discord.NotFound:
                 logger.error(f"Public message with ID {view.game_state['public_message_id']} not found during update.")
             except Exception as e:
@@ -451,21 +453,21 @@ class PlayButton(Button):
                 if not channel:
                     channel = await view.bot.fetch_channel(view.game_state['channel_id'])
                 public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
-                game_board_view = GameBoardView(view.game_state, view.bot)
+                view.show_my_cards_button.disabled = False # Enable even if image fails
                 await public_message_to_edit.edit(
                     content="**🃏 Dealer's Hand & Community Cards: (Image failed to load)**",
-                    view=game_board_view
+                    view=view # Keep the existing GameBoardView
                 )
             except Exception as e:
                 logger.error(f"Error handling image creation failure in public message: {e}")
             logger.error("Could not create updated dealer's hand image for public display.")
 
-        view.stop()
+        # No need to stop the view here, as GameBoardView should persist.
 
 
 class ShowMyCardsButton(Button):
     def __init__(self, game_state: dict, bot: commands.Bot):
-        super().__init__(label="Show Me My Cards Again", style=discord.ButtonStyle.primary, row=0)
+        super().__init__(label="Show Me My Cards Again", style=discord.ButtonStyle.primary, row=1) # Moved to row 1 to make space for StartGameButton
         self.game_state = game_state
         self.bot = bot
 
@@ -500,15 +502,24 @@ class ShowMyCardsButton(Button):
             await interaction.response.send_message(f"You don't have any cards, {interaction.user.mention}.", ephemeral=True)
 
 
-class GameBoardView(View):
+class GameBoardView(View): # This view will hold the game board and in-game buttons
     def __init__(self, game_state: dict, bot: commands.Bot):
-        super().__init__(timeout=None)
+        super().__init__(timeout=None) # This view should persist indefinitely for the game board
         self.game_state = game_state
         self.bot = bot
-        self.add_item(ShowMyCardsButton(game_state, bot))
+        
+        # Add the StartGameButton here, initially disabled
+        self.start_game_button = StartGameButton()
+        self.add_item(self.start_game_button)
+        self.start_game_button.disabled = True # Disabled until setup is complete
+
+        # Add the ShowMyCardsButton
+        self.show_my_cards_button = ShowMyCardsButton(game_state, bot)
+        self.add_item(self.show_my_cards_button)
+        self.show_my_cards_button.disabled = True # Disabled until cards are dealt
 
 
-class InviteButton(Button): # Moved this class definition to be before BetButtonView
+class InviteButton(Button):
     def __init__(self):
         super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, row=2)
 
@@ -561,13 +572,14 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
             await interaction.response.defer()
             return
 
-        # Remove the game mode select, user select, invite button, AND play button from the view
+        # Remove the game mode select, user select, invite button from the view
         view.remove_item(view.game_mode_select)
         view.remove_item(view.invite_user_select)
         view.remove_item(self)
-        view.remove_item(view.play_button)
+        # The StartGameButton is now handled by GameBoardView, so we don't remove it from BetButtonView here.
+        # BetButtonView will be replaced entirely by GameBoardView.
 
-        await interaction.response.edit_message(view=view)
+        await interaction.response.edit_message(view=view) # Update the message to remove the select menus and invite button
         
         logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
 
@@ -601,10 +613,11 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
 
         except Exception as e:
             logger.error(f"Database error when fetching notif_channel: {e}")
+            # Re-add components if DB error occurs
             view.add_item(view.game_mode_select)
             view.add_item(view.invite_user_select)
             view.add_item(self)
-            view.add_item(view.play_button)
+            # view.add_item(view.start_game_button) # This button is not on BetButtonView anymore
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True)
@@ -614,10 +627,11 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
                 conn.close()
 
         if not notif_channel_id:
+            # Re-add components if no channel found
             view.add_item(view.game_mode_select)
             view.add_item(view.invite_user_select)
             view.add_item(self)
-            view.add_item(view.play_button)
+            # view.add_item(view.start_game_button) # This button is not on BetButtonView anymore
             self.disabled = False
             await interaction.response.edit_message(view=view)
             await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True)
@@ -629,16 +643,19 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
                 if not notif_channel:
                     notif_channel = await view.bot.fetch_channel(int(notif_channel_id))
                 
+                # Create a new view for each invite message
                 invite_message_view = discord.ui.View(timeout=60)
 
+                # Accept Button
                 accept_button = discord.ui.Button(
-                    label="Accept & Join Game", 
+                    label="Accept", # Changed label to "Accept"
                     style=discord.ButtonStyle.green,
                     custom_id=f"accept_invite_{invited_user.id}",
                     row=0
                 )
                 invite_message_view.add_item(accept_button)
 
+                # Deny Button
                 deny_button = discord.ui.Button(
                     label="Deny", 
                     style=discord.ButtonStyle.red, 
@@ -651,16 +668,34 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
                     if accept_interaction.user.id == invited_user.id:
                         await accept_interaction.response.defer()
                         logger.info(f"Invite accepted by {accept_interaction.user.display_name}.")
-                        for item in invite_message_view.children:
-                            item.disabled = True
-                        await accept_interaction.message.edit(content=f"{accept_interaction.user.mention} has accepted the game invite! Join the game in {interaction.channel.mention}.", view=invite_message_view)
-                        invite_message_view.stop()
-
+                        
+                        # Update game state
                         view.game_state['invited_players_status'][invited_user.id]['status'] = 'accepted'
                         view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0
                         await view._update_public_game_status_message()
                         await view._check_all_players_responded()
-                        await accept_interaction.message.delete(delay=5)
+
+                        # Create a new view with only the "Join Game" link button
+                        join_game_link_view = discord.ui.View(timeout=None) # This view can persist
+                        join_game_link_button = discord.ui.Button(
+                            label="Join Game",
+                            style=discord.ButtonStyle.link,
+                            url=interaction.channel.jump_url, # Link to the game channel
+                            row=0
+                        )
+                        join_game_link_view.add_item(join_game_link_button)
+
+                        # Edit the original invite message to show "Accepted!" and the "Join Game" link
+                        await accept_interaction.message.edit(
+                            content=f"{accept_interaction.user.mention} has accepted the game invite! Click 'Join Game' to go to the channel.",
+                            view=join_game_link_view # Replace the old view with the new link view
+                        )
+                        invite_message_view.stop() # Stop the old view with Accept/Deny buttons
+                        logger.info(f"Invite message for {invited_user.display_name} updated with Join Game link.")
+
+                        # The message will not be deleted on click of "Join Game" as it's a URL button.
+                        # It will be cleaned up by the main game flow's timeout or when the game starts.
+
                     else:
                         await accept_interaction.response.send_message("This invite is not for you!", ephemeral=True)
 
@@ -689,7 +724,6 @@ class InviteButton(Button): # Moved this class definition to be before BetButton
 
                 initial_invite_content = (
                     f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em!\n"
-                    f"Join the game channel here: {interaction.channel.mention}\n"
                     f"Please respond by <t:{countdown_end_timestamp}:R>."
                 )
                 
@@ -741,23 +775,22 @@ class BetButtonView(View): # Inherit from View
         self.game_mode_select = GameModeSelect()
         self.invite_user_select = InviteUserSelect()
         self.invite_button = InviteButton()
-        self.play_button = PlayButton()
-
-        # Assign references for PlayButton to access view's context
-        self.play_button.game_state = game_state
-        self.play_button.bot = bot
-        self.play_button.original_interaction = original_interaction
+        # The StartGameButton is NOT part of BetButtonView initially.
+        # It will be added to GameBoardView.
+        # We need a dummy instance here to pass to GameModeSelect's callback for disabling.
+        self.start_game_button = StartGameButton() 
 
         # Add items to the view in desired order
         self.add_item(self.game_mode_select)
         self.add_item(self.invite_user_select)
         self.add_item(self.invite_button)
-        self.add_item(self.play_button)
+        # self.add_item(self.start_game_button) # Removed from here, as it's on GameBoardView
 
         # Set initial states based on default single player
         self.invite_user_select.disabled = True
         self.invite_button.disabled = True
-        self.play_button.disabled = False
+        # The start_game_button is not part of this view, so its disabled state here is irrelevant.
+        # Its state will be managed by GameBoardView.
 
     async def _update_public_game_status_message(self):
         """Updates the public message with the current status of invited players, including countdown."""
@@ -818,15 +851,29 @@ class BetButtonView(View): # Inherit from View
 
     async def _check_all_players_responded(self):
         """Checks if all invited players have responded and enables the Play button if so."""
-        if not self.game_state['invited_players_status']: # No players invited
-            # If no players were invited (e.g., single player mode), ensure play button is visible and enabled
-            # This check is important if the game starts directly without invites
+        # This method is now responsible for transitioning from BetButtonView to GameBoardView
+        if not self.game_state['invited_players_status']: # No players invited (implies single player)
             if self.game_mode_select.values[0] == "single_player":
-                if self.play_button not in self.children: # Only add if not already present
-                    self.add_item(self.play_button)
-                self.play_button.disabled = False
-                await self.original_interaction.edit_original_response(view=self)
-                logger.info("Single player mode: Play button enabled.")
+                # Finalize players_in_game for single player
+                self.game_state['players_in_game'] = [self.original_interaction.user.id]
+
+                game_board_view = GameBoardView(self.game_state, self.bot)
+                game_board_view.start_game_button.disabled = False
+                game_board_view.show_my_cards_button.disabled = True # Disable until cards are dealt
+                
+                try:
+                    channel = self.bot.get_channel(self.game_state['channel_id'])
+                    if not channel:
+                        channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                    public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+                    await public_message_to_edit.edit(
+                        content="**🃏 Game Table: Ready to Play!**",
+                        view=game_board_view # Replace BetButtonView with GameBoardView
+                    )
+                    logger.info("Single player mode: GameBoardView set with enabled Play button.")
+                except Exception as e:
+                    logger.error(f"Error transitioning to GameBoardView for single player: {e}")
+                self.stop() # Stop BetButtonView
             return
 
         all_responded = True
@@ -836,11 +883,34 @@ class BetButtonView(View): # Inherit from View
                 break
         
         if all_responded:
-            if self.play_button not in self.children: # Only add if not already present
-                self.add_item(self.play_button)
-            self.play_button.disabled = False
-            await self.original_interaction.edit_original_response(view=self) # Update the view to enable play button
-            logger.info("All invited players have responded. Play button enabled.")
+            # Collect accepted players for the game_state
+            accepted_players = [
+                user_id for user_id, status_info in self.game_state['invited_players_status'].items() 
+                if status_info['status'] == 'accepted'
+            ]
+            # Add the initiator if they are not already in the accepted list (e.g., if they didn't invite themselves)
+            if self.original_interaction.user.id not in accepted_players:
+                accepted_players.append(self.original_interaction.user.id)
+            self.game_state['players_in_game'] = accepted_players
+
+            # Transition to GameBoardView and enable its StartGameButton
+            game_board_view = GameBoardView(self.game_state, self.bot)
+            game_board_view.start_game_button.disabled = False
+            game_board_view.show_my_cards_button.disabled = True # Disable until cards are dealt
+
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message_to_edit.edit(
+                    content="**🃏 Game Table: All players responded! Ready to Play!**",
+                    view=game_board_view # Replace BetButtonView with GameBoardView
+                )
+                logger.info("All invited players have responded. GameBoardView set with enabled Play button.")
+            except Exception as e:
+                logger.error(f"Error transitioning to GameBoardView for multiplayer: {e}")
+            self.stop() # Stop BetButtonView
 
 
     async def on_timeout(self):
@@ -876,7 +946,8 @@ async def start(interaction: discord.Interaction, bot):
         'community_cards': [],
         'public_message_id': None,
         'channel_id': interaction.channel_id,
-        'invited_players_status': {} 
+        'invited_players_status': {},
+        'players_in_game': [] # Initialize players_in_game here
     }
     random.shuffle(game_state['deck'])
 

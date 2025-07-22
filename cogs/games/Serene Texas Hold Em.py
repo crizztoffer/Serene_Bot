@@ -316,7 +316,7 @@ async def _deal_cards(
     return {"player_hands": player_hands, "dealer_hand": dealer_hand}
 
 
-# --- UI Component Classes ---
+# --- UI Component Classes (Ordered by dependency) ---
 
 class GameModeSelect(Select):
     def __init__(self):
@@ -373,253 +373,94 @@ class InviteUserSelect(UserSelect):
         await interaction.response.edit_message(view=view)
         logger.info(f"User {interaction.user.display_name} selected {len(self.values)} users for invite.")
 
-class InviteButton(Button):
+class PlayButton(Button):
     def __init__(self):
-        # Initially disabled for single player default
-        super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, disabled=True, row=2)
-
-    async def _handle_invite_timeout(self, invited_user_id: int, invite_message_view: discord.ui.View, invite_message_obj: discord.Message, invited_user_mention: str, inviter_mention: str):
-        """Handles the automatic denial of an invite after a timeout."""
-        countdown_seconds = 60 # Changed from 30 to 60 seconds
-        view = self.view # Get the parent view (BetButtonView)
-
-        # Wait for the full countdown duration
-        await asyncio.sleep(countdown_seconds)
-
-        # After countdown, check if status is still 'waiting'
-        # Access the dictionary for the user's status
-        user_status_info = view.game_state['invited_players_status'].get(invited_user_id)
-
-        if user_status_info and user_status_info.get('status') == 'waiting':
-            logger.info(f"Invite for {invited_user_id} timed out. Automatically declining.")
-            user_status_info['status'] = 'denied'
-            # Mark countdown as finished
-            user_status_info['countdown_end_time'] = 0 
-
-            # Disable buttons on the invite message
-            for item in invite_message_view.children:
-                item.disabled = True
-            
-            try:
-                await invite_message_obj.edit(
-                    content=f"{invited_user_mention} did not respond to {inviter_mention}'s game invite in time and it has been automatically declined.",
-                    view=invite_message_view
-                )
-                # Delete the invite message after it's updated to show timeout
-                await invite_message_obj.delete(delay=5) # Delete after 5 seconds to allow user to see the message
-            except discord.NotFound:
-                logger.warning(f"Invite message {invite_message_obj.id} not found for timeout update or deletion.")
-            except Exception as e:
-                logger.error(f"Error updating/deleting invite message on timeout for {invited_user_id}: {e}")
-
-            invite_message_view.stop() # Stop the invite view to clean up its listeners
-
-            await view._update_public_game_status_message()
-            await view._check_all_players_responded()
-
+        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green, row=3)
 
     async def callback(self, interaction: discord.Interaction):
         view = self.view
         if not view:
-            logger.error("InviteButton callback: View is not set.")
+            logger.error("PlayButton callback: View is not set.")
             await interaction.response.defer()
             return
 
-        invited_users = view.selected_users_for_invite
-        if not invited_users:
-            logger.warning("Invite button clicked without selected users.")
-            await interaction.response.defer() # Acknowledge the interaction silently
-            return
-
-        # Remove the game mode select, user select, invite button, AND play button from the view
-        # This effectively "hides" them from the public message.
-        view.remove_item(view.game_mode_select)
-        view.remove_item(view.invite_user_select)
-        view.remove_item(self) # Remove the invite button itself
-        view.remove_item(view.play_button) # Remove the play button as well
-
-        # The play button will be re-added and enabled by _check_all_players_responded
-        # if all players accept, or if it's single player.
-        # For now, we update the message with the reduced view.
+        for item in view.children:
+            item.disabled = True
         await interaction.response.edit_message(view=view)
+
+        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
+
+        if view.game_mode_select.values[0] == "multiplayer":
+            accepted_players = [
+                user_id for user_id, status_info in view.game_state['invited_players_status'].items() 
+                if status_info['status'] == 'accepted'
+            ]
+            if interaction.user.id not in accepted_players:
+                accepted_players.append(interaction.user.id)
+            view.game_state['players_in_game'] = accepted_players
+            num_players_to_deal = len(accepted_players)
+        else:
+            view.game_state['players_in_game'] = [interaction.user.id]
+            num_players_to_deal = 1
+
+
+        dealt_info = await _deal_cards(
+            view.game_state['deck'],
+            num_players=num_players_to_deal,
+            cards_per_player=2,
+            deal_dealer=True,
+            dealer_hidden_cards=2
+        )
+        player_idx = 0
+        for player_id in view.game_state['players_in_game']:
+            view.game_state['player_hands'][player_id] = dealt_info['player_hands'].get(f"player_{player_idx}", [])
+            player_idx += 1
+        view.game_state['dealer_hand'] = dealt_info['dealer_hand']
+
+        dealer_public_cards_info = []
+        for card in view.game_state['dealer_hand']:
+            dealer_public_cards_info.append({'code': card['code'], 'face_up': False})
         
-        logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
+        updated_public_board_image_bytes = await _create_public_board_image(dealer_public_cards_info, view.game_state['community_cards'])
 
-        # --- Database connection and channel retrieval ---
-        DB_USER = os.getenv("DB_USER")
-        DB_PASSWORD = os.getenv("DB_PASSWORD")
-        DB_HOST = os.getenv("DB_HOST")
-        
-        notif_channel_id = None
-        conn = None
-        try:
-            conn = await aiomysql.connect(
-                host=DB_HOST,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                db="serene_users",
-                charset='utf8mb4',
-                autocommit=True
-            )
-            async with conn.cursor() as cur:
-                guild_id = interaction.guild_id # Get the guild ID from the interaction
-                if guild_id:
-                    await cur.execute("SELECT notif_channel FROM bot_guild_settings WHERE guild_id = %s", (str(guild_id),))
-                    result = await cur.fetchone()
-                    if result:
-                        notif_channel_id = result[0]
-                        logger.info(f"Retrieved notif_channel_id: {notif_channel_id} for guild {guild_id}")
-                    else:
-                        logger.warning(f"No notif_channel found for guild_id: {guild_id}")
-                else:
-                    logger.warning("Interaction has no guild_id. Cannot fetch notif_channel.")
-
-        except Exception as e:
-            logger.error(f"Database error when fetching notif_channel: {e}")
-            # Re-add and re-enable invite button and other components if DB error occurs, as the flow is broken
-            view.add_item(view.game_mode_select)
-            view.add_item(view.invite_user_select)
-            view.add_item(self)
-            view.add_item(view.play_button) # Re-add play button
-            self.disabled = False
-            await interaction.response.edit_message(view=view)
-            await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True) # Ephemeral for critical error
-            return
-        finally:
-            if conn:
-                conn.close()
-
-        if not notif_channel_id:
-            # Re-add and re-enable invite button and other components if no channel found
-            view.add_item(view.game_mode_select)
-            view.add_item(view.invite_user_select)
-            view.add_item(self)
-            view.add_item(view.play_button) # Re-add play button
-            self.disabled = False
-            await interaction.response.edit_message(view=view)
-            await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True) # Ephemeral for critical error
-            return
-
-        # --- Send invite messages with user-specific buttons ---
-        for invited_user in invited_users:
+        if updated_public_board_image_bytes:
+            updated_public_file = discord.File(updated_public_board_image_bytes, filename="game_board.png")
+            
             try:
-                notif_channel = view.bot.get_channel(int(notif_channel_id))
-                if not notif_channel:
-                    notif_channel = await view.bot.fetch_channel(int(notif_channel_id))
+                channel = view.bot.get_channel(view.game_state['channel_id'])
+                if not channel:
+                    channel = await view.bot.fetch_channel(view.game_state['channel_id'])
                 
-                # Create a new view for each invite message
-                invite_message_view = discord.ui.View(timeout=60) # Timeout for invite buttons (60 seconds)
-
-                # Accept Button (NOW a regular button with custom_id)
-                accept_button = discord.ui.Button(
-                    label="Accept & Join Game", 
-                    style=discord.ButtonStyle.green, # Changed to green for a regular button
-                    custom_id=f"accept_invite_{invited_user.id}", # Custom ID for callback
-                    row=0
-                )
-                invite_message_view.add_item(accept_button)
-
-                # Deny Button (user-specific custom_id)
-                deny_button = discord.ui.Button(
-                    label="Deny", 
-                    style=discord.ButtonStyle.red, 
-                    custom_id=f"deny_invite_{invited_user.id}",
-                    row=0
-                )
-                invite_message_view.add_item(deny_button)
-
-                # Define the callback for the accept button
-                async def accept_callback(accept_interaction: discord.Interaction):
-                    if accept_interaction.user.id == invited_user.id:
-                        await accept_interaction.response.defer()
-                        logger.info(f"Invite accepted by {accept_interaction.user.display_name}.")
-                        for item in invite_message_view.children:
-                            item.disabled = True
-                        await accept_interaction.message.edit(content=f"{accept_interaction.user.mention} has accepted the game invite! Join the game in {interaction.channel.mention}.", view=invite_message_view)
-                        invite_message_view.stop() # Stop the invite view
-
-                        view.game_state['invited_players_status'][invited_user.id]['status'] = 'accepted'
-                        view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0
-                        await view._update_public_game_status_message()
-                        await view._check_all_players_responded()
-                        await accept_interaction.message.delete(delay=5) # Delete after 5 seconds
-                    else:
-                        await accept_interaction.response.send_message("This invite is not for you!", ephemeral=True)
-
-                accept_button.callback = accept_callback # Assign the callback to the accept button
-
-                # Define the callback for the deny button
-                async def deny_callback(deny_interaction: discord.Interaction):
-                    # Ensure only the invited user can click deny
-                    if deny_interaction.user.id == invited_user.id:
-                        await deny_interaction.response.defer() 
-                        logger.info(f"Invite denied by {deny_interaction.user.display_name}.")
-                        # Update the invite message to disable buttons after denial
-                        for item in invite_message_view.children:
-                            item.disabled = True
-                        await deny_interaction.message.edit(content=f"{deny_interaction.user.mention} has denied the game invite.", view=invite_message_view)
-                        invite_message_view.stop() # Stop the invite view
-
-                        # Update main game state and public message
-                        view.game_state['invited_players_status'][invited_user.id]['status'] = 'denied'
-                        # Mark countdown as finished
-                        view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0 
-                        await view._update_public_game_status_message()
-                        await view._check_all_players_responded()
-                        # Delete the invite message after it's denied
-                        await deny_interaction.message.delete(delay=5) # Delete after 5 seconds
-                    else:
-                        await deny_interaction.response.send_message("This invite is not for you!", ephemeral=True)
+                public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
                 
-                deny_button.callback = deny_callback # Assign the callback to the deny button
+                game_board_view = GameBoardView(view.game_state, view.bot)
 
-                # Calculate the Unix timestamp for 60 seconds from now
-                countdown_end_timestamp = int(time.time() + 60) # Changed from 30 to 60 seconds
-
-                initial_invite_content = (
-                    f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em!\n"
-                    f"Join the game channel here: {interaction.channel.mention}\n" # Explicitly provide the channel link
-                    f"Please respond by <t:{countdown_end_timestamp}:R>."
+                await public_message_to_edit.edit(
+                    content="**🃏 Dealer's Hand & Community Cards:**",
+                    attachments=[updated_public_file],
+                    view=game_board_view
                 )
-                
-                # Send the invite message
-                invite_message_obj = await notif_channel.send(
-                    initial_invite_content,
-                    view=invite_message_view
-                )
-                logger.info(f"Invite sent to {invited_user.display_name} in channel {notif_channel.name}.")
-
-                # Store the invite message ID and countdown end time in game_state
-                view.game_state['invited_players_status'][invited_user.id] = {
-                    'status': 'waiting',
-                    'invite_message_id': invite_message_obj.id,
-                    'countdown_end_time': countdown_end_timestamp
-                }
-
-                # Start the timeout task for this specific invite
-                view.bot.loop.create_task(
-                    self._handle_invite_timeout(
-                        invited_user.id, 
-                        invite_message_view, 
-                        invite_message_obj, 
-                        invited_user.mention, 
-                        interaction.user.mention
-                    )
-                )
-
+                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealer's cards and 'Show Me My Cards Again' button.")
+            except discord.NotFound:
+                logger.error(f"Public message with ID {view.game_state['public_message_id']} not found during update.")
             except Exception as e:
-                logger.error(f"Error sending invite message to {invited_user.display_name}: {e}")
-                # Mark this specific user as failed in status
-                view.game_state['invited_players_status'][invited_user.id] = {
-                    'status': 'failed',
-                    'invite_message_id': None,
-                    'countdown_end_time': 0 # Mark as finished
-                }
-                # Continue trying to send invites to other users
-        
-        # Update public message with initial waiting statuses
-        await view._update_public_game_status_message()
-        await interaction.response.defer() # Acknowledge the initial interaction silently
+                logger.error(f"Error updating public message: {e}")
+        else:
+            try:
+                channel = view.bot.get_channel(view.game_state['channel_id'])
+                if not channel:
+                    channel = await view.bot.fetch_channel(view.game_state['channel_id'])
+                public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
+                game_board_view = GameBoardView(view.game_state, view.bot)
+                await public_message_to_edit.edit(
+                    content="**🃏 Dealer's Hand & Community Cards: (Image failed to load)**",
+                    view=game_board_view
+                )
+            except Exception as e:
+                logger.error(f"Error handling image creation failure in public message: {e}")
+            logger.error("Could not create updated dealer's hand image for public display.")
+
+        view.stop()
 
 
 class ShowMyCardsButton(Button):
@@ -644,14 +485,14 @@ class ShowMyCardsButton(Button):
 
             if player_combined_image:
                 player_file = discord.File(player_combined_image, filename="your_hand.png")
-                await interaction.response.send_message( # Send ephemeral message
+                await interaction.response.send_message(
                     f"👋 {interaction.user.mention}, here is your hand: {player_hand_text}",
                     file=player_file,
                     ephemeral=True
                 )
                 logger.info(f"Ephemeral message sent to {interaction.user.display_name}")
             else:
-                await interaction.response.send_message( # Send ephemeral message
+                await interaction.response.send_message(
                     f"Could not display your hand image, {interaction.user.mention}. Your cards: {player_hand_text}",
                     ephemeral=True
                 )
@@ -661,113 +502,361 @@ class ShowMyCardsButton(Button):
 
 class GameBoardView(View):
     def __init__(self, game_state: dict, bot: commands.Bot):
-        super().__init__(timeout=None) # This view should persist indefinitely for the game board
+        super().__init__(timeout=None)
         self.game_state = game_state
         self.bot = bot
         self.add_item(ShowMyCardsButton(game_state, bot))
 
 
-class PlayButton(Button):
+class InviteButton(Button): # Moved this class definition to be before BetButtonView
     def __init__(self):
-        # Initially enabled for single player default
-        super().__init__(label="Play (10.00 Minimum)", style=discord.ButtonStyle.green, disabled=False, row=3) # Moved to row 3
+        super().__init__(label="Invite to Game", style=discord.ButtonStyle.blurple, row=2)
+
+    async def _handle_invite_timeout(self, invited_user_id: int, invite_message_view: discord.ui.View, invite_message_obj: discord.Message, invited_user_mention: str, inviter_mention: str):
+        """Handles the automatic denial of an invite after a timeout."""
+        countdown_seconds = 60
+        view = self.view # Get the parent view (BetButtonView)
+
+        # Wait for the full countdown duration
+        await asyncio.sleep(countdown_seconds)
+
+        # After countdown, check if status is still 'waiting'
+        user_status_info = view.game_state['invited_players_status'].get(invited_user_id)
+
+        if user_status_info and user_status_info.get('status') == 'waiting':
+            logger.info(f"Invite for {invited_user_id} timed out. Automatically declining.")
+            user_status_info['status'] = 'denied'
+            user_status_info['countdown_end_time'] = 0 
+
+            for item in invite_message_view.children:
+                item.disabled = True
+            
+            try:
+                await invite_message_obj.edit(
+                    content=f"{invited_user_mention} did not respond to {inviter_mention}'s game invite in time and it has been automatically declined.",
+                    view=invite_message_view
+                )
+                await invite_message_obj.delete(delay=5)
+            except discord.NotFound:
+                logger.warning(f"Invite message {invite_message_obj.id} not found for timeout update or deletion.")
+            except Exception as e:
+                logger.error(f"Error updating/deleting invite message on timeout for {invited_user_id}: {e}")
+
+            invite_message_view.stop()
+
+            await view._update_public_game_status_message()
+            await view._check_all_players_responded()
+
 
     async def callback(self, interaction: discord.Interaction):
-        view = self.view # The view property is automatically set by discord.py
+        view = self.view
         if not view:
-            logger.error("PlayButton callback: View is not set.")
-            # Acknowledge the interaction to prevent "Interaction Failed"
+            logger.error("InviteButton callback: View is not set.")
             await interaction.response.defer()
             return
 
-        # Disable all UI components on the public message
-        for item in view.children:
-            item.disabled = True
+        invited_users = view.selected_users_for_invite
+        if not invited_users:
+            logger.warning("Invite button clicked without selected users.")
+            await interaction.response.defer()
+            return
+
+        # Remove the game mode select, user select, invite button, AND play button from the view
+        view.remove_item(view.game_mode_select)
+        view.remove_item(view.invite_user_select)
+        view.remove_item(self)
+        view.remove_item(view.play_button)
+
         await interaction.response.edit_message(view=view)
-
-        # No "You clicked 'Play'!" message as per user's request
-        logger.info(f"Player {interaction.user.display_name} clicked the Play button. Starting game flow.")
-
-        # Assign the actual player ID to the game state
-        # In multiplayer, this should include all accepted players + initiator
-        if view.game_mode_select.values[0] == "multiplayer":
-            # Collect accepted players. Initiator is always a player.
-            accepted_players = [
-                user_id for user_id, status_info in view.game_state['invited_players_status'].items() 
-                if status_info['status'] == 'accepted'
-            ]
-            if interaction.user.id not in accepted_players: # Ensure initiator is in the list
-                accepted_players.append(interaction.user.id)
-            view.game_state['players_in_game'] = accepted_players
-            num_players_to_deal = len(accepted_players)
-        else: # Single player
-            view.game_state['players_in_game'] = [interaction.user.id]
-            num_players_to_deal = 1
-
-
-        # Deal cards using the game_state's deck
-        dealt_info = await _deal_cards(
-            view.game_state['deck'],
-            num_players=num_players_to_deal, # Use dynamic player count
-            cards_per_player=2,
-            deal_dealer=True,
-            dealer_hidden_cards=2 # Both dealer cards hidden initially
-        )
-        # Assign hands to actual user IDs
-        player_idx = 0
-        for player_id in view.game_state['players_in_game']:
-            view.game_state['player_hands'][player_id] = dealt_info['player_hands'].get(f"player_{player_idx}", [])
-            player_idx += 1
-        view.game_state['dealer_hand'] = dealt_info['dealer_hand']
-
-        # --- Update Public Message (Dealer's hand - image only) ---
-        dealer_public_cards_info = []
-        for card in view.game_state['dealer_hand']:
-            dealer_public_cards_info.append({'code': card['code'], 'face_up': False})
         
-        # Create the public board image (dealer's cards + empty community cards for now)
-        updated_public_board_image_bytes = await _create_public_board_image(dealer_public_cards_info, view.game_state['community_cards'])
+        logger.info(f"User {interaction.user.display_name} clicked the Invite button for {len(invited_users)} users.")
 
-        if updated_public_board_image_bytes:
-            updated_public_file = discord.File(updated_public_board_image_bytes, filename="game_board.png")
+        DB_USER = os.getenv("DB_USER")
+        DB_PASSWORD = os.getenv("DB_PASSWORD")
+        DB_HOST = os.getenv("DB_HOST")
+        
+        notif_channel_id = None
+        conn = None
+        try:
+            conn = await aiomysql.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db="serene_users",
+                charset='utf8mb4',
+                autocommit=True
+            )
+            async with conn.cursor() as cur:
+                guild_id = interaction.guild_id
+                if guild_id:
+                    await cur.execute("SELECT notif_channel FROM bot_guild_settings WHERE guild_id = %s", (str(guild_id),))
+                    result = await cur.fetchone()
+                    if result:
+                        notif_channel_id = result[0]
+                        logger.info(f"Retrieved notif_channel_id: {notif_channel_id} for guild {guild_id}")
+                    else:
+                        logger.warning(f"No notif_channel found for guild_id: {guild_id}")
+                else:
+                    logger.warning("Interaction has no guild_id. Cannot fetch notif_channel.")
+
+        except Exception as e:
+            logger.error(f"Database error when fetching notif_channel: {e}")
+            view.add_item(view.game_mode_select)
+            view.add_item(view.invite_user_select)
+            view.add_item(self)
+            view.add_item(view.play_button)
+            self.disabled = False
+            await interaction.response.edit_message(view=view)
+            await interaction.followup.send("Failed to fetch notification channel from database.", ephemeral=True)
+            return
+        finally:
+            if conn:
+                conn.close()
+
+        if not notif_channel_id:
+            view.add_item(view.game_mode_select)
+            view.add_item(view.invite_user_select)
+            view.add_item(self)
+            view.add_item(view.play_button)
+            self.disabled = False
+            await interaction.response.edit_message(view=view)
+            await interaction.followup.send("Notification channel not configured for this server.", ephemeral=True)
+            return
+
+        for invited_user in invited_users:
+            try:
+                notif_channel = view.bot.get_channel(int(notif_channel_id))
+                if not notif_channel:
+                    notif_channel = await view.bot.fetch_channel(int(notif_channel_id))
+                
+                invite_message_view = discord.ui.View(timeout=60)
+
+                accept_button = discord.ui.Button(
+                    label="Accept & Join Game", 
+                    style=discord.ButtonStyle.green,
+                    custom_id=f"accept_invite_{invited_user.id}",
+                    row=0
+                )
+                invite_message_view.add_item(accept_button)
+
+                deny_button = discord.ui.Button(
+                    label="Deny", 
+                    style=discord.ButtonStyle.red, 
+                    custom_id=f"deny_invite_{invited_user.id}",
+                    row=0
+                )
+                invite_message_view.add_item(deny_button)
+
+                async def accept_callback(accept_interaction: discord.Interaction):
+                    if accept_interaction.user.id == invited_user.id:
+                        await accept_interaction.response.defer()
+                        logger.info(f"Invite accepted by {accept_interaction.user.display_name}.")
+                        for item in invite_message_view.children:
+                            item.disabled = True
+                        await accept_interaction.message.edit(content=f"{accept_interaction.user.mention} has accepted the game invite! Join the game in {interaction.channel.mention}.", view=invite_message_view)
+                        invite_message_view.stop()
+
+                        view.game_state['invited_players_status'][invited_user.id]['status'] = 'accepted'
+                        view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0
+                        await view._update_public_game_status_message()
+                        await view._check_all_players_responded()
+                        await accept_interaction.message.delete(delay=5)
+                    else:
+                        await accept_interaction.response.send_message("This invite is not for you!", ephemeral=True)
+
+                accept_button.callback = accept_callback
+
+                async def deny_callback(deny_interaction: discord.Interaction):
+                    if deny_interaction.user.id == invited_user.id:
+                        await deny_interaction.response.defer() 
+                        logger.info(f"Invite denied by {deny_interaction.user.display_name}.")
+                        for item in invite_message_view.children:
+                            item.disabled = True
+                        await deny_interaction.message.edit(content=f"{deny_interaction.user.mention} has denied the game invite.", view=invite_message_view)
+                        invite_message_view.stop()
+
+                        view.game_state['invited_players_status'][invited_user.id]['status'] = 'denied'
+                        view.game_state['invited_players_status'][invited_user.id]['countdown_end_time'] = 0 
+                        await view._update_public_game_status_message()
+                        await view._check_all_players_responded()
+                        await deny_interaction.message.delete(delay=5)
+                    else:
+                        await deny_interaction.response.send_message("This invite is not for you!", ephemeral=True)
+                
+                deny_button.callback = deny_callback
+
+                countdown_end_timestamp = int(time.time() + 60)
+
+                initial_invite_content = (
+                    f"**🎮 Game Invite!** {invited_user.mention}, {interaction.user.mention} has invited you to a game of Serene Texas Hold'em!\n"
+                    f"Join the game channel here: {interaction.channel.mention}\n"
+                    f"Please respond by <t:{countdown_end_timestamp}:R>."
+                )
+                
+                invite_message_obj = await notif_channel.send(
+                    initial_invite_content,
+                    view=invite_message_view
+                )
+                logger.info(f"Invite sent to {invited_user.display_name} in channel {notif_channel.name}.")
+
+                view.game_state['invited_players_status'][invited_user.id] = {
+                    'status': 'waiting',
+                    'invite_message_id': invite_message_obj.id,
+                    'countdown_end_time': countdown_end_timestamp
+                }
+
+                view.bot.loop.create_task(
+                    self._handle_invite_timeout(
+                        invited_user.id, 
+                        invite_message_view, 
+                        invite_message_obj, 
+                        invited_user.mention, 
+                        interaction.user.mention
+                    )
+                )
+
+            except Exception as e:
+                logger.error(f"Error sending invite message to {invited_user.display_name}: {e}")
+                view.game_state['invited_players_status'][invited_user.id] = {
+                    'status': 'failed',
+                    'invite_message_id': None,
+                    'countdown_end_time': 0
+                }
+        
+        await view._update_public_game_status_message()
+        await interaction.response.defer()
+
+
+class BetButtonView(View): # Inherit from View
+    def __init__(self, game_state: dict, bot: commands.Bot, original_interaction: discord.Interaction):
+        super().__init__(timeout=180) # Timeout after 3 minutes if no interaction
+        self.game_state = game_state
+        self.bot = bot
+        self.original_interaction = original_interaction # Store the initial interaction
+        self.selected_users_for_invite = [] # To store the list of user objects selected for invite
+        # Initialize invited_players_status with a more detailed structure
+        self.game_state['invited_players_status'] = {} # {user_id: {'status': 'waiting'/'accepted'/'denied'/'failed', 'invite_message_id': None, 'countdown_end_time': 0}}
+
+        # Instantiate UI components
+        self.game_mode_select = GameModeSelect()
+        self.invite_user_select = InviteUserSelect()
+        self.invite_button = InviteButton()
+        self.play_button = PlayButton()
+
+        # Assign references for PlayButton to access view's context
+        self.play_button.game_state = game_state
+        self.play_button.bot = bot
+        self.play_button.original_interaction = original_interaction
+
+        # Add items to the view in desired order
+        self.add_item(self.game_mode_select)
+        self.add_item(self.invite_user_select)
+        self.add_item(self.invite_button)
+        self.add_item(self.play_button)
+
+        # Set initial states based on default single player
+        self.invite_user_select.disabled = True
+        self.invite_button.disabled = True
+        self.play_button.disabled = False
+
+    async def _update_public_game_status_message(self):
+        """Updates the public message with the current status of invited players, including countdown."""
+        if not self.game_state['public_message_id']:
+            logger.warning("No public message ID to update status.")
+            return
+
+        status_lines = []
+        for user_id, status_info in self.game_state['invited_players_status'].items():
+            status = status_info['status']
+            countdown_end_time = status_info.get('countdown_end_time', 0)
             
             try:
-                channel = view.bot.get_channel(view.game_state['channel_id'])
-                if not channel:
-                    channel = await view.bot.fetch_channel(view.game_state['channel_id'])
+                user = await self.bot.fetch_user(user_id)
+                emoji = ""
+                status_text = status.capitalize()
                 
-                public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
+                if status == 'waiting':
+                    # Use Discord's relative timestamp for the public status message
+                    emoji = "⏳"
+                    status_text = f"Waiting (responds by <t:{countdown_end_time}:R>)"
+                elif status == 'accepted':
+                    emoji = "✅"
+                    status_text = "Accepted"
+                elif status == 'denied':
+                    emoji = "❌"
+                    status_text = "Denied"
+                elif status == 'failed':
+                    emoji = "⚠️"
+                    status_text = "Failed to send invite"
                 
-                # Create the new GameBoardView with the "Show Me My Cards Again" button
-                game_board_view = GameBoardView(view.game_state, view.bot)
-
-                await public_message_to_edit.edit(
-                    content="**🃏 Dealer's Hand & Community Cards:**",
-                    attachments=[updated_public_file], # Replace existing file
-                    view=game_board_view # Set the new view with the "Show Me My Cards Again" button
-                )
-                logger.info(f"Public message {view.game_state['public_message_id']} updated with dealer's cards and 'Show Me My Cards Again' button.")
+                status_lines.append(f"{emoji} {user.mention} ({status_text})")
             except discord.NotFound:
-                logger.error(f"Public message with ID {view.game_state['public_message_id']} not found during update.")
+                status_lines.append(f"❓ Unknown User (ID: {user_id}) ({status.capitalize()})")
             except Exception as e:
-                logger.error(f"Error updating public message: {e}")
-        else:
-            # If image creation fails, still remove the old view and try to set the new one
-            try:
-                channel = view.bot.get_channel(view.game_state['channel_id'])
-                if not channel:
-                    channel = await view.bot.fetch_channel(view.game_state['channel_id'])
-                public_message_to_edit = await channel.fetch_message(view.game_state['public_message_id'])
-                game_board_view = GameBoardView(view.game_state, view.bot) # Still create and attach the new view
-                await public_message_to_edit.edit(
-                    content="**🃏 Dealer's Hand & Community Cards: (Image failed to load)**",
-                    view=game_board_view
-                )
-            except Exception as e:
-                logger.error(f"Error handling image creation failure in public message: {e}")
-            logger.error("Could not create updated dealer's hand image for public display.")
+                logger.error(f"Error fetching user {user_id} for status update: {e}")
+                status_lines.append(f"❓ Error User (ID: {user_id}) ({status.capitalize()})")
+        
+        status_text_combined = "\n".join(status_lines) if status_lines else "No players invited yet."
+        
+        try:
+            channel = self.bot.get_channel(self.game_state['channel_id'])
+            if not channel:
+                channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+            
+            public_message_to_edit = await channel.fetch_message(self.game_state['public_message_id'])
+            
+            # Preserve the image if it exists, otherwise send without it
+            # For simplicity, we'll just update the content, the image stays.
+            await public_message_to_edit.edit(
+                content=f"**🃏 Game Table: Player Status**\n{status_text_combined}",
+            )
+            logger.info(f"Public message {self.game_state['public_message_id']} updated with player statuses.")
+        except discord.NotFound:
+            logger.error(f"Public message with ID {self.game_state['public_message_id']} not found during status update.")
+        except Exception as e:
+            logger.error(f"Error updating public message with player status: {e}")
 
-        view.stop() # Stop the initial BetButtonView
+    async def _check_all_players_responded(self):
+        """Checks if all invited players have responded and enables the Play button if so."""
+        if not self.game_state['invited_players_status']: # No players invited
+            # If no players were invited (e.g., single player mode), ensure play button is visible and enabled
+            # This check is important if the game starts directly without invites
+            if self.game_mode_select.values[0] == "single_player":
+                if self.play_button not in self.children: # Only add if not already present
+                    self.add_item(self.play_button)
+                self.play_button.disabled = False
+                await self.original_interaction.edit_original_response(view=self)
+                logger.info("Single player mode: Play button enabled.")
+            return
+
+        all_responded = True
+        for status_info in self.game_state['invited_players_status'].values():
+            if status_info['status'] == 'waiting':
+                all_responded = False
+                break
+        
+        if all_responded:
+            if self.play_button not in self.children: # Only add if not already present
+                self.add_item(self.play_button)
+            self.play_button.disabled = False
+            await self.original_interaction.edit_original_response(view=self) # Update the view to enable play button
+            logger.info("All invited players have responded. Play button enabled.")
+
+
+    async def on_timeout(self):
+        # This method is called when the view times out
+        logger.info("BetButtonView timed out.")
+        if self.game_state['public_message_id']:
+            try:
+                channel = self.bot.get_channel(self.game_state['channel_id'])
+                if not channel:
+                    channel = await self.bot.fetch_channel(self.game_state['channel_id'])
+                public_message = await channel.fetch_message(self.game_state['public_message_id'])
+                await public_message.edit(content="Game setup timed out. Please start a new game.", view=None)
+            except discord.NotFound:
+                logger.error(f"Public message with ID {self.game_state['public_message_id']} not found on timeout.")
+            except Exception as e:
+                logger.error(f"Error updating public message on timeout: {e}")
 
 
 async def start(interaction: discord.Interaction, bot):
@@ -787,16 +876,11 @@ async def start(interaction: discord.Interaction, bot):
         'community_cards': [],
         'public_message_id': None,
         'channel_id': interaction.channel_id,
-        # Initialize with the new structure for invited_players_status
         'invited_players_status': {} 
     }
     random.shuffle(game_state['deck'])
 
-    # --- Send Initial Public Message (Placeholder for dealer's hand) with button ---
-    # Initially, display a blank image or a game logo if preferred, or just a message.
-    # For now, we'll send a blank transparent image as a placeholder for the dealer's cards.
-    # Use the new _create_public_board_image for initial display as well
-    initial_combined_image_bytes = await _create_public_board_image([], []) # Empty dealer and community cards
+    initial_combined_image_bytes = await _create_public_board_image([], [])
 
     view = BetButtonView(game_state, bot, interaction)
 
@@ -805,19 +889,15 @@ async def start(interaction: discord.Interaction, bot):
         public_message = await interaction.followup.send(
             "**🃏 Game Table: Select your game mode:**",
             file=initial_public_file,
-            view=view # Attach the view with the button
+            view=view
         )
         game_state['public_message_id'] = public_message.id
         logger.info(f"Initial public message sent with ID: {public_message.id} and game mode selection.")
     else:
         await interaction.followup.send(
             "Could not create initial game table image. Game might not proceed as expected.",
-            view=view, # Still attach the view even if image fails
+            view=view,
             ephemeral=False
         )
 
-    # Wait for the view to stop (e.g., Play button clicked or timeout)
     await view.wait()
-    
-    # The rest of the game logic (dealing, sending ephemeral messages, updating public message)
-    # is now handled within the BetButtonView's callback (play_button method)

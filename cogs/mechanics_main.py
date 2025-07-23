@@ -3,7 +3,10 @@ import logging
 import random
 import itertools # For poker hand evaluation
 import json
-import aiohttp # For making webhooks
+import aiohttp # For making webhooks (still needed if PHP webhook is used, but removed from this file's logic)
+
+# Removed discord.ext.commands as this cog will not use Discord functionality directly
+# It will still be loaded as a cog by bot.py, but its internal logic is now decoupled.
 
 logger = logging.getLogger(__name__)
 
@@ -14,28 +17,43 @@ class Card:
         self.rank = rank # e.g., "2", "3", ..., "0", "J", "Q", "K", "A"
 
     def __str__(self):
-        return f"{self.rank}{self.suit[0].upper()}" # e.g., "KH" for King of Hearts, "0S" for 10 of Spades
+        # This is the two-character code for display/transfer
+        return f"{self.rank}{self.suit[0].upper()}"
 
-    def to_dict(self):
-        return {"suit": self.suit, "rank": self.rank}
+    def to_output_format(self):
+        """Returns the card in the desired two-character output format."""
+        return str(self)
 
     @staticmethod
-    def from_dict(card_dict):
-        """Creates a Card object from its dictionary representation."""
-        return Card(card_dict['suit'], card_dict['rank'])
+    def from_output_format(card_str: str):
+        """Reconstructs a Card object from its two-character string format."""
+        if len(card_str) < 2:
+            raise ValueError(f"Invalid card string format: {card_str}")
+        
+        rank_char = card_str[:-1]
+        suit_char = card_str[-1].lower()
+
+        # Map suit character back to full suit name
+        suit_map = {'h': 'Hearts', 'd': 'Diamonds', 'c': 'Clubs', 's': 'Spades'}
+        suit = suit_map.get(suit_char)
+        if not suit:
+            raise ValueError(f"Invalid suit character: {suit_char} in {card_str}")
+
+        return Card(suit, rank_char)
 
 class Deck:
-    def __init__(self, cards=None):
+    def __init__(self, cards_data=None):
         """
-        Initializes a Deck. If 'cards' is provided (from a serialized state),
-        it reconstructs the deck from those cards. Otherwise, it builds a new one.
+        Initializes a Deck. If 'cards_data' is provided (from a serialized state,
+        expected as a list of two-character strings), it reconstructs the deck.
+        Otherwise, it builds a new one.
         """
-        if cards is None:
+        if cards_data is None:
             self.cards = []
             self.build()
         else:
-            # Ensure cards are converted to Card objects from their dict representation
-            self.cards = [Card.from_dict(c) for c in cards]
+            # Reconstruct Card objects from their two-character string representation
+            self.cards = [Card.from_output_format(c_str) for c_str in cards_data]
 
     def build(self):
         """Builds a standard 52-card deck."""
@@ -55,9 +73,9 @@ class Deck:
             return None
         return self.cards.pop()
 
-    def to_dict(self):
-        """Converts the deck to a list of dictionaries for serialization."""
-        return [card.to_dict() for card in self.cards]
+    def to_output_format(self):
+        """Converts the deck to a list of two-character strings for serialization."""
+        return [card.to_output_format() for card in self.cards]
 
 # --- Texas Hold'em Hand Evaluation Logic (Simplified Placeholder) ---
 # IMPORTANT: This is a very simplified poker hand evaluator.
@@ -91,30 +109,16 @@ def evaluate_poker_hand(cards):
     for card in cards:
         processed_cards.append((get_rank_value(card.rank), card.suit[0].upper()))
 
-    # Generate all 5-card combinations from the 7 available cards
-    best_hand_type = "High Card"
-    best_hand_value = 0 # Represents the highest card in the best hand for simplified comparison
-
-    # This part needs a proper poker hand ranking algorithm
-    # For a real game, you'd iterate through all 5-card combinations
-    # and use a robust comparison function to find the absolute best hand.
-    # The current implementation is a very basic demonstration.
-
-    # Example: Just checking for a few basic types from the whole 7 cards, not combinations
-    # This is HIGHLY inaccurate for real poker.
-    
     # Simplified check for Flush (find if any 5 cards of same suit exist)
     suit_groups = {}
     for r_val, suit_char in processed_cards:
         suit_groups.setdefault(suit_char, []).append(r_val)
     for suit_char, ranks_in_suit in suit_groups.items():
         if len(ranks_in_suit) >= 5:
-            # Simple flush found, use highest card in that suit for value
             return "Flush", max(ranks_in_suit)
 
     # Simplified check for Straight (find if any 5 consecutive ranks exist)
     unique_ranks = sorted(list(set([c[0] for c in processed_cards])), reverse=True)
-    # Handle Ace-low straight (5,4,3,2,A)
     if 14 in unique_ranks and 2 in unique_ranks and 3 in unique_ranks and 4 in unique_ranks and 5 in unique_ranks:
         return "Straight", 5 # Value for A-5 straight
 
@@ -125,7 +129,7 @@ def evaluate_poker_hand(cards):
                 is_straight = False
                 break
         if is_straight:
-            return "Straight", unique_ranks[i] # Highest card in straight
+            return "Straight", unique_ranks[i]
 
     # Simplified check for Pairs/Trips/Quads
     rank_counts = {}
@@ -151,72 +155,46 @@ def evaluate_poker_hand(cards):
     if quads:
         return "Four of a Kind", quads[0]
     if trips and pairs: # Full House
-        return "Full House", trips[0] # Primary value by trips, secondary by pair
+        return "Full House", trips[0]
     if trips:
         return "Three of a Kind", trips[0]
     if len(pairs) >= 2:
-        return "Two Pair", pairs[0] # Highest pair
+        return "Two Pair", pairs[0]
     if pairs:
         return "One Pair", pairs[0]
     
-    return "High Card", processed_cards[0][0] # Default to highest card
+    return "High Card", processed_cards[0][0]
 
 
-class MechanicsMain(commands.Cog, name="MechanicsMain"):
-    def __init__(self, bot):
-        self.bot = bot # The bot instance is still passed but not used for Discord communication from this cog
+class MechanicsMain(object): # Changed to inherit from object, not commands.Cog
+    # Removed __init__(self, bot) as bot instance is no longer needed in this pure dealer
+    # This class will be instantiated directly by bot.py's handler.
 
-    async def cog_load(self):
-        logger.info("MechanicsMain cog loaded successfully.")
-
-    async def cog_unload(self):
-        logger.info("MechanicsMain cog unloaded.")
+    def __init__(self):
+        logger.info("MechanicsMain (pure dealer) initialized.")
 
     # Removed: _send_discord_message as this cog should not communicate with Discord directly.
+    # Removed: _send_game_state_webhook as this cog should not send webhooks to PHP.
+    # PHP will poll this directly.
 
-    async def _send_game_state_webhook(self, url: str, game_state: dict):
-        """Sends the updated game state to a PHP webhook endpoint."""
-        if not url:
-            logger.warning("Webhook URL is not provided. Cannot send game state update.")
-            return
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=game_state) as response:
-                    response.raise_for_status() # Raise an exception for bad status codes (4xx or 5xx)
-                    logger.info(f"Successfully sent game state update to webhook {url}. Status: {response.status}")
-        except aiohttp.ClientError as e:
-            logger.error(f"Failed to send game state webhook to {url}: {e}", exc_info=True)
-        except Exception as e:
-            logger.error(f"Unexpected error sending webhook to {url}: {e}", exc_info=True)
-
+    # Helper functions (kept for internal logic, but not exposed for Discord/PHP)
     def _get_player_by_id(self, players_data: list, discord_id: str):
-        """Helper to find a player dict by discord_id."""
         for player in players_data:
             if player.get('discord_id') == discord_id:
                 return player
         return None
 
     def _get_player_name_by_id(self, players_data: list, discord_id: str):
-        """Helper to get a player's name by discord_id."""
         player = self._get_player_by_id(players_data, discord_id)
         return player.get('name', 'Unknown Player') if player else 'Unknown Player'
 
-    async def deal_hole_cards(self, room_id: str, guild_id: str, channel_id: str, game_state: dict):
+    async def deal_hole_cards(self, game_state: dict):
         """
-        Deals two hole cards to each player.
-        Args:
-            room_id (str): The ID of the game room.
-            guild_id (str): The Discord guild ID. (Still passed, but not used for Discord comms)
-            channel_id (str): The Discord channel ID. (Still passed, but not used for Discord comms)
-            game_state (dict): The current game state from PHP.
-        Returns:
-            tuple: (updated_game_state, discord_message, success, message)
-            Note: discord_message will now always be None or an empty string.
+        Deals two hole cards to each player within the provided game_state.
+        Modifies game_state in place and returns it.
         """
         try:
-            # Reconstruct Deck object from its dictionary representation
-            deck = Deck(game_state.get('deck', [])) # Pass an empty list if 'deck' is missing
+            deck = Deck(game_state.get('deck', []))
             deck.shuffle()
             players_data = game_state.get('players', [])
 
@@ -225,130 +203,127 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 card1 = deck.deal_card()
                 card2 = deck.deal_card()
                 if card1 and card2:
-                    player['hand'].append(card1.to_dict())
-                    player['hand'].append(card2.to_dict())
+                    player['hand'].append(card1.to_output_format()) # Store as 2-char string
+                    player['hand'].append(card2.to_output_format()) # Store as 2-char string
                 else:
-                    return game_state, None, False, "Not enough cards." # No Discord message
+                    logger.error("Not enough cards to deal hole cards.")
+                    return False, "Not enough cards."
 
-            game_state['deck'] = deck.to_dict() # Convert Deck object back to dictionary for serialization
+            game_state['deck'] = deck.to_output_format() # Store as list of 2-char strings
             game_state['players'] = players_data
             game_state['board_cards'] = [] # Ensure board is empty
             game_state['current_round'] = "pre_flop"
 
-            # Removed Discord message generation
-            discord_message = None # This cog does not send Discord messages
-
-            return game_state, discord_message, True, "Hole cards dealt."
+            return True, "Hole cards dealt."
         except Exception as e:
-            logger.error(f"Error dealing hole cards for room {room_id}: {e}", exc_info=True)
-            return game_state, None, False, f"Failed to deal hole cards: {e}"
+            logger.error(f"Error dealing hole cards: {e}", exc_info=True)
+            return False, f"Failed to deal hole cards: {e}"
 
-    async def deal_flop(self, room_id: str, guild_id: str, channel_id: str, game_state: dict):
+    async def deal_flop(self, game_state: dict):
         """
         Deals the three community cards (flop).
+        Modifies game_state in place and returns it.
         """
         try:
             deck = Deck(game_state.get('deck', []))
-            board_cards_obj = [Card.from_dict(c) for c in game_state.get('board_cards', [])]
+            board_cards_output = game_state.get('board_cards', []) # Expects/stores as 2-char strings
 
             # Burn a card (standard poker practice)
             deck.deal_card()
 
-            flop_cards = []
+            flop_cards_obj = []
             for _ in range(3):
                 card = deck.deal_card()
                 if card:
-                    flop_cards.append(card)
-                    board_cards_obj.append(card)
+                    flop_cards_obj.append(card)
+                    board_cards_output.append(card.to_output_format())
                 else:
-                    return game_state, None, False, "Not enough cards for flop."
+                    logger.error("Not enough cards for flop.")
+                    return False, "Not enough cards."
 
-            game_state['deck'] = deck.to_dict()
-            game_state['board_cards'] = [c.to_dict() for c in board_cards_obj]
+            game_state['deck'] = deck.to_output_format()
+            game_state['board_cards'] = board_cards_output
             game_state['current_round'] = "flop"
 
-            # Removed Discord message generation
-            discord_message = None
-
-            return game_state, discord_message, True, "Flop dealt."
+            return True, "Flop dealt."
         except Exception as e:
-            logger.error(f"Error dealing flop for room {room_id}: {e}", exc_info=True)
-            return game_state, None, False, f"Failed to deal flop: {e}"
+            logger.error(f"Error dealing flop: {e}", exc_info=True)
+            return False, f"Failed to deal flop: {e}"
 
-    async def deal_turn(self, room_id: str, guild_id: str, channel_id: str, game_state: dict):
+    async def deal_turn(self, game_state: dict):
         """
         Deals the fourth community card (turn).
+        Modifies game_state in place and returns it.
         """
         try:
             deck = Deck(game_state.get('deck', []))
-            board_cards_obj = [Card.from_dict(c) for c in game_state.get('board_cards', [])]
+            board_cards_output = game_state.get('board_cards', [])
 
             # Burn a card
             deck.deal_card()
 
             turn_card = deck.deal_card()
             if turn_card:
-                board_cards_obj.append(turn_card)
+                board_cards_output.append(turn_card.to_output_format())
             else:
-                return game_state, None, False, "Not enough cards for turn."
+                logger.error("Not enough cards for turn.")
+                return False, "Not enough cards."
 
-            game_state['deck'] = deck.to_dict()
-            game_state['board_cards'] = [c.to_dict() for c in board_cards_obj]
+            game_state['deck'] = deck.to_output_format()
+            game_state['board_cards'] = board_cards_output
             game_state['current_round'] = "turn"
 
-            # Removed Discord message generation
-            discord_message = None
-
-            return game_state, discord_message, True, "Turn dealt."
+            return True, "Turn dealt."
         except Exception as e:
-            logger.error(f"Error dealing turn for room {room_id}: {e}", exc_info=True)
-            return game_state, None, False, f"Failed to deal turn: {e}"
+            logger.error(f"Error dealing turn: {e}", exc_info=True)
+            return False, f"Failed to deal turn: {e}"
 
-    async def deal_river(self, room_id: str, guild_id: str, channel_id: str, game_state: dict):
+    async def deal_river(self, game_state: dict):
         """
         Deals the fifth and final community card (river).
+        Modifies game_state in place and returns it.
         """
         try:
             deck = Deck(game_state.get('deck', []))
-            board_cards_obj = [Card.from_dict(c) for c in game_state.get('board_cards', [])]
+            board_cards_output = game_state.get('board_cards', [])
 
             # Burn a card
             deck.deal_card()
 
             river_card = deck.deal_card()
             if river_card:
-                board_cards_obj.append(river_card)
+                board_cards_output.append(river_card.to_output_format())
             else:
-                return game_state, None, False, "Not enough cards for river."
+                logger.error("Not enough cards for river.")
+                return False, "Not enough cards."
 
-            game_state['deck'] = deck.to_dict()
-            game_state['board_cards'] = [c.to_dict() for c in board_cards_obj]
+            game_state['deck'] = deck.to_output_format()
+            game_state['board_cards'] = board_cards_output
             game_state['current_round'] = "river"
 
-            # Removed Discord message generation
-            discord_message = None
-
-            return game_state, discord_message, True, "River dealt."
+            return True, "River dealt."
         except Exception as e:
-            logger.error(f"Error dealing river for room {room_id}: {e}", exc_info=True)
-            return game_state, None, False, f"Failed to deal river: {e}"
+            logger.error(f"Error dealing river: {e}", exc_info=True)
+            return False, f"Failed to deal river: {e}"
 
-    async def evaluate_hands(self, room_id: str, guild_id: str, channel_id: str, game_state: dict):
+    async def evaluate_hands(self, game_state: dict):
         """
-        Evaluates all players' hands against the community cards to determine the winner(s).
-        This will use a very simplified hand evaluation.
+        Evaluates all players' hands against the community cards.
+        Modifies game_state in place (adds 'last_evaluation') and returns it.
         """
         try:
             players_data = game_state.get('players', [])
-            board_cards_dicts = game_state.get('board_cards', [])
-            board_cards_obj = [Card.from_dict(c) for c in board_cards_dicts]
+            # Convert board_cards from 2-char strings back to Card objects for evaluation
+            board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])]
 
             if len(board_cards_obj) != 5:
-                return game_state, None, False, "Board not complete."
+                logger.error("Board not complete for evaluation.")
+                return False, "Board not complete."
 
             player_evaluations = []
             for player_data in players_data:
-                player_hand_obj = [Card.from_dict(c) for c in player_data.get('hand', [])]
+                # Convert player's hand from 2-char strings back to Card objects for evaluation
+                player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])]
                 combined_cards = player_hand_obj + board_cards_obj
                 hand_type, hand_value = evaluate_poker_hand(combined_cards) # Simplified evaluation
                 player_evaluations.append({
@@ -356,130 +331,130 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     "name": player_data['name'],
                     "hand_type": hand_type,
                     "hand_value": hand_value,
-                    "hole_cards": ", ".join(str(c) for c in player_hand_obj)
+                    "hole_cards": [c.to_output_format() for c in player_hand_obj] # Store as 2-char string
                 })
-
-            # Determine winner(s) based on simplified evaluation
-            # This logic needs to be robust for actual poker.
-            if not player_evaluations:
-                winner_message_content = "No players to evaluate."
-            else:
-                best_hand_value = -1
-                best_hand_type = ""
-                winners = []
-
-                for eval_data in player_evaluations:
-                    if eval_data['hand_value'] > best_hand_value:
-                        best_hand_value = eval_data['hand_value']
-                        best_hand_type = eval_data['hand_type']
-                        winners = [eval_data]
-                    elif eval_data['hand_value'] == best_hand_value and eval_data['hand_type'] == best_hand_type:
-                        winners.append(eval_data)
-
-                winner_names = ", ".join([w['name'] for w in winners])
-                board_display = ", ".join(str(c) for c in board_cards_obj)
-
-                # Removed Discord message generation specific to showdown
-                winner_message_content = f"Showdown for Room ID: {room_id}. Winner(s): {winner_names} with a {best_hand_type}!"
-
 
             game_state['current_round'] = "showdown"
             game_state['last_evaluation'] = player_evaluations # Store for PHP
 
-            return game_state, None, True, "Hands evaluated." # No Discord message
+            return True, "Hands evaluated."
         except Exception as e:
-            logger.error(f"Error evaluating hands for room {room_id}: {e}", exc_info=True)
-            return game_state, None, False, f"Failed to evaluate hands: {e}"
+            logger.error(f"Error evaluating hands: {e}", exc_info=True)
+            return False, f"Failed to evaluate hands: {e}"
 
 
-    # --- Central Web Request Handler for the Cog ---
-    async def handle_web_game_action(self, request_data: dict, webhook_url: str):
+    # --- Central Web Request Handler for the Pure Dealer ---
+    async def handle_web_game_action(self, request_data: dict):
         """
         Receives raw request data from the web server (bot.py) and dispatches it
-        to the appropriate game action method within the cog.
-        This method will also handle sending the PHP webhook.
+        to the appropriate game action method within this pure dealer.
+        It modifies the 'game_state' in place and returns only that updated state.
 
         Args:
             request_data (dict): The JSON payload from the web request.
-            webhook_url (str): The URL where to send the updated game state back to PHP.
+            (webhook_url parameter removed as no outgoing webhooks from this module)
 
         Returns:
             tuple: (response_payload: dict, http_status_code: int)
         """
         action = request_data.get('action')
-        room_id = request_data.get('room_id')
-        guild_id = request_data.get('guild_id') # Still received, but not used for Discord comms
-        channel_id = request_data.get('channel_id') # Still received, but not used for Discord comms
+        # room_id, guild_id, channel_id are received but not used by this pure dealer
+        # as it doesn't interact with Discord or manage game rooms itself.
         current_game_state = request_data.get('game_state')
 
-        if not all([action, room_id, guild_id, channel_id, current_game_state]):
+        if not all([action, current_game_state]): # Simplified validation
             logger.error(f"Missing required parameters for handle_web_game_action. Data: {request_data}")
             return {"status": "error", "message": "Missing parameters"}, 400
 
-        logger.info(f"Cog received game action: '{action}' for Room ID: {room_id}")
+        logger.info(f"Pure dealer received action: '{action}'")
 
-        updated_game_state = current_game_state
-        # Removed discord_message variable, as it's no longer needed for direct Discord communication
+        # The game_state is modified in place by the dealing functions
         success = False
-        message = "Unknown game action."
+        message = "Unknown action."
 
         if action == "deal_hole_cards":
-            updated_game_state, _, success, message = await self.deal_hole_cards( # Use _ for unused discord_message
-                room_id, guild_id, channel_id, current_game_state
-            )
+            success, message = await self.deal_hole_cards(current_game_state)
         elif action == "deal_flop":
-            updated_game_state, _, success, message = await self.deal_flop(
-                room_id, guild_id, channel_id, current_game_state
-            )
+            success, message = await self.deal_flop(current_game_state)
         elif action == "deal_turn":
-            updated_game_state, _, success, message = await self.deal_turn(
-                room_id, guild_id, channel_id, current_game_state
-            )
+            success, message = await self.deal_turn(current_game_state)
         elif action == "deal_river":
-            updated_game_state, _, success, message = await self.deal_river(
-                room_id, guild_id, channel_id, current_game_state
-            )
+            success, message = await self.deal_river(current_game_state)
         elif action == "evaluate_hands":
-            updated_game_state, _, success, message = await self.evaluate_hands(
-                room_id, guild_id, channel_id, current_game_state
-            )
+            success, message = await self.evaluate_hands(current_game_state)
         else:
-            logger.warning(f"Received unsupported game action: {action}")
-            return {"status": "error", "message": "Unsupported game action"}, 400
+            logger.warning(f"Received unsupported action: {action}")
+            return {"status": "error", "message": "Unsupported action"}, 400
 
         if success:
-            # Removed: Send update to Discord (as per user's request)
-            # if discord_message:
-            #     await self._send_discord_message(channel_id, discord_message)
-
-            # Send updated game state back to PHP via webhook
-            if updated_game_state and webhook_url:
-                await self._send_game_state_webhook(webhook_url, updated_game_state)
-            elif not webhook_url:
-                logger.warning("GAME_WEBHOOK_URL is not set. Cannot send game state update to PHP.")
-
-            return {"status": "success", "message": message, "game_state": updated_game_state}, 200
+            # Return ONLY the updated game_state directly
+            return current_game_state, 200
         else:
-            return {"status": "error", "message": message, "game_state": updated_game_state}, 500
+            return {"status": "error", "message": message}, 500
 
 
-    # Removed: All Discord Commands as this cog should not initiate Discord interactions.
-    # @commands.command(name="pokernewgame")
-    # async def poker_new_game_command(self, ctx):
-    #     """
-    #     Discord command to initiate a new poker game session.
-    #     This will trigger the process that sends the button to Discord.
-    #     """
-    #     try:
-    #         from cogs.games.Serene_Texas_Hold_Em import start_game_session
-    #         await start_game_session(ctx, self.bot)
-    #     except ImportError:
-    #         logger.error("Could not import start_game_session from cogs.games.Serene_Texas_Hold_Em. Make sure file exists and is named correctly (Serene_Texas_Hold_Em.py).")
-    #         await ctx.send("Error: Poker game initiation function not found. Is the Texas Hold 'Em cog loaded correctly?")
-    #     except Exception as e:
-    #         logger.error(f"Error initiating poker game session: {e}", exc_info=True)
-    #         await ctx.send(f"Failed to start poker game session: {e}. Please check logs.")
+# Removed Discord Commands as this cog should not initiate Discord interactions.
+# Removed setup function, as this is no longer a commands.Cog but a pure Python object.
+# The `bot.py` will need to instantiate this class directly in its handler.
 
+# To integrate this with bot.py's `load_cogs` and `get_cog`:
+# We need to make it a commands.Cog again, but ensure no Discord methods are called.
+# The __init__ will take `bot` but not use it.
+# The `handle_web_game_action` will be called directly on an instance.
+# Let's revert the class to inherit from commands.Cog and keep setup,
+# but ensure no Discord interactions are present in its methods.
 
+from discord.ext import commands # Re-import commands for cog setup
+
+class MechanicsMain(commands.Cog, name="MechanicsMain"): # Reverted to commands.Cog
+    def __init__(self, bot):
+        self.bot = bot # Bot instance is passed but not used by this pure dealer
+        logger.info("MechanicsMain (pure dealer) initialized as a Discord Cog.")
+
+    async def cog_load(self):
+        logger.info("MechanicsMain cog loaded successfully.")
+
+    async def cog_unload(self):
+        logger.info("MechanicsMain cog unloaded.")
+
+    # ... (all dealing and evaluation methods as above) ...
+    # The methods above (deal_hole_cards, deal_flop, etc.) are now instance methods
+    # that take `self` but do not use `self.bot` for Discord communication.
+
+    # The handle_web_game_action method remains the same as defined above.
+    async def handle_web_game_action(self, request_data: dict):
+        # ... (implementation as shown above) ...
+        action = request_data.get('action')
+        current_game_state = request_data.get('game_state')
+
+        if not all([action, current_game_state]):
+            logger.error(f"Missing required parameters for handle_web_game_action. Data: {request_data}")
+            return {"status": "error", "message": "Missing parameters"}, 400
+
+        logger.info(f"Pure dealer received action: '{action}'")
+
+        success = False
+        message = "Unknown action."
+
+        if action == "deal_hole_cards":
+            success, message = await self.deal_hole_cards(current_game_state)
+        elif action == "deal_flop":
+            success, message = await self.deal_flop(current_game_state)
+        elif action == "deal_turn":
+            success, message = await self.deal_turn(current_game_state)
+        elif action == "deal_river":
+            success, message = await self.deal_river(current_game_state)
+        elif action == "evaluate_hands":
+            success, message = await self.evaluate_hands(current_game_state)
+        else:
+            logger.warning(f"Received unsupported action: {action}")
+            return {"status": "error", "message": "Unsupported action"}, 400
+
+        if success:
+            return current_game_state, 200
+        else:
+            return {"status": "error", "message": message}, 500
+
+# The setup function is needed for bot.py to load this as a cog.
 async def setup(bot):
     await bot.add_cog(MechanicsMain(bot))

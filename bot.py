@@ -114,7 +114,7 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
     Helper function to post a new Discord embed and save its details to bot_messages table.
     Expects rules_json_bytes to be bytes, will decode it.
     """
-    conn = None
+    conn = None # Initialize conn to None
     try:
         conn = await aiomysql.connect(
             host=DB_HOST,
@@ -271,7 +271,7 @@ async def settings_saved_handler(request):
                     existing_message_id = bot_messages_row.get('message_id')
 
                     # Decode existing_message_json from bytes to string
-                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_bytes
+                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_str
                     logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...") # Log first 200 chars
                     logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
 
@@ -340,8 +340,9 @@ async def game_action_route_handler(request):
             return web.Response(text="Internal Server Error: Game mechanics not available", status=500, headers=CORS_HEADERS)
 
         # Delegate the actual processing to the cog's method
+        # MODIFIED: Removed GAME_WEBHOOK_URL as an argument to handle_web_game_action
         response_data, status_code = await mechanics_cog.handle_web_game_action(
-            data, GAME_WEBHOOK_URL # Pass data and the webhook URL
+            data
         )
         return web.json_response(response_data, status=status_code, headers=CORS_HEADERS)
 
@@ -382,6 +383,8 @@ async def on_ready():
     bot.db_user = DB_USER
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
+    # Assign GAME_WEBHOOK_URL to bot object so cogs can access it if needed
+    bot.GAME_WEBHOOK_URL = GAME_WEBHOOK_URL
 
     # Load all cogs
     await load_cogs()

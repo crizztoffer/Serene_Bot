@@ -1,4 +1,4 @@
-# --- cogs/games/Serene Texas Hold Em.py ---
+# cogs/games/Serene_Texas_Hold_Em.py
 
 import discord
 from discord.ext import commands
@@ -15,6 +15,9 @@ import time
 import uuid
 
 from discord.ui import View, Button
+
+# Import the Deck class from mechanics_main.py
+from cogs.mechanics_main import Deck
 
 
 logger = logging.getLogger(__name__)
@@ -35,7 +38,7 @@ async def _get_or_create_game_room_link(guild_id: str, channel_id: str, button_c
     DB_USER = os.getenv("DB_USER")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
     DB_HOST = os.getenv("DB_HOST")
-    GAME_WEB_URL = "https://serenekeks.com/game_room.php"
+    GAME_WEB_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php") # Use environment variable
 
     conn = None
     room_id = button_custom_id
@@ -70,15 +73,34 @@ async def _get_or_create_game_room_link(guild_id: str, channel_id: str, button_c
                 
                 unique_suffix = str(uuid.uuid4())[:8]
                 room_name = f"{chosen_base_name} - {unique_suffix}" # Generate new room name
-                room_type = "Texas Hold 'Em"
+                room_type = "Texas Hold 'Em" # This is the display name
                 player_count = 0
 
+                # Initialize a new deck for the game state
+                new_deck_obj = Deck()
+                new_deck_obj.build()
+                new_deck_obj.shuffle()
+                initial_deck_output = new_deck_obj.to_output_format()
+
+                # Define the initial game state JSON
+                initial_game_state = {
+                    'room_id': room_id,
+                    'game_type': "1", # MODIFIED: Set game_type to string "1" as requested
+                    'current_round': 'pre_game',
+                    'players': [], # No players yet, they will join via the web frontend
+                    'deck': initial_deck_output,
+                    'board_cards': [],
+                    'last_evaluation': None
+                }
+                initial_game_state_json = json.dumps(initial_game_state)
+
+                # Insert initial game_statelongtextutf8mb4_bin
                 await cur.execute(
-                    "INSERT INTO bot_game_rooms (room_name, room_type, guild_id, channel_id, room_id, player_count) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (room_name, room_type, str(guild_id), str(channel_id), button_custom_id, player_count)
+                    "INSERT INTO bot_game_rooms (room_name, room_type, guild_id, channel_id, room_id, player_count, game_statelongtextutf8mb4_bin) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (room_name, room_type, str(guild_id), str(channel_id), button_custom_id, player_count, initial_game_state_json)
                 )
                 room_id = button_custom_id
-                logger.info(f"New game room created: {room_name} with room_id: {room_id}")
+                logger.info(f"New game room created: {room_name} with room_id: {room_id} and initial game state.")
 
             query_params = {
                 'room_id': room_id,
@@ -97,7 +119,7 @@ async def _get_or_create_game_room_link(guild_id: str, channel_id: str, button_c
             return game_url, room_name # Return both URL and room_name
 
     except Exception as e:
-        logger.error(f"Database error in _get_or_create_game_room_link: {e}")
+        logger.error(f"Database error in _get_or_create_game_room_link: {e}", exc_info=True)
         return "Error generating game link.", None # Return None for room_name on error
     finally:
         if conn:
@@ -190,3 +212,17 @@ async def start(interaction: discord.Interaction, bot):
         ephemeral=False
     )
     logger.info(f"Initial game session button sent for room ID: {game_session_room_id}, room name: {generated_room_name}")
+
+
+class SereneTexasHoldEm(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.command(name="texasholdem")
+    async def texas_hold_em_command(self, ctx: commands.Context):
+        """Starts a new Texas Hold 'Em game session."""
+        # Call the standalone function to initiate the game session
+        await start(ctx.interaction, self.bot) # Pass interaction and bot instance
+
+async def setup(bot):
+    await bot.add_cog(SereneTexasHoldEm(bot))

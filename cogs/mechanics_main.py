@@ -215,7 +215,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     new_deck.shuffle()
                     return {
                         'room_id': room_id,
-                        # 'game_type': '1', # REMOVED: game_type is not part of the dynamic game_state JSON
                         'current_round': 'pre_game',
                         'players': [], # Players will be added/updated by frontend/game logic
                         'deck': new_deck.to_output_format(), # Fresh, shuffled deck output format
@@ -236,7 +235,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 game_state_json = json.dumps(game_state)
-                # MODIFIED: Updating 'bot_game_rooms' table and using 'game_state' column
+                # Updating 'bot_game_rooms' table and using 'game_state' column
                 await cursor.execute(
                     "INSERT INTO bot_game_rooms (room_id, game_state) VALUES (%s, %s) "
                     "ON DUPLICATE KEY UPDATE game_state = %s",
@@ -456,24 +455,53 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             return {"status": "error", "message": f"Server error: {e}"}, 500
 
     async def _add_player_to_game(self, room_id: str, player_data: dict) -> tuple[bool, str]:
-        """Adds a player to the game state for a given room_id."""
+        """
+        Adds a player to the game state for a given room_id, including their chosen seat_id.
+        Ensures a player cannot sit in an occupied seat or sit in multiple seats.
+        """
+        logger.info(f"[_add_player_to_game] Attempting to add player for room {room_id} with data: {player_data}")
         game_state = await self._load_game_state(room_id)
         players = game_state.get('players', [])
+        logger.info(f"[_add_player_to_game] Current players in game state: {players}")
+        
+        player_discord_id = player_data['discord_id']
+        player_name = player_data['name']
+        seat_id = player_data.get('seat_id') # Get the seat_id from player_data
 
-        # Check if player already exists
-        if any(p['discord_id'] == player_data['discord_id'] for p in players):
-            return False, "Player already in this game."
+        if not seat_id:
+            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_name}.")
+            return False, "Seat ID is required to add a player."
 
-        # Add new player, ensuring hand is empty initially
+        # Check if player already exists and is seated
+        existing_player = next((p for p in players if p['discord_id'] == player_discord_id), None)
+        if existing_player:
+            logger.info(f"[_add_player_to_game] Player {player_name} ({player_discord_id}) already exists in game state.")
+            # Ensure 'seat_id' exists in existing_player before comparing
+            if existing_player.get('seat_id') == seat_id:
+                logger.info(f"[_add_player_to_game] Player {player_name} already in seat {seat_id}.")
+                return False, f"Player {player_name} is already in seat {seat_id}."
+            else:
+                logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id', 'an unknown seat')}.")
+                return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first."
+
+        # Check if the target seat is already occupied by *any* player
+        if any(p.get('seat_id') == seat_id for p in players):
+            logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
+            return False, f"Seat {seat_id} is already occupied by another player."
+
+        # Add new player with seat_id, ensuring hand is empty initially
         new_player = {
-            'discord_id': player_data['discord_id'],
-            'name': player_data['name'],
-            'hand': []
+            'discord_id': player_discord_id,
+            'name': player_name,
+            'hand': [],
+            'seat_id': seat_id # Store the chosen seat ID
         }
         players.append(new_player)
         game_state['players'] = players
         
+        logger.info(f"[_add_player_to_game] New player {player_name} added to game state, saving...")
         await self._save_game_state(room_id, game_state)
+        logger.info(f"[_add_player_to_game] Player {player_name} added to seat {seat_id} in room {room_id}. State saved.")
         return True, "Player added successfully."
 
 

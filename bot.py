@@ -506,29 +506,36 @@ async def hourly_db_check():
 async def load_cogs():
     if not os.path.exists("cogs"):
         os.makedirs("cogs")
-    # Load cogs directly in the 'cogs' directory
-    for filename in os.listdir("cogs"):
-        if filename.endswith(".py") and filename != "__init__.py":
-            try:
-                await bot.load_extension(f"cogs.{filename[:-3]}")
-                logger.info(f"Loaded cog {filename}")
-            except Exception as e:
-                logger.error(f"Failed to load cog {filename}: {e}")
-    # Load cogs from subdirectories within 'cogs'
+
+    # List of cogs to load in a specific order (dependencies first)
+    # This assumes mechanics_main.py is directly in the cogs/ directory
+    ordered_cogs = ["mechanics_main"]
+    loaded_cogs_set = set()
+
+    # First, load explicitly ordered cogs
+    for cog_name in ordered_cogs:
+        try:
+            full_module_name = f"cogs.{cog_name}"
+            await bot.load_extension(full_module_name)
+            logger.info(f"Loaded prioritized cog {full_module_name}")
+            loaded_cogs_set.add(full_module_name)
+        except Exception as e:
+            logger.error(f"Failed to load prioritized cog {full_module_name}: {e}")
+
+    # Then, load remaining cogs (including those in subdirectories)
     for root, dirs, files in os.walk("cogs"):
-        for dir_name in dirs:
-            if dir_name != "__pycache__":
-                for filename in os.listdir(os.path.join(root, dir_name)):
-                    if filename.endswith(".py") and filename != "__init__.py":
-                        try:
-                            # Construct the full path for loading (e.g., cogs.games.Serene_Texas_Hold_Em)
-                            # Get relative path from 'cogs' directory
-                            relative_path_from_cogs = os.path.relpath(os.path.join(root, dir_name, filename), start="cogs").replace(os.sep, '.')
-                            full_module_name = f"cogs.{relative_path_from_cogs[:-3]}"
-                            await bot.load_extension(full_module_name)
-                            logger.info(f"Loaded cog {full_module_name}")
-                        except Exception as e:
-                            logger.error(f"Failed to load cog {full_module_name}: {e}")
+        for filename in files:
+            if filename.endswith(".py") and filename != "__init__.py":
+                # Calculate the full module path
+                relative_path = os.path.relpath(os.path.join(root, filename), start="cogs")
+                full_module_name = f"cogs.{relative_path[:-3].replace(os.sep, '.')}"
+
+                if full_module_name not in loaded_cogs_set:
+                    try:
+                        await bot.load_extension(full_module_name)
+                        logger.info(f"Loaded cog {full_module_name}")
+                    except Exception as e:
+                        logger.error(f"Failed to load cog {full_module_name}: {e}")
 
 
 async def main():
@@ -540,4 +547,3 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
-

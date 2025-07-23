@@ -137,7 +137,7 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
                 return
 
             # Decode rules_json_bytes to string
-            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
+            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_str
             logger.debug(f"post_and_save_embed: Decoded rules_json_str for guild {guild_id}: {rules_json_str[:200]}...") # Log first 200 chars
             logger.debug(f"post_and_save_embed: Type of rules_json_str: {type(rules_json_str)}")
 
@@ -516,9 +516,17 @@ async def load_cogs():
     for cog_name in ordered_cogs:
         try:
             full_module_name = f"cogs.{cog_name}"
-            await bot.load_extension(full_module_name)
-            logger.info(f"Loaded prioritized cog {full_module_name}")
-            loaded_cogs_set.add(full_module_name)
+            # Check if the module has a setup function before attempting to load as a cog
+            # This prevents errors for utility files like game_models.py that are not cogs
+            module = __import__(full_module_name, fromlist=['setup'])
+            if hasattr(module, 'setup') and callable(module.setup):
+                await bot.load_extension(full_module_name)
+                logger.info(f"Loaded prioritized cog {full_module_name}")
+                loaded_cogs_set.add(full_module_name)
+            else:
+                logger.warning(f"Skipping module {full_module_name}: No 'setup' function found, not a Discord cog.")
+        except ModuleNotFoundError:
+            logger.error(f"Prioritized cog {full_module_name} not found.")
         except Exception as e:
             logger.error(f"Failed to load prioritized cog {full_module_name}: {e}")
 
@@ -541,8 +549,15 @@ async def load_cogs():
 
                 if full_module_name not in loaded_cogs_set:
                     try:
-                        await bot.load_extension(full_module_name)
-                        logger.info(f"Loaded cog {full_module_name}")
+                        # Check if the module has a setup function before attempting to load as a cog
+                        module = __import__(full_module_name, fromlist=['setup'])
+                        if hasattr(module, 'setup') and callable(module.setup):
+                            await bot.load_extension(full_module_name)
+                            logger.info(f"Loaded cog {full_module_name}")
+                        else:
+                            logger.info(f"Skipping module {full_module_name}: No 'setup' function found, not a Discord cog.")
+                    except ModuleNotFoundError:
+                        logger.warning(f"Cog module {full_module_name} not found, skipping.")
                     except Exception as e:
                         logger.error(f"Failed to load cog {full_module_name}: {e}")
 

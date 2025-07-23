@@ -85,7 +85,7 @@ async def _get_or_create_game_room_link(guild_id: str, channel_id: str, button_c
                 # Define the initial game state JSON
                 initial_game_state = {
                     'room_id': room_id,
-                    'game_type': "1", # MODIFIED: Set game_type to string "1" as requested
+                    'game_type': "1", # Set game_type to string "1" as requested
                     'current_round': 'pre_game',
                     'players': [], # No players yet, they will join via the web frontend
                     'deck': initial_deck_output,
@@ -94,9 +94,10 @@ async def _get_or_create_game_room_link(guild_id: str, channel_id: str, button_c
                 }
                 initial_game_state_json = json.dumps(initial_game_state)
 
-                # Insert initial game_statelongtextutf8mb4_bin
+                # Insert initial game_state
+                # MODIFIED: Corrected column name from 'game_statelongtextutf8mb4_bin' to 'game_state'
                 await cur.execute(
-                    "INSERT INTO bot_game_rooms (room_name, room_type, guild_id, channel_id, room_id, player_count, game_statelongtextutf8mb4_bin) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO bot_game_rooms (room_name, room_type, guild_id, channel_id, room_id, player_count, game_state) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     (room_name, room_type, str(guild_id), str(channel_id), button_custom_id, player_count, initial_game_state_json)
                 )
                 room_id = button_custom_id

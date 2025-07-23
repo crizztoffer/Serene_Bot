@@ -1,510 +1,542 @@
-# cogs/mechanics_main.py
-import logging
-import random
+import discord
+from discord.ext import commands, tasks
+from discord import app_commands
+import os
+from dotenv import load_dotenv
+import aiomysql
 import json
-import os # Still imported, but primarily for initial setup/fallback if needed
-import aiomysql # For database interaction
+import logging
+import asyncio # Import asyncio for running web server in a separate task
+from aiohttp import web # Import aiohttp for the web server
+import aiohttp # Import aiohttp for making webhooks (used by mechanics_main)
 
-# Removed discord.ext.commands as this cog will not use Discord functionality directly
-# It will still be loaded as a cog by bot.py, but its internal logic is now decoupled.
+# Load env vars
+load_dotenv()
 
+TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
+# NEW: Environment variables for game web URL and webhook URL
+GAME_WEB_URL = os.getenv("GAME_WEB_URL", "[https://serenekeks.com/game_room.php](https://serenekeks.com/game_room.php)")
+GAME_WEBHOOK_URL = os.getenv("GAME_WEB_URL", "[https://serenekeks.com/game_update_webhook.php](https://serenekeks.com/game_update_webhook.php)")
+
+
+# Define the BOT_ENTRY key for validation
+BOT_ENTRY = os.getenv("BOT_ENTRY")
+
+BOT_PREFIX = "!"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+intents.presences = True
+
+bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+
+# Add /serene group BEFORE cog loading
+serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
+bot.tree.add_command(serene_group)
+
+# Logging setup
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Card and Deck Classes ---
-class Card:
-    def __init__(self, suit, rank):
-        self.suit = suit
-        self.rank = rank # e.g., "2", "3", ..., "0", "J", "Q", "K", "A"
+# DB methods
+async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        logger.error("Missing DB credentials.")
+        return
 
-    def __str__(self):
-        # This is the two-character code for display/transfer
-        return f"{self.rank}{self.suit[0].upper()}"
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            (count,) = await cursor.fetchone()
+            if count == 0:
+                initial_json_data = json.dumps({"warnings": {}})
+                await cursor.execute(
+                    "INSERT INTO discord_users (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
+                    (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
+                )
+                logger.info(f"Added new user '{user_name}' to DB.")
+    except Exception as e:
+        logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
+    finally:
+        if conn:
+            conn.close() # Use conn.close() for aiomysql connections
 
-    def to_output_format(self):
-        """Returns the card in the desired two-character output format."""
-        return str(self)
+bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
-    @staticmethod
-    def from_output_format(card_str: str):
-        """Reconstructs a Card object from its two-character string format."""
-        if len(card_str) < 2:
-            raise ValueError(f"Invalid card string format: {card_str}")
-        
-        rank_char = card_str[:-1]
-        suit_char = card_str[-1].lower()
+async def load_flag_reasons():
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        logger.error("Missing DB credentials, cannot load flag reasons.")
+        bot.flag_reasons = []
+        return
 
-        # Map suit character back to full suit name
-        suit_map = {'h': 'Hearts', 'd': 'Diamonds', 'c': 'Clubs', 's': 'Spades'}
-        suit = suit_map.get(suit_char)
-        if not suit:
-            raise ValueError(f"Invalid suit character: {suit_char} in {card_str}")
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT reason FROM rule_flagging")
+            rows = await cursor.fetchall()
+            logger.info(f"DB rows fetched: {rows}")
+            bot.flag_reasons = [row[0] for row in rows]
+            logger.info(f"Loaded flag reasons: {bot.flag_reasons}")
+    except Exception as e:
+        logger.error(f"Failed to load flag reasons: {e}")
+        bot.flag_reasons = []
+    finally:
+        if conn:
+            conn.close() # Use conn.close() for aiomysql connections
 
-        return Card(suit, rank_char)
-
-class Deck:
-    def __init__(self, cards_data=None):
-        """
-        Initializes a Deck. If 'cards_data' is provided (from a serialized state,
-        expected as a list of two-character strings), it reconstructs the deck.
-        Otherwise, it builds a new one.
-        """
-        if cards_data is None:
-            self.cards = []
-            self.build()
-        else:
-            # Reconstruct Card objects from their two-character string representation
-            self.cards = [Card.from_output_format(c_str) for c_str in cards_data]
-
-    def build(self):
-        """Builds a standard 52-card deck."""
-        suits = ["Hearts", "Diamonds", "Clubs", "Spades"]
-        # "10" is represented as "0" as per user's requirement for 2-character generation
-        ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "0", "J", "Q", "K", "A"]
-        self.cards = [Card(suit, rank) for suit in suits for rank in ranks]
-
-    def shuffle(self):
-        """Shuffles the deck."""
-        random.shuffle(self.cards)
-
-    def deal_card(self):
-        """Deals a single card from the top of the deck."""
-        if not self.cards:
-            logger.warning("Deck is empty. Cannot deal more cards.")
-            return None
-        return self.cards.pop()
-
-    def to_output_format(self):
-        """Converts the deck to a list of two-character strings for serialization."""
-        return [card.to_output_format() for card in self.cards]
-
-# --- Texas Hold'em Hand Evaluation Logic (Simplified Placeholder) ---
-def get_rank_value(rank):
-    """Returns numerical value for poker ranks for comparison."""
-    if rank.isdigit():
-        if rank == '0': return 10
-        return int(rank)
-    elif rank == 'J': return 11
-    elif rank == 'Q': return 12
-    elif rank == 'K': return 13
-    elif rank == 'A': return 14
-    return 0
-
-def evaluate_poker_hand(cards):
+async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
     """
-    Evaluates a 7-card poker hand (5 community + 2 hole) and returns its type and value.
-    This is a very simplified placeholder and DOES NOT correctly implement full poker rules.
+    Helper function to post a new Discord embed and save its details to bot_messages table.
+    Expects rules_json_bytes to be bytes, will decode it.
     """
-    if len(cards) < 5:
-        return "Not enough cards", 0
-
-    processed_cards = []
-    for card in cards:
-        processed_cards.append((get_rank_value(card.rank), card.suit[0].upper()))
-
-    suit_groups = {}
-    for r_val, suit_char in processed_cards:
-        suit_groups.setdefault(suit_char, []).append(r_val)
-    for suit_char, ranks_in_suit in suit_groups.items():
-        if len(ranks_in_suit) >= 5:
-            return "Flush", max(ranks_in_suit)
-
-    unique_ranks = sorted(list(set([c[0] for c in processed_cards])), reverse=True)
-    if 14 in unique_ranks and 2 in unique_ranks and 3 in unique_ranks and 4 in unique_ranks and 5 in unique_ranks:
-        return "Straight", 5
-
-    for i in range(len(unique_ranks) - 4):
-        is_straight = True
-        for j in range(4):
-            if unique_ranks[i+j] - unique_ranks[i+j+1] != 1:
-                is_straight = False
-                break
-        if is_straight:
-            return "Straight", unique_ranks[i]
-
-    rank_counts = {}
-    for rank_val, _ in processed_cards:
-        rank_counts[rank_val] = rank_counts.get(rank_val, 0) + 1
-
-    quads = []
-    trips = []
-    pairs = []
-    singles = []
-
-    for rank_val, count in rank_counts.items():
-        if count == 4: quads.append(rank_val)
-        elif count == 3: trips.append(rank_val)
-        elif count == 2: pairs.append(rank_val)
-        else: singles.append(rank_val)
-
-    quads.sort(reverse=True)
-    trips.sort(reverse=True)
-    pairs.sort(reverse=True)
-    singles.sort(reverse=True)
-
-    if quads:
-        return "Four of a Kind", quads[0]
-    if trips and pairs:
-        return "Full House", trips[0]
-    if trips:
-        return "Three of a Kind", trips[0]
-    if len(pairs) >= 2:
-        return "Two Pair", pairs[0]
-    if pairs:
-        return "One Pair", pairs[0]
-    
-    return "High Card", processed_cards[0][0]
-
-
-# Reverted to commands.Cog structure to be loadable by bot.py
-from discord.ext import commands 
-
-class MechanicsMain(commands.Cog, name="MechanicsMain"):
-    def __init__(self, bot):
-        self.bot = bot # Bot instance is passed but not used by this pure dealer for Discord comms
-        logger.info("MechanicsMain (backend state management) initialized as a Discord Cog.")
-        
-        # Database credentials - NOW using credentials assigned to bot object
-        # These are set in bot.py's on_ready event.
-        self.db_user = self.bot.db_user
-        self.db_password = self.bot.db_password
-        self.db_host = self.bot.db_host
-        self.db_name = "serene_users" # Assuming this is the database name
-
-    async def cog_load(self):
-        logger.info("MechanicsMain cog loaded successfully.")
-
-    async def cog_unload(self):
-        logger.info("MechanicsMain cog unloaded.")
-
-    async def _get_db_connection(self):
-        """Helper to get a database connection."""
-        if not all([self.db_user, self.db_password, self.db_host, self.db_name]):
-            logger.error("Missing DB credentials for MechanicsMain. Check bot.py's on_ready.")
-            raise ConnectionError("Database credentials not configured or not assigned to bot object.")
-        return await aiomysql.connect(
-            host=self.db_host,
-            user=self.db_user,
-            password=self.db_password,
-            db=self.db_name,
+    conn = None # Initialize conn to None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
             charset='utf8mb4',
             autocommit=True,
             cursorclass=aiomysql.cursors.DictCursor
         )
+        async with conn.cursor() as cursor:
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                logger.warning(f"Bot not in guild {guild_id}. Cannot post rules embed.")
+                return
 
-    async def _load_game_state(self, room_id: str) -> dict:
-        """Loads the game state for a given room_id from the database."""
-        conn = None
-        try:
-            conn = await self._get_db_connection()
+            rules_channel = guild.get_channel(int(rules_channel_id))
+            if not rules_channel:
+                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
+                return
+
+            # Decode rules_json_bytes to string
+            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
+            logger.debug(f"post_and_save_embed: Decoded rules_json_str for guild {guild_id}: {rules_json_str[:200]}...") # Log first 200 chars
+            logger.debug(f"post_and_save_embed: Type of rules_json_str: {type(rules_json_str)}")
+
+
+            try:
+                embed_data_list = json.loads(rules_json_str)
+                if not isinstance(embed_data_list, list) or not embed_data_list:
+                    raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
+                embed_data = embed_data_list[0]
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
+                return
+
+            new_embed = discord.Embed.from_dict(embed_data)
+            sent_message = await rules_channel.send(embed=new_embed)
+            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
+
+            await cursor.execute(
+                "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
+                (str(guild_id), rules_json_str, str(sent_message.id))
+            )
+            logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
+
+    except discord.errors.Forbidden:
+        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
+    except Exception as e:
+        logger.error(f"Error posting and saving embed for guild {guild_id}: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+
+# --- Web Server Setup ---
+
+# CORS headers for preflight and actual requests
+CORS_HEADERS = {
+    'Access-Control-Allow-Origin': '[https://serenekeks.com](https://serenekeks.com)', # Replace with your actual domain
+    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type',
+    'Access-Control-Max-Age': '86400' # Cache preflight for 24 hours
+}
+
+async def cors_preflight_handler(request):
+    """Handles CORS OPTIONS preflight requests."""
+    return web.Response(status=200, headers=CORS_HEADERS)
+
+async def settings_saved_handler(request):
+    """
+    Handles POST requests to /settings_saved endpoint.
+    Expects a JSON body with 'guild_id' and 'bot_entry'.
+    """
+    conn = None # Initialize conn to None
+    try:
+        data = await request.json()
+        guild_id = data.get('guild_id')
+        bot_entry = data.get('bot_entry')
+        action = data.get('action')
+
+        if bot_entry == BOT_ENTRY:
+            logger.info(f"Received signal: '{action}' for guild ID: {guild_id}")
+
+            # Fetch settings from the database (bot_guild_settings)
+            if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+                logger.error("Missing DB credentials for fetching settings.")
+                return web.Response(text="Internal Server Error: DB credentials missing", status=500, headers=CORS_HEADERS)
+
+            conn = await aiomysql.connect(
+                host=DB_HOST,
+                user=DB_USER,
+                password=DB_PASSWORD,
+                db="serene_users", # Assuming 'serene_users' is the database where 'bot_guild_settings' and 'bot_messages' tables reside
+                charset='utf8mb4',
+                autocommit=True,
+                cursorclass=aiomysql.cursors.DictCursor # To get results as dictionaries
+            )
             async with conn.cursor() as cursor:
-                # Querying 'bot_game_rooms' table and using 'game_state' column
+                # 1. Get the rules from bot_guild_settings
                 await cursor.execute(
-                    "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
-                    (room_id,)
+                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
+                    (str(guild_id),)
                 )
-                result = await cursor.fetchone()
-                if result and result['game_state']: # Accessing by 'game_state'
-                    # Decode the JSON string from the database
-                    return json.loads(result['game_state'])
+                settings_row = await cursor.fetchone()
+
+                if not settings_row:
+                    logger.warning(f"No settings found for guild ID: {guild_id} in bot_guild_settings.")
+                    return web.Response(text="No settings found for guild", status=404, headers=CORS_HEADERS)
+
+                new_rules_json_bytes = settings_row.get('rules')
+                rules_channel_id = settings_row.get('rules_channel')
+
+                if not new_rules_json_bytes or not rules_channel_id:
+                    logger.warning(f"Missing 'rules' JSON or 'rules_channel' for guild ID: {guild_id}. Cannot process embed.")
+                    return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
+
+                # Decode new_rules_json from bytes to string
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_str
+                logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
+                logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
+
+
+                # Parse the new rules JSON
+                try:
+                    # Discord API expects an array of embeds, usually just one
+                    embed_data_list = json.loads(new_rules_json_str)
+                    if not isinstance(embed_data_list, list) or not embed_data_list:
+                        raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
+                    embed_data = embed_data_list[0] # Take the first embed
+                except (json.JSONDecodeError, ValueError) as e:
+                    logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
+                    return web.Response(text="Invalid rules JSON format", status=400, headers=CORS_HEADERS)
+
+                # 2. Check bot_messages table
+                await cursor.execute(
+                    "SELECT message, message_id FROM bot_messages WHERE guild_id = %s",
+                    (str(guild_id),)
+                )
+                bot_messages_row = await cursor.fetchone()
+
+                guild = bot.get_guild(int(guild_id))
+                if not guild:
+                    logger.error(f"Bot is not in guild with ID: {guild_id}")
+                    return web.Response(text="Bot not in specified guild", status=404, headers=CORS_HEADERS)
+
+                rules_channel = guild.get_channel(int(rules_channel_id))
+                if not rules_channel:
+                    logger.error(f"Rules channel with ID {rules_channel_id} not found in guild {guild_id}.")
+                    return web.Response(text="Rules channel not found", status=404, headers=CORS_HEADERS)
+
+                if bot_messages_row:
+                    # Row exists, compare messages
+                    existing_message_json_bytes = bot_messages_row.get('message')
+                    existing_message_id = bot_messages_row.get('message_id')
+
+                    # Decode existing_message_json from bytes to string
+                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_str
+                    logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...") # Log first 200 chars
+                    logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
+
+
+                    if existing_message_json_str != new_rules_json_str:
+                        logger.info(f"Rules content changed for guild {guild_id}. Attempting to update message.")
+                        try:
+                            # Fetch the existing message
+                            message_to_edit = await rules_channel.fetch_message(int(existing_message_id))
+                            # Construct new embed
+                            new_embed = discord.Embed.from_dict(embed_data)
+                            await message_to_edit.edit(embed=new_embed)
+                            logger.info(f"Successfully updated Discord message {existing_message_id} in channel {rules_channel_id} for guild {guild_id}.")
+
+                            # Update bot_messages table with the new JSON
+                            await cursor.execute(
+                                "UPDATE bot_messages SET message = %s WHERE guild_id = %s",
+                                (new_rules_json_str, str(guild_id))
+                            )
+                            logger.info(f"Updated bot_messages table for guild {guild_id}.")
+                        except discord.errors.NotFound:
+                            logger.warning(f"Message {existing_message_id} not found in channel {rules_channel_id}. Re-posting new message.")
+                            # Message not found, proceed to post new message
+                            await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id) # Reuse helper
+                        except discord.errors.Forbidden:
+                            logger.error(f"Bot lacks permissions to edit/send messages in channel {rules_channel_id} for guild {guild_id}.")
+                            return web.Response(text="Bot lacks Discord permissions", status=403, headers=CORS_HEADERS)
+                        except Exception as discord_e:
+                            logger.error(f"Error interacting with Discord API for guild {guild_id}: {discord_e}")
+                            return web.Response(text="Discord API error", status=500, headers=CORS_HEADERS)
+                    else:
+                        logger.info(f"Rules content is identical for guild {guild_id}. No update needed.")
                 else:
-                    logger.warning(f"No existing game state found for room_id: {room_id} in bot_game_rooms. Initializing new state.")
-                    # Return a basic initial state if not found
-                    # Ensure a new deck is built and shuffled correctly for the initial state
-                    new_deck = Deck()
-                    new_deck.build()
-                    new_deck.shuffle()
-                    return {
-                        'room_id': room_id,
-                        'current_round': 'pre_game',
-                        'players': [], # Players will be added/updated by frontend/game logic
-                        'deck': new_deck.to_output_format(), # Fresh, shuffled deck output format
-                        'board_cards': [],
-                        'last_evaluation': None
-                    }
-        except Exception as e:
-            logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
-            raise # Re-raise to be caught by the handler
-        finally:
-            if conn:
-                conn.close()
+                    # No row exists in bot_messages, post new embed
+                    logger.info(f"No existing bot_messages entry for guild {guild_id}. Posting new embed.")
+                    await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id) # Reuse helper
 
-    async def _save_game_state(self, room_id: str, game_state: dict):
-        """Saves the game state for a given room_id to the database."""
-        conn = None
+            return web.Response(text="Signal received and settings processed", status=200, headers=CORS_HEADERS)
+        else:
+            logger.warning(f"Unauthorized access attempt to /settings_saved. Invalid BOT_ENTRY: {bot_entry}")
+            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
+    except Exception as e:
+        logger.error(f"Overall error in settings_saved_handler for guild {guild_id}: {e}", exc_info=True)
+        return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
+    finally:
+        if conn:
+            conn.close()
+
+# NEW: Centralized game action handler in bot.py
+async def game_action_route_handler(request):
+    """
+    Receives web requests for game actions and dispatches them to the MechanicsMain cog.
+    """
+    try:
+        data = await request.json()
+        bot_entry = data.get('bot_entry')
+
+        if bot_entry != BOT_ENTRY:
+            logger.warning(f"Unauthorized access attempt to /game_action. Invalid BOT_ENTRY: {bot_entry}")
+            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
+
+        # Get the MechanicsMain cog
+        mechanics_cog = bot.get_cog('MechanicsMain')
+        if not mechanics_cog:
+            logger.error("MechanicsMain cog not loaded or accessible for game_action_route_handler.")
+            return web.Response(text="Internal Server Error: Game mechanics not available", status=500, headers=CORS_HEADERS)
+
+        # Delegate the actual processing to the cog's method
+        response_data, status_code = await mechanics_cog.handle_web_game_action(
+            data, GAME_WEBHOOK_URL # Pass data and the webhook URL
+        )
+        return web.json_response(response_data, status=status_code, headers=CORS_HEADERS)
+
+    except json.JSONDecodeError:
+        logger.error("Received malformed JSON for game_action_route_handler.")
+        return web.Response(text="Bad Request: Invalid JSON", status=400, headers=CORS_HEADERS)
+    except Exception as e:
+        logger.error(f"Overall error in game_action_route_handler: {e}", exc_info=True)
+        return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
+
+
+async def start_web_server():
+    """Starts the aiohttp web server."""
+    app = web.Application()
+    # Add OPTIONS handler for CORS preflight
+    app.router.add_options('/settings_saved', cors_preflight_handler)
+    app.router.add_post('/settings_saved', settings_saved_handler)
+
+    # NEW: Add the game action endpoint, pointing to our new dispatcher
+    app.router.add_options('/game_action', cors_preflight_handler)
+    app.router.add_post('/game_action', game_action_route_handler)
+
+    port = int(os.getenv("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', port) # Listen on all interfaces
+    await site.start()
+    logger.info(f"Web server started on [http://0.0.0.0](http://0.0.0.0):{port}")
+
+@bot.event
+async def on_ready():
+    logger.info(f"Logged in as {bot.user}.")
+
+    # Load flag reasons before loading cogs
+    await load_flag_reasons()
+
+    # Assign DB credentials for use in modules like flag.py
+    bot.db_user = DB_USER
+    bot.db_password = DB_PASSWORD
+    bot.db_host = DB_HOST
+
+    # Load all cogs
+    await load_cogs()
+
+    # Global sync (optional, helpful to clear cache)
+    try:
+        await bot.tree.sync()
+        logger.info("✅ Globally synced all commands")
+    except Exception as e:
+        logger.error(f"Global sync failed: {e}")
+
+    # Force-sync commands per guild
+    for guild in bot.guilds:
         try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                game_state_json = json.dumps(game_state)
-                # Updating 'bot_game_rooms' table and using 'game_state' column
+            await bot.tree.sync(guild=guild)
+            logger.info(f"✅ Resynced commands for guild: {guild.name} ({guild.id})")
+        except Exception as e:
+            logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
+
+    # Ensure all users are in DB
+    for guild in bot.guilds:
+        for member in guild.members:
+            if not member.bot:
+                await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
+
+    # --- New: Check and post rules embed on startup if missing ---
+    conn_on_ready = None
+    try:
+        conn_on_ready = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True,
+            cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn_on_ready.cursor() as cursor:
+            for guild in bot.guilds:
+                # 1. Check bot_guild_settings for this guild
                 await cursor.execute(
-                    "INSERT INTO bot_game_rooms (room_id, game_state) VALUES (%s, %s) "
-                    "ON DUPLICATE KEY UPDATE game_state = %s",
-                    (room_id, game_state_json, game_state_json)
+                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
+                    (str(guild.id),)
                 )
-                logger.info(f"Game state saved for room_id: {room_id} in bot_game_rooms.")
-        except Exception as e:
-            logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
-            raise # Re-raise to be caught by the handler
-        finally:
-            if conn:
-                conn.close()
+                settings_row = await cursor.fetchone()
 
-    async def deal_hole_cards(self, room_id: str) -> tuple[bool, str]:
-        """Deals two hole cards to each player for the specified room_id."""
-        game_state = await self._load_game_state(room_id)
-        
-        # Ensure players list is not empty for dealing
-        if not game_state.get('players'):
-            return False, "No players in the game to deal cards."
+                if settings_row:
+                    # 2. Check bot_messages for this guild
+                    await cursor.execute(
+                        "SELECT message_id FROM bot_messages WHERE guild_id = %s",
+                        (str(guild.id),)
+                    )
+                    bot_messages_row = await cursor.fetchone()
 
-        deck = Deck(game_state.get('deck', []))
-        # Shuffle only if it's a new game or if the deck hasn't been shuffled yet for this round
-        # For simplicity, we'll re-shuffle here if it's 'pre_game'
-        if game_state['current_round'] == 'pre_game' or not deck.cards:
-            deck.build() # Rebuild a full deck
-            deck.shuffle()
-            logger.info(f"Deck rebuilt and shuffled for room {room_id}.")
-        
-        players_data = game_state.get('players', [])
+                    if not bot_messages_row:
+                        # Case: Entry in bot_guild_settings but not in bot_messages
+                        new_rules_json_bytes = settings_row.get('rules')
+                        rules_channel_id = settings_row.get('rules_channel')
 
-        for player in players_data:
-            player['hand'] = [] # Clear existing hands
-            card1 = deck.deal_card()
-            card2 = deck.deal_card()
-            if card1 and card2:
-                player['hand'].append(card1.to_output_format())
-                player['hand'].append(card2.to_output_format())
-            else:
-                logger.error("Not enough cards to deal hole cards.")
-                return False, "Not enough cards."
+                        if new_rules_json_bytes and rules_channel_id:
+                            logger.info(f"Detected missing rules embed for guild {guild.id} on startup. Attempting to post.")
+                            # Call the helper function to post and save the embed
+                            await post_and_save_embed(str(guild.id), new_rules_json_bytes, rules_channel_id)
+                        else:
+                            logger.warning(f"Guild {guild.id} has settings but missing rules JSON or channel ID. Skipping rules embed post on startup.")
+                # else: No settings for this guild, nothing to do.
+    except Exception as e:
+        logger.error(f"Error during startup rules embed check: {e}", exc_info=True)
+    finally:
+        if conn_on_ready:
+            conn_on_ready.close()
+    # --- End new section ---
 
-        game_state['deck'] = deck.to_output_format()
-        game_state['players'] = players_data
-        game_state['board_cards'] = [] # Ensure board is empty for a new deal
-        game_state['current_round'] = "pre_flop"
+    # Start background DB check
+    hourly_db_check.start()
 
-        await self._save_game_state(room_id, game_state)
-        return True, "Hole cards dealt."
-
-    async def deal_flop(self, room_id: str) -> tuple[bool, str]:
-        """Deals the three community cards (flop) for the specified room_id."""
-        game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'pre_flop':
-            return False, f"Cannot deal flop. Current round is {game_state['current_round']}."
-
-        deck = Deck(game_state.get('deck', []))
-        board_cards_output = game_state.get('board_cards', [])
-
-        deck.deal_card() # Burn a card
-
-        flop_cards_obj = []
-        for _ in range(3):
-            card = deck.deal_card()
-            if card:
-                flop_cards_obj.append(card)
-                board_cards_output.append(card.to_output_format())
-            else:
-                return False, "Not enough cards for flop."
-
-        game_state['deck'] = deck.to_output_format()
-        game_state['board_cards'] = board_cards_output
-        game_state['current_round'] = "flop"
-
-        await self._save_game_state(room_id, game_state)
-        return True, "Flop dealt."
-
-    async def deal_turn(self, room_id: str) -> tuple[bool, str]:
-        """Deals the fourth community card (turn) for the specified room_id."""
-        game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'flop':
-            return False, f"Cannot deal turn. Current round is {game_state['current_round']}."
-
-        deck = Deck(game_state.get('deck', []))
-        board_cards_output = game_state.get('board_cards', [])
-
-        deck.deal_card() # Burn a card
-
-        turn_card = deck.deal_card()
-        if turn_card:
-            board_cards_output.append(turn_card.to_output_format())
-        else:
-            return False, "Not enough cards for turn."
-
-        game_state['deck'] = deck.to_output_format()
-        game_state['board_cards'] = board_cards_output
-        game_state['current_round'] = "turn"
-
-        await self._save_game_state(room_id, game_state)
-        return True, "Turn dealt."
-
-    async def deal_river(self, room_id: str) -> tuple[bool, str]:
-        """Deals the fifth and final community card (river) for the specified room_id."""
-        game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'turn':
-            return False, f"Cannot deal river. Current round is {game_state['current_round']}."
-
-        deck = Deck(game_state.get('deck', []))
-        board_cards_output = game_state.get('board_cards', [])
-
-        deck.deal_card() # Burn a card
-
-        river_card = deck.deal_card()
-        if river_card:
-            board_cards_output.append(river_card.to_output_format())
-        else:
-            return False, "Not enough cards for river."
-
-        game_state['deck'] = deck.to_output_format()
-        game_state['board_cards'] = board_cards_output
-        game_state['current_round'] = "river"
-
-        await self._save_game_state(room_id, game_state)
-        return True, "River dealt."
-
-    async def evaluate_hands(self, room_id: str) -> tuple[bool, str]:
-        """Evaluates all players' hands against the community cards for the specified room_id."""
-        game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'river':
-            return False, f"Cannot evaluate hands. Current round is {game_state['current_round']}."
-
-        players_data = game_state.get('players', [])
-        board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])]
-
-        if len(board_cards_obj) != 5:
-            logger.error("Board not complete for evaluation.")
-            return False, "Board not complete."
-
-        player_evaluations = []
-        for player_data in players_data:
-            player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])]
-            combined_cards = player_hand_obj + board_cards_obj
-            hand_type, hand_value = evaluate_poker_hand(combined_cards)
-            player_evaluations.append({
-                "discord_id": player_data['discord_id'],
-                "name": player_data['name'],
-                "hand_type": hand_type,
-                "hand_value": hand_value,
-                "hole_cards": [c.to_output_format() for c in player_hand_obj]
-            })
-
-        game_state['current_round'] = "showdown"
-        game_state['last_evaluation'] = player_evaluations
-
-        await self._save_game_state(room_id, game_state)
-        return True, "Hands evaluated."
-
-    # --- Central Web Request Handler for the State-Managing Dealer ---
-    async def handle_web_game_action(self, request_data: dict) -> tuple[dict, int]:
-        """
-        Receives raw request data from the web server (bot.py) and dispatches it
-        to the appropriate game action method. It loads and saves the game state internally.
-
-        Args:
-            request_data (dict): The JSON payload from the web request,
-                                 now containing only room_id, action, etc.
-                                 (NOT the full game_state).
-
-        Returns:
-            tuple: (response_payload: dict, http_status_code: int)
-        """
-        action = request_data.get('action')
-        room_id = request_data.get('room_id')
-        
-        if not all([action, room_id]):
-            logger.error(f"Missing required parameters for handle_web_game_action. Data: {request_data}")
-            return {"status": "error", "message": "Missing room_id or action."}, 400
-
-        logger.info(f"Backend dealer received action: '{action}' for Room ID: {room_id}")
-
-        success = False
-        message = "Unknown action."
-        updated_game_state = None # Will hold the state after action
-
-        try:
-            if action == "deal_hole_cards":
-                success, message = await self.deal_hole_cards(room_id)
-            elif action == "deal_flop":
-                success, message = await self.deal_flop(room_id)
-            elif action == "deal_turn":
-                success, message = await self.deal_turn(room_id)
-            elif action == "deal_river":
-                success, message = await self.deal_river(room_id)
-            elif action == "evaluate_hands":
-                success, message = await self.evaluate_hands(room_id)
-            elif action == "add_player": # New action to add players to a game
-                player_data = request_data.get('player_data')
-                if not player_data or not isinstance(player_data, dict):
-                    return {"status": "error", "message": "Missing or invalid player_data for add_player."}, 400
-                success, message = await self._add_player_to_game(room_id, player_data)
-            elif action == "get_state": # New action to simply get the current state
-                success = True
-                message = "Game state retrieved."
-            else:
-                logger.warning(f"Received unsupported action: {action}")
-                return {"status": "error", "message": "Unsupported action"}, 400
-
-            # After any action, load the latest state to return it
-            if success:
-                updated_game_state = await self._load_game_state(room_id)
-                return updated_game_state, 200
-            else:
-                return {"status": "error", "message": message}, 500
-
-        except Exception as e:
-            logger.error(f"Error processing action '{action}' for room {room_id}: {e}", exc_info=True)
-            return {"status": "error", "message": f"Server error: {e}"}, 500
-
-    async def _add_player_to_game(self, room_id: str, player_data: dict) -> tuple[bool, str]:
-        """
-        Adds a player to the game state for a given room_id, including their chosen seat_id.
-        Ensures a player cannot sit in an occupied seat or sit in multiple seats.
-        """
-        logger.info(f"[_add_player_to_game] Attempting to add player for room {room_id} with data: {player_data}")
-        game_state = await self._load_game_state(room_id)
-        players = game_state.get('players', [])
-        logger.info(f"[_add_player_to_game] Current players in game state: {players}")
-        
-        player_discord_id = player_data['discord_id']
-        player_name = player_data['name']
-        seat_id = player_data.get('seat_id') # Get the seat_id from player_data
-
-        if not seat_id:
-            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_name}.")
-            return False, "Seat ID is required to add a player."
-
-        # Check if player already exists and is seated
-        existing_player = next((p for p in players if p['discord_id'] == player_discord_id), None)
-        if existing_player:
-            logger.info(f"[_add_player_to_game] Player {player_name} ({player_discord_id}) already exists in game state.")
-            # Ensure 'seat_id' exists in existing_player before comparing
-            if existing_player.get('seat_id') == seat_id:
-                logger.info(f"[_add_player_to_game] Player {player_name} already in seat {seat_id}.")
-                return False, f"Player {player_name} is already in seat {seat_id}."
-            else:
-                logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id', 'an unknown seat')}.")
-                return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first."
-
-        # Check if the target seat is already occupied by *any* player
-        if any(p.get('seat_id') == seat_id for p in players):
-            logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
-            return False, f"Seat {seat_id} is already occupied by another player."
-
-        # Add new player with seat_id, ensuring hand is empty initially
-        new_player = {
-            'discord_id': player_discord_id,
-            'name': player_name,
-            'hand': [],
-            'seat_id': seat_id # Store the chosen seat ID
-        }
-        players.append(new_player)
-        game_state['players'] = players
-        
-        logger.info(f"[_add_player_to_game] New player {player_name} added to game state, saving...")
-        await self._save_game_state(room_id, game_state)
-        logger.info(f"[_add_player_to_game] Player {player_name} added to seat {seat_id} in room {room_id}. State saved.")
-        return True, "Player added successfully."
+    # Start the web server in a separate asyncio task
+    bot.loop.create_task(start_web_server())
 
 
-# The setup function is needed for bot.py to load this as a cog.
-async def setup(bot):
-    await bot.add_cog(MechanicsMain(bot))
+@bot.event
+async def on_member_join(member):
+    if not member.bot:
+        await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
+
+@bot.event
+async def on_message(message):
+    if message.author.id != bot.user.id:
+        await bot.process_commands(message)
+
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send("Command not found.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"Missing argument: {error.param.name}.")
+    elif isinstance(error, commands.MissingPermissions):
+        await ctx.send("You lack permissions.")
+    else:
+        logger.error(f"Command error: {error}")
+        await ctx.send(f"Unexpected error: {error}")
+
+@tasks.loop(hours=1)
+async def hourly_db_check():
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        logger.info("DB connection OK.")
+    except Exception as e:
+        logger.error(f"Hourly DB check failed: {e}")
+    finally:
+        if conn:
+            conn.close() # Use conn.close() for aiomysql connections
+
+async def load_cogs():
+    if not os.path.exists("cogs"):
+        os.makedirs("cogs")
+    # Load cogs directly in the 'cogs' directory
+    for filename in os.listdir("cogs"):
+        if filename.endswith(".py") and filename != "__init__.py":
+            try:
+                await bot.load_extension(f"cogs.{filename[:-3]}")
+                logger.info(f"Loaded cog {filename}")
+            except Exception as e:
+                logger.error(f"Failed to load cog {filename}: {e}")
+    # Load cogs from subdirectories within 'cogs'
+    for root, dirs, files in os.walk("cogs"):
+        for dir_name in dirs:
+            if dir_name != "__pycache__":
+                for filename in os.listdir(os.path.join(root, dir_name)):
+                    if filename.endswith(".py") and filename != "__init__.py":
+                        try:
+                            # Construct the full path for loading (e.g., cogs.games.Serene_Texas_Hold_Em)
+                            # Get relative path from 'cogs' directory
+                            relative_path_from_cogs = os.path.relpath(os.path.join(root, dir_name, filename), start="cogs").replace(os.sep, '.')
+                            full_module_name = f"cogs.{relative_path_from_cogs[:-3]}"
+                            await bot.load_extension(full_module_name)
+                            logger.info(f"Loaded cog {full_module_name}")
+                        except Exception as e:
+                            logger.error(f"Failed to load cog {full_module_name}: {e}")
+
+
+async def main():
+    if not TOKEN:
+        logger.error("BOT_TOKEN missing")
+        return
+    await bot.start(TOKEN)
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

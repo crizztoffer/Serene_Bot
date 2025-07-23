@@ -197,15 +197,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                # Querying 'bot_game_rooms' table and using 'game_statelongtextutf8mb4_bin' column
+                # Querying 'bot_game_rooms' table and using 'game_state' column
                 await cursor.execute(
-                    "SELECT game_statelongtextutf8mb4_bin FROM bot_game_rooms WHERE room_id = %s",
+                    "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
                     (room_id,)
                 )
                 result = await cursor.fetchone()
-                if result and result['game_statelongtextutf8mb4_bin']:
+                if result and result['game_state']: # Accessing by 'game_state'
                     # Decode the JSON string from the database
-                    return json.loads(result['game_statelongtextutf8mb4_bin'])
+                    return json.loads(result['game_state'])
                 else:
                     logger.warning(f"No existing game state found for room_id: {room_id} in bot_game_rooms. Initializing new state.")
                     # Return a basic initial state if not found
@@ -215,7 +215,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     new_deck.shuffle()
                     return {
                         'room_id': room_id,
-                        'game_type': 'Texas Hold Em',
+                        # 'game_type': '1', # REMOVED: game_type is not part of the dynamic game_state JSON
                         'current_round': 'pre_game',
                         'players': [], # Players will be added/updated by frontend/game logic
                         'deck': new_deck.to_output_format(), # Fresh, shuffled deck output format
@@ -236,10 +236,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 game_state_json = json.dumps(game_state)
-                # Updating 'bot_game_rooms' table and using 'game_statelongtextutf8mb4_bin' column
+                # MODIFIED: Updating 'bot_game_rooms' table and using 'game_state' column
                 await cursor.execute(
-                    "INSERT INTO bot_game_rooms (room_id, game_statelongtextutf8mb4_bin) VALUES (%s, %s) "
-                    "ON DUPLICATE KEY UPDATE game_statelongtextutf8mb4_bin = %s",
+                    "INSERT INTO bot_game_rooms (room_id, game_state) VALUES (%s, %s) "
+                    "ON DUPLICATE KEY UPDATE game_state = %s",
                     (room_id, game_state_json, game_state_json)
                 )
                 logger.info(f"Game state saved for room_id: {room_id} in bot_game_rooms.")

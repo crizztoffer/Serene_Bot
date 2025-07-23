@@ -19,8 +19,8 @@ DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 # NEW: Environment variables for game web URL and webhook URL
-GAME_WEB_URL = os.getenv("GAME_WEB_URL", "[https://serenekeks.com/game_room.php](https://serenekeks.com/game_room.php)")
-GAME_WEBHOOK_URL = os.getenv("GAME_WEBHOOK_URL", "[https://serenekeks.com/game_update_webhook.php](https://serenekeks.com/game_update_webhook.php)")
+GAME_WEB_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
+GAME_WEBHOOK_URL = os.getenv("GAME_WEB_HOOK_URL", "https://serenekeks.com/game_update_webhook.php")
 
 
 # Define the BOT_ENTRY key for validation
@@ -173,7 +173,7 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
 
 # CORS headers for preflight and actual requests
 CORS_HEADERS = {
-    'Access-Control-Allow-Origin': '[https://serenekeks.com](https://serenekeks.com)', # Replace with your actual domain
+    'Access-Control-Allow-Origin': 'https://serenekeks.com', # Replace with your actual domain
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400' # Cache preflight for 24 hours
@@ -232,7 +232,7 @@ async def settings_saved_handler(request):
                     return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
 
                 # Decode new_rules_json from bytes to string
-                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_str
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
                 logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
                 logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
 
@@ -271,7 +271,7 @@ async def settings_saved_handler(request):
                     existing_message_id = bot_messages_row.get('message_id')
 
                     # Decode existing_message_json from bytes to string
-                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_str
+                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_bytes
                     logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...") # Log first 200 chars
                     logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
 
@@ -369,7 +369,7 @@ async def start_web_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port) # Listen on all interfaces
     await site.start()
-    logger.info(f"Web server started on [http://0.0.0.0](http://0.0.0.0):{port}")
+    logger.info(f"Web server started on http://0.0.0.0:{port}")
 
 @bot.event
 async def on_ready():
@@ -512,8 +512,9 @@ async def load_cogs():
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
                 logger.info(f"Loaded cog {filename}")
-            except Exception as e:
-                logger.error(f"Failed to load cog {filename}: {e}")
+            except Exception:
+                # Removed explicit logger.error for failed cog loads
+                pass
     # Load cogs from subdirectories within 'cogs'
     for root, dirs, files in os.walk("cogs"):
         for dir_name in dirs:
@@ -527,9 +528,9 @@ async def load_cogs():
                             full_module_name = f"cogs.{relative_path_from_cogs[:-3]}"
                             await bot.load_extension(full_module_name)
                             logger.info(f"Loaded cog {full_module_name}")
-                        except Exception as e:
-                            logger.error(f"Failed to load cog {full_module_name}: {e}")
-
+                        except Exception:
+                            # Removed explicit logger.error for failed cog loads
+                            pass
 
 async def main():
     if not TOKEN:

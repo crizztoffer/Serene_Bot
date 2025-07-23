@@ -187,6 +187,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     "ON DUPLICATE KEY UPDATE game_state = %s",
                     (room_id, game_state_json, game_state_json)
                 )
+                await conn.commit() # Explicitly commit the transaction
                 logger.info(f"Game state saved for room_id: {room_id} in bot_game_rooms.")
         except Exception as e:
             logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
@@ -476,6 +477,28 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         
         logger.info(f"[_add_player_to_game] Saving game state for room {room_id} after player update. Players count: {len(game_state['players'])}")
         await self._save_game_state(room_id, game_state)
+
+        # NEW DEBUGGING STEP: Read state directly from DB after saving
+        conn = None
+        try:
+            conn = await self._get_db_connection()
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
+                    (room_id,)
+                )
+                result = await cursor.fetchone()
+                if result and result['game_state']:
+                    loaded_state_after_save = json.loads(result['game_state'])
+                    logger.info(f"[_add_player_to_game] State directly from DB after save: Players count: {len(loaded_state_after_save.get('players', []))}. Full state: {loaded_state_after_save}")
+                else:
+                    logger.warning(f"[_add_player_to_game] No state found in DB immediately after save for room {room_id}.")
+        except Exception as e:
+            logger.error(f"[_add_player_to_game] Error verifying DB state after save: {e}", exc_info=True)
+        finally:
+            if conn:
+                conn.close()
+
         logger.info(f"[_add_player_to_game] Player {player_name} added/updated in seat {seat_id} in room {room_id}. State saved.")
         return True, "Player added successfully."
 

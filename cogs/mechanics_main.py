@@ -123,36 +123,48 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         Loads the game state for a given room_id from the database.
         If not found, initializes a new state, using provided guild_id and channel_id.
+        Ensures guild_id and channel_id are always present in the returned state.
         """
         conn = None
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                # Querying 'bot_game_rooms' table and using 'game_state' column
                 await cursor.execute(
                     "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
                     (room_id,)
                 )
                 result = await cursor.fetchone()
-                if result and result['game_state']: # Accessing by 'game_state'
-                    # Decode the JSON string from the database
-                    return json.loads(result['game_state'])
+                
+                game_state = {}
+                if result and result['game_state']:
+                    game_state = json.loads(result['game_state'])
+                    logger.info(f"Loaded existing game state for room_id: {room_id}.")
                 else:
-                    logger.warning(f"No existing game state found for room_id: {room_id} in bot_game_rooms. Initializing new state.")
-                    # Return a basic initial state if not found
-                    new_deck = Deck() # Use Deck from game_models
+                    logger.warning(f"No existing game state found for room_id: {room_id}. Initializing new state.")
+                    # Initialize with basic structure, including provided guild_id and channel_id
+                    new_deck = Deck()
                     new_deck.build()
                     new_deck.shuffle()
-                    return {
+                    game_state = {
                         'room_id': room_id,
-                        'guild_id': guild_id,   # IMPORTANT: Include guild_id
-                        'channel_id': channel_id, # IMPORTANT: Include channel_id
                         'current_round': 'pre_game',
-                        'players': [], # Players will be added/updated by frontend/game logic
-                        'deck': new_deck.to_output_format(), # Fresh, shuffled deck output format
+                        'players': [],
+                        'deck': new_deck.to_output_format(),
                         'board_cards': [],
                         'last_evaluation': None
                     }
+                
+                # --- IMPORTANT: Ensure guild_id and channel_id are always present ---
+                # If they were missing from the loaded state (e.g., old DB entry)
+                # or if a new state was just initialized, set them from the arguments.
+                if 'guild_id' not in game_state or game_state['guild_id'] is None:
+                    game_state['guild_id'] = guild_id
+                    logger.info(f"Set guild_id to {guild_id} for room {room_id} (was missing/None).")
+                if 'channel_id' not in game_state or game_state['channel_id'] is None:
+                    game_state['channel_id'] = channel_id
+                    logger.info(f"Set channel_id to {channel_id} for room {room_id} (was missing/None).")
+
+                return game_state
         except Exception as e:
             logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
             raise # Re-raise to be caught by the handler
@@ -376,14 +388,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 player_data = request_data.get('player_data')
                 if not player_data or not isinstance(player_data, dict):
                     return {"status": "error", "message": "Missing or invalid player_data for add_player."}, 400
-                success, message = await self._add_player_to_game(room_id, player_data)
+                # Pass guild_id and channel_id to _add_player_to_game if it needs to initialize a new game state
+                success, message = await self._add_player_to_game(room_id, player_data, guild_id, channel_id)
             elif action == "leave_player": # New action to remove a player
                 discord_id = request_data.get('discord_id')
                 if not discord_id:
                     return {"status": "error", "message": "Missing discord_id for leave_player."}, 400
                 success, message = await self._leave_player(room_id, discord_id)
             elif action == "start_new_game": # New action to start a new game
-                success, message = await self._start_new_game(room_id)
+                success, message = await self._start_new_game(room_id, guild_id, channel_id) # Pass guild/channel for new game init
             else:
                 logger.warning(f"Received unsupported action: {action}")
                 return {"status": "error", "message": "Unsupported action"}, 400
@@ -402,13 +415,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.error(f"Error processing action '{action}' for room {room_id}: {e}", exc_info=True)
             return {"status": "error", "message": f"Server error: {e}"}, 500
 
-    async def _add_player_to_game(self, room_id: str, player_data: dict) -> tuple[bool, str]:
+    async def _add_player_to_game(self, room_id: str, player_data: dict, guild_id: str = None, channel_id: str = None) -> tuple[bool, str]:
         """
         Adds a player to the game state for a given room_id, including their chosen seat_id.
         Ensures a player cannot sit in an occupied seat or sit in multiple seats.
         """
         logger.info(f"[_add_player_to_game] Attempting to add player for room {room_id} with data: {player_data}")
-        game_state = await self._load_game_state(room_id, game_state.get('guild_id'), game_state.get('channel_id')) # Pass guild/channel for new state init
+        # Pass guild_id and channel_id to _load_game_state so it can initialize a new state correctly if needed
+        game_state = await self._load_game_state(room_id, guild_id, channel_id) 
         players = game_state.get('players', [])
         logger.info(f"[_add_player_to_game] Current players in game state: {players}")
         
@@ -478,10 +492,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"[_leave_player] Player {discord_id} not found in room {room_id}.")
             return False, "Player not found in this game."
 
-    async def _start_new_game(self, room_id: str) -> tuple[bool, str]:
+    async def _start_new_game(self, room_id: str, guild_id: str = None, channel_id: str = None) -> tuple[bool, str]:
         """Resets the game state to start a new game in the specified room."""
         logger.info(f"[_start_new_game] Starting new game for room {room_id}.")
-        game_state = await self._load_game_state(room_id) # Load current state to preserve guild/channel IDs
+        # Load current state to preserve guild/channel IDs, passing them to _load_game_state
+        game_state = await self._load_game_state(room_id, guild_id, channel_id) 
 
         new_deck = Deck()
         new_deck.build()

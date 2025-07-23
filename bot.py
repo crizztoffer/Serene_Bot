@@ -20,7 +20,7 @@ DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 # NEW: Environment variables for game web URL and webhook URL
 GAME_WEB_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
-GAME_WEBHOOK_URL = os.getenv("GAME_WEB_HOOK_URL", "https://serenekeks.com/game_update_webhook.php")
+GAME_WEBHOOK_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_update_webhook.php")
 
 
 # Define the BOT_ENTRY key for validation
@@ -232,7 +232,7 @@ async def settings_saved_handler(request):
                     return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
 
                 # Decode new_rules_json from bytes to string
-                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_str
                 logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
                 logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
 
@@ -340,9 +340,8 @@ async def game_action_route_handler(request):
             return web.Response(text="Internal Server Error: Game mechanics not available", status=500, headers=CORS_HEADERS)
 
         # Delegate the actual processing to the cog's method
-        # MODIFIED: Removed GAME_WEBHOOK_URL as an argument to handle_web_game_action
         response_data, status_code = await mechanics_cog.handle_web_game_action(
-            data
+            data # Removed GAME_WEBHOOK_URL as it's not used in handle_web_game_action directly
         )
         return web.json_response(response_data, status=status_code, headers=CORS_HEADERS)
 
@@ -383,10 +382,8 @@ async def on_ready():
     bot.db_user = DB_USER
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
-    # Assign GAME_WEBHOOK_URL to bot object so cogs can access it if needed
-    bot.GAME_WEBHOOK_URL = GAME_WEBHOOK_URL
 
-    # Load all cogs
+    # Load all cogs - ENSURE THIS COMPLETES BEFORE STARTING WEB SERVER
     await load_cogs()
 
     # Global sync (optional, helpful to clear cache)
@@ -461,7 +458,7 @@ async def on_ready():
     # Start background DB check
     hourly_db_check.start()
 
-    # Start the web server in a separate asyncio task
+    # Start the web server in a separate asyncio task AFTER cogs are loaded
     bot.loop.create_task(start_web_server())
 
 
@@ -515,9 +512,8 @@ async def load_cogs():
             try:
                 await bot.load_extension(f"cogs.{filename[:-3]}")
                 logger.info(f"Loaded cog {filename}")
-            except Exception:
-                # Removed explicit logger.error for failed cog loads
-                pass
+            except Exception as e:
+                logger.error(f"Failed to load cog {filename}: {e}")
     # Load cogs from subdirectories within 'cogs'
     for root, dirs, files in os.walk("cogs"):
         for dir_name in dirs:
@@ -531,9 +527,9 @@ async def load_cogs():
                             full_module_name = f"cogs.{relative_path_from_cogs[:-3]}"
                             await bot.load_extension(full_module_name)
                             logger.info(f"Loaded cog {full_module_name}")
-                        except Exception:
-                            # Removed explicit logger.error for failed cog loads
-                            pass
+                        except Exception as e:
+                            logger.error(f"Failed to load cog {full_module_name}: {e}")
+
 
 async def main():
     if not TOKEN:
@@ -544,3 +540,4 @@ async def main():
 if __name__ == "__main__":
     import asyncio
     asyncio.run(main())
+

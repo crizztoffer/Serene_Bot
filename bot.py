@@ -530,6 +530,15 @@ async def load_cogs():
                 relative_path = os.path.relpath(os.path.join(root, filename), start="cogs")
                 full_module_name = f"cogs.{relative_path[:-3].replace(os.sep, '.')}"
 
+                # IMPORTANT: Handle invalid Python module names (e.g., spaces)
+                # If a cog file has spaces in its name (like "Serene Texas Hold Em.py"),
+                # it cannot be directly imported as a Python module.
+                # You MUST rename such files to use underscores or camelCase (e.g., "serene_texas_hold_em.py").
+                # This log will help identify such files.
+                if ' ' in full_module_name:
+                    logger.warning(f"Skipping cog '{full_module_name}' due to invalid characters (spaces) in module name. Please rename the file.")
+                    continue
+
                 if full_module_name not in loaded_cogs_set:
                     try:
                         await bot.load_extension(full_module_name)

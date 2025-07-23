@@ -1,7 +1,7 @@
 import logging
 import json
 import aiomysql 
-from discord.ext import commands # Reverted to commands.Cog structure to be loadable by bot.py
+from discord.ext import commands
 
 # Import Card and Deck from the new game_models utility file
 from cogs.utils.game_models import Card, Deck 
@@ -377,6 +377,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if not player_data or not isinstance(player_data, dict):
                     return {"status": "error", "message": "Missing or invalid player_data for add_player."}, 400
                 success, message = await self._add_player_to_game(room_id, player_data)
+            elif action == "leave_player": # New action to remove a player
+                discord_id = request_data.get('discord_id')
+                if not discord_id:
+                    return {"status": "error", "message": "Missing discord_id for leave_player."}, 400
+                success, message = await self._leave_player(room_id, discord_id)
+            elif action == "start_new_game": # New action to start a new game
+                success, message = await self._start_new_game(room_id)
             else:
                 logger.warning(f"Received unsupported action: {action}")
                 return {"status": "error", "message": "Unsupported action"}, 400
@@ -401,7 +408,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         Ensures a player cannot sit in an occupied seat or sit in multiple seats.
         """
         logger.info(f"[_add_player_to_game] Attempting to add player for room {room_id} with data: {player_data}")
-        game_state = await self._load_game_state(room_id) # This will now load with guild_id/channel_id if new
+        game_state = await self._load_game_state(room_id, game_state.get('guild_id'), game_state.get('channel_id')) # Pass guild/channel for new state init
         players = game_state.get('players', [])
         logger.info(f"[_add_player_to_game] Current players in game state: {players}")
         
@@ -422,28 +429,77 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.info(f"[_add_player_to_game] Player {player_name} already in seat {seat_id}.")
                 return False, f"Player {player_name} is already in seat {seat_id}."
             else:
-                logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id', 'an unknown seat')}.")
-                return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first."
+                # If player is already seated in a *different* seat, prevent new seating
+                if existing_player.get('seat_id'):
+                    logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id')}.")
+                    return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first."
+                else:
+                    # This case means player exists but has no seat_id (e.g., from an old state), allow them to take a seat
+                    existing_player['seat_id'] = seat_id
+                    existing_player['name'] = player_name # Update name in case it changed
+                    logger.info(f"[_add_player_to_game] Player {player_name} updated with seat {seat_id}.")
+        else:
+            # Check if the target seat is already occupied by *any* player
+            if any(p.get('seat_id') == seat_id for p in players):
+                logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
+                return False, f"Seat {seat_id} is already occupied by another player."
 
-        # Check if the target seat is already occupied by *any* player
-        if any(p.get('seat_id') == seat_id for p in players):
-            logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
-            return False, f"Seat {seat_id} is already occupied by another player."
+            # Add new player with seat_id, ensuring hand is empty initially
+            new_player = {
+                'discord_id': player_discord_id,
+                'name': player_name,
+                'hand': [],
+                'seat_id': seat_id, # Store the chosen seat ID
+                'avatar_url': player_data.get('avatar_url') # Store avatar URL if provided
+            }
+            players.append(new_player)
+            logger.info(f"[_add_player_to_game] New player {player_name} added to game state.")
 
-        # Add new player with seat_id, ensuring hand is empty initially
-        new_player = {
-            'discord_id': player_discord_id,
-            'name': player_name,
-            'hand': [],
-            'seat_id': seat_id # Store the chosen seat ID
-        }
-        players.append(new_player)
         game_state['players'] = players
         
-        logger.info(f"[_add_player_to_game] New player {player_name} added to game state, saving...")
+        logger.info(f"[_add_player_to_game] Saving game state for room {room_id} after player update.")
         await self._save_game_state(room_id, game_state)
-        logger.info(f"[_add_player_to_game] Player {player_name} added to seat {seat_id} in room {room_id}. State saved.")
+        logger.info(f"[_add_player_to_game] Player {player_name} added/updated in seat {seat_id} in room {room_id}. State saved.")
         return True, "Player added successfully."
+
+    async def _leave_player(self, room_id: str, discord_id: str) -> tuple[bool, str]:
+        """Removes a player from the game state for a given room_id."""
+        logger.info(f"[_leave_player] Attempting to remove player {discord_id} from room {room_id}.")
+        game_state = await self._load_game_state(room_id)
+        
+        initial_player_count = len(game_state.get('players', []))
+        game_state['players'] = [p for p in game_state.get('players', []) if p['discord_id'] != discord_id]
+        
+        if len(game_state['players']) < initial_player_count:
+            logger.info(f"[_leave_player] Player {discord_id} removed from room {room_id}. Saving state.")
+            await self._save_game_state(room_id, game_state)
+            return True, "Player left successfully."
+        else:
+            logger.warning(f"[_leave_player] Player {discord_id} not found in room {room_id}.")
+            return False, "Player not found in this game."
+
+    async def _start_new_game(self, room_id: str) -> tuple[bool, str]:
+        """Resets the game state to start a new game in the specified room."""
+        logger.info(f"[_start_new_game] Starting new game for room {room_id}.")
+        game_state = await self._load_game_state(room_id) # Load current state to preserve guild/channel IDs
+
+        new_deck = Deck()
+        new_deck.build()
+        new_deck.shuffle()
+
+        # Reset relevant game state variables
+        game_state['current_round'] = 'pre_game'
+        game_state['deck'] = new_deck.to_output_format()
+        game_state['board_cards'] = []
+        game_state['last_evaluation'] = None
+        
+        # Clear players' hands, but keep players in their seats
+        for player in game_state['players']:
+            player['hand'] = []
+
+        logger.info(f"[_start_new_game] Game state reset for room {room_id}. Saving state.")
+        await self._save_game_state(room_id, game_state)
+        return True, "New game started successfully."
 
 
 # The setup function is needed for bot.py to load this as a cog.

@@ -138,9 +138,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state = {}
                 if result and result['game_state']:
                     game_state = json.loads(result['game_state'])
-                    logger.info(f"Loaded existing game state for room_id: {room_id}.")
+                    logger.info(f"[_load_game_state] Loaded existing game state for room_id: {room_id}. Players count: {len(game_state.get('players', []))}")
+                    logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}") # Add this debug log
                 else:
-                    logger.warning(f"No existing game state found for room_id: {room_id}. Initializing new state.")
+                    logger.warning(f"[_load_game_state] No existing game state found for room_id: {room_id}. Initializing new state.")
                     # Initialize with basic structure, including provided guild_id and channel_id
                     new_deck = Deck()
                     new_deck.build()
@@ -159,10 +160,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 # or if a new state was just initialized, set them from the arguments.
                 if 'guild_id' not in game_state or game_state['guild_id'] is None:
                     game_state['guild_id'] = guild_id
-                    logger.info(f"Set guild_id to {guild_id} for room {room_id} (was missing/None).")
+                    logger.info(f"[_load_game_state] Set guild_id to {guild_id} for room {room_id} (was missing/None).")
                 if 'channel_id' not in game_state or game_state['channel_id'] is None:
                     game_state['channel_id'] = channel_id
-                    logger.info(f"Set channel_id to {channel_id} for room {room_id} (was missing/None).")
+                    logger.info(f"[_load_game_state] Set channel_id to {channel_id} for room {room_id} (was missing/None).")
 
                 return game_state
         except Exception as e:
@@ -179,6 +180,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 game_state_json = json.dumps(game_state)
+                logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}") # Add this debug log
                 # Updating 'bot_game_rooms' table and using 'game_state' column
                 await cursor.execute(
                     "INSERT INTO bot_game_rooms (room_id, game_state) VALUES (%s, %s) "
@@ -451,6 +453,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     # This case means player exists but has no seat_id (e.g., from an old state), allow them to take a seat
                     existing_player['seat_id'] = seat_id
                     existing_player['name'] = player_name # Update name in case it changed
+                    existing_player['avatar_url'] = player_data.get('avatar_url') # Ensure avatar is updated too
                     logger.info(f"[_add_player_to_game] Player {player_name} updated with seat {seat_id}.")
         else:
             # Check if the target seat is already occupied by *any* player
@@ -467,11 +470,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'avatar_url': player_data.get('avatar_url') # Store avatar URL if provided
             }
             players.append(new_player)
-            logger.info(f"[_add_player_to_game] New player {player_name} added to game state.")
+            logger.info(f"[_add_player_to_game] New player {player_name} added to game state. Current players list: {players}")
 
-        game_state['players'] = players
+        game_state['players'] = players # This line ensures the updated 'players' list is assigned back to game_state
         
-        logger.info(f"[_add_player_to_game] Saving game state for room {room_id} after player update.")
+        logger.info(f"[_add_player_to_game] Saving game state for room {room_id} after player update. Players count: {len(game_state['players'])}")
         await self._save_game_state(room_id, game_state)
         logger.info(f"[_add_player_to_game] Player {player_name} added/updated in seat {seat_id} in room {room_id}. State saved.")
         return True, "Player added successfully."

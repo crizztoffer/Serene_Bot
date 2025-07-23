@@ -181,14 +181,20 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             async with conn.cursor() as cursor:
                 game_state_json = json.dumps(game_state)
                 logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}") # Add this debug log
-                # Updating 'bot_game_rooms' table and using 'game_state' column
+                
+                # Changed from INSERT...ON DUPLICATE KEY UPDATE to a pure UPDATE
                 await cursor.execute(
-                    "INSERT INTO bot_game_rooms (room_id, game_state) VALUES (%s, %s) "
-                    "ON DUPLICATE KEY UPDATE game_state = %s",
-                    (room_id, game_state_json, game_state_json)
+                    "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
+                    (game_state_json, room_id)
                 )
                 await conn.commit() # Explicitly commit the transaction
-                logger.info(f"Game state saved for room_id: {room_id} in bot_game_rooms.")
+
+                if cursor.rowcount == 0:
+                    logger.error(f"[_save_game_state] Failed to update game state for room_id: {room_id}. Room not found in DB. Game state: {game_state_json}")
+                    # Optionally, you could raise an exception here if a room not existing is a critical error
+                    # raise ValueError(f"Game room {room_id} not found for update.")
+                else:
+                    logger.info(f"Game state updated for room_id: {room_id} in bot_game_rooms.")
         except Exception as e:
             logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
             raise # Re-raise to be caught by the handler

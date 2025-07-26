@@ -90,7 +90,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot # Bot instance is passed but not used by this pure dealer for Discord comms
         logger.info("MechanicsMain (backend state management) initialized as a Discord Cog.")
-        
+    
         # Database credentials - NOW using credentials assigned to bot object
         # These are set in bot.py's on_ready event.
         self.db_user = self.bot.db_user
@@ -150,6 +150,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         'room_id': room_id,
                         'current_round': 'pre_game',
                         'players': [],
+                        'dealer_hand': [], # Initialize dealer's hand
                         'deck': new_deck.to_output_format(),
                         'board_cards': [],
                         'last_evaluation': None
@@ -235,10 +236,38 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['deck'] = deck.to_output_format()
         game_state['players'] = players_data
         game_state['board_cards'] = [] # Ensure board is empty for a new deal
-        game_state['current_round'] = "pre_flop"
+        # game_state['current_round'] = "pre_flop" # This will now be set by _start_new_round_pre_flop if applicable
 
         await self._save_game_state(room_id, game_state)
         return True, "Hole cards dealt."
+
+    async def deal_dealer_cards(self, room_id: str) -> tuple[bool, str]:
+        """Deals two cards to the dealer for the specified room_id."""
+        game_state = await self._load_game_state(room_id)
+
+        deck = Deck(game_state.get('deck', []))
+
+        # Ensure dealer_hand is initialized
+        if 'dealer_hand' not in game_state or not isinstance(game_state['dealer_hand'], list):
+            game_state['dealer_hand'] = []
+        else:
+            game_state['dealer_hand'].clear() # Clear existing dealer hand for a new deal
+
+        card1 = deck.deal_card()
+        card2 = deck.deal_card()
+        
+        if card1 and card2:
+            game_state['dealer_hand'].append(card1.to_output_format())
+            game_state['dealer_hand'].append(card2.to_output_format())
+            logger.info(f"Dealer cards dealt for room {room_id}.")
+        else:
+            logger.error("Not enough cards to deal dealer's hand.")
+            return False, "Not enough cards to deal dealer's hand."
+
+        game_state['deck'] = deck.to_output_format()
+        await self._save_game_state(room_id, game_state)
+        return True, "Dealer's cards dealt."
+
 
     async def deal_flop(self, room_id: str) -> tuple[bool, str]:
         """Deals the three community cards (flop) for the specified room_id."""
@@ -385,6 +414,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 message = "Game state retrieved."
             elif action == "deal_hole_cards":
                 success, message = await self.deal_hole_cards(room_id)
+            elif action == "deal_dealer_cards": # New action handler
+                success, message = await self.deal_dealer_cards(room_id)
             elif action == "deal_flop":
                 success, message = await self.deal_flop(room_id)
             elif action == "deal_turn":
@@ -404,8 +435,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if not discord_id:
                     return {"status": "error", "message": "Missing discord_id for leave_player."}, 400
                 success, message = await self._leave_player(room_id, discord_id)
-            elif action == "start_new_game": # New action to start a new game
+            elif action == "start_new_game": # Action to start a new game (resets state)
                 success, message = await self._start_new_game(room_id, guild_id, channel_id) # Pass guild/channel for new game init
+            elif action == "start_new_round_pre_flop": # New action to start a new round pre-flop
+                success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
             else:
                 logger.warning(f"Received unsupported action: {action}")
                 return {"status": "error", "message": "Unsupported action"}, 400
@@ -538,6 +571,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['current_round'] = 'pre_game'
         game_state['deck'] = new_deck.to_output_format()
         game_state['board_cards'] = []
+        game_state['dealer_hand'] = [] # Clear dealer's hand
         game_state['last_evaluation'] = None
         
         # Clear players' hands, but keep players in their seats
@@ -548,6 +582,35 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         await self._save_game_state(room_id, game_state)
         return True, "New game started successfully."
 
+    async def _start_new_round_pre_flop(self, room_id: str, guild_id: str = None, channel_id: str = None) -> tuple[bool, str]:
+        """
+        Starts a new round, dealing hole cards to players and two cards to the dealer,
+        and sets the round to 'pre_flop'.
+        """
+        logger.info(f"[_start_new_round_pre_flop] Starting new round pre-flop for room {room_id}.")
+        
+        # 1. Reset the game state like _start_new_game
+        success_reset, message_reset = await self._start_new_game(room_id, guild_id, channel_id)
+        if not success_reset:
+            return False, f"Failed to reset game for new round: {message_reset}"
+
+        # 2. Deal hole cards to players
+        success_players, message_players = await self.deal_hole_cards(room_id)
+        if not success_players:
+            return False, f"Failed to deal hole cards: {message_players}"
+
+        # 3. Deal two cards to the dealer
+        success_dealer, message_dealer = await self.deal_dealer_cards(room_id)
+        if not success_dealer:
+            return False, f"Failed to deal dealer cards: {message_dealer}"
+
+        # 4. Set the current round to 'pre_flop'
+        game_state = await self._load_game_state(room_id)
+        game_state['current_round'] = 'pre_flop'
+        await self._save_game_state(room_id, game_state)
+        logger.info(f"[_start_new_round_pre_flop] New round for room {room_id} successfully moved to pre_flop.")
+        
+        return True, "New round started, hole cards and dealer cards dealt, moved to pre_flop."
 
 # The setup function is needed for bot.py to load this as a cog.
 async def setup(bot):

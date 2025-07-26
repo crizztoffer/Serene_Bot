@@ -1,10 +1,10 @@
 import logging
 import json
-import aiomysql 
+import aiomysql
 from discord.ext import commands
 
 # Import Card and Deck from the new game_models utility file
-from cogs.utils.game_models import Card, Deck 
+from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
 
@@ -206,7 +206,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def deal_hole_cards(self, room_id: str) -> tuple[bool, str]:
         """Deals two hole cards to each player for the specified room_id."""
         # Note: _load_game_state will now ensure guild_id and channel_id are present if new state
-        game_state = await self._load_game_state(room_id) 
+        game_state = await self._load_game_state(room_id)
         
         # Ensure players list is not empty for dealing
         if not game_state.get('players'):
@@ -439,17 +439,29 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 success, message = await self._start_new_game(room_id, guild_id, channel_id) # Pass guild/channel for new game init
             elif action == "start_new_round_pre_flop": # New action to start a new round pre-flop
                 success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
+            elif action == "send_message":  # New action for in-game messages
+                message_content = request_data.get('message_content')
+                sender_id = request_data.get('sender_id')
+                if not message_content or not sender_id:
+                    return {"status": "error", "message": "Missing message_content or sender_id for send_message."}, 400
+                success, message, response_data = await self._handle_in_game_message(room_id, sender_id, message_content)
+                if success:
+                    return response_data, 200 # Return the specific message data
+                else:
+                    return {"status": "error", "message": message}, 500
             else:
                 logger.warning(f"Received unsupported action: {action}")
                 return {"status": "error", "message": "Unsupported action"}, 400
 
             # After any action, load the latest state to return it
-            if success:
+            if success and action != "send_message": # Don't reload state if it's just a message echo
                 # Re-load the state to ensure it's the absolute latest from DB, including any updates
                 # from the action itself (e.g., player additions, card deals).
                 # This re-load will now correctly include guild_id/channel_id if it was a new game.
-                updated_game_state = await self._load_game_state(room_id, guild_id, channel_id) 
+                updated_game_state = await self._load_game_state(room_id, guild_id, channel_id)
                 return updated_game_state, 200
+            elif success and action == "send_message":
+                 return response_data, 200 # Already handled for send_message
             else:
                 return {"status": "error", "message": message}, 500
 
@@ -464,7 +476,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         logger.info(f"[_add_player_to_game] Attempting to add player for room {room_id} with data: {player_data}")
         # Pass guild_id and channel_id to _load_game_state so it can initialize a new state correctly if needed
-        game_state = await self._load_game_state(room_id, guild_id, channel_id) 
+        game_state = await self._load_game_state(room_id, guild_id, channel_id)
         players = game_state.get('players', [])
         logger.info(f"[_add_player_to_game] Current players in game state: {players}")
         
@@ -561,7 +573,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """Resets the game state to start a new game in the specified room."""
         logger.info(f"[_start_new_game] Starting new game for room {room_id}.")
         # Load current state to preserve guild/channel IDs, passing them to _load_game_state
-        game_state = await self._load_game_state(room_id, guild_id, channel_id) 
+        game_state = await self._load_game_state(room_id, guild_id, channel_id)
 
         new_deck = Deck()
         new_deck.build()
@@ -611,6 +623,35 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[_start_new_round_pre_flop] New round for room {room_id} successfully moved to pre_flop.")
         
         return True, "New round started, hole cards and dealer cards dealt, moved to pre_flop."
+
+    async def _handle_in_game_message(self, room_id: str, sender_id: str, message_content: str) -> tuple[bool, str, dict]:
+        """
+        Handles an in-game message by echoing it back.
+        In a real game, this might involve more complex logic like
+        broadcasting to other players, logging, or checking for commands.
+        """
+        logger.info(f"[_handle_in_game_message] Received message for room {room_id} from {sender_id}: '{message_content}'")
+
+        # Load game state to get sender's name (optional but good for context)
+        game_state = await self._load_game_state(room_id)
+        sender_name = "Unknown Player"
+        for player in game_state.get('players', []):
+            if player['discord_id'] == sender_id:
+                sender_name = player['name']
+                break
+
+        response_data = {
+            "status": "success",
+            "message": "Message received and echoed.",
+            "echo_message": {
+                "sender_id": sender_id,
+                "sender_name": sender_name,
+                "content": message_content
+            },
+            "game_state": game_state # Include the current game state
+        }
+        return True, "Message processed.", response_data
+
 
 # The setup function is needed for bot.py to load this as a cog.
 async def setup(bot):

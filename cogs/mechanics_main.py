@@ -312,7 +312,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def deal_flop(self, room_id: str) -> tuple[bool, str]:
         """Deals the three community cards (flop) for the specified room_id."""
         game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'pre_game': # Changed from 'pre_flop' to 'pre_game'
+        if game_state['current_round'] != 'pre_flop': # Changed from 'pre_flop' to 'pre_game'
             logger.warning(f"[deal_flop] Cannot deal flop. Current round is {game_state['current_round']} for room {room_id}.")
             return False, f"Cannot deal flop. Current round is {game_state['current_round']}."
 
@@ -601,7 +601,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             # If no players, perhaps end the game or wait. For now, just return.
             return
 
-        if game_state['current_round'] == 'pre_game': # Changed from 'pre_flop' to 'pre_game'
+        if game_state['current_round'] == 'pre_flop': # Changed from 'pre_flop' to 'pre_game'
             # Pre-flop: Action starts after big blind (i.e., player after big blind)
             dealer_pos = game_state['dealer_button_position']
             big_blind_pos_idx = (dealer_pos + 2) % num_players
@@ -708,7 +708,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 
         next_round = None
-        if game_state['current_round'] == 'pre_game': # Changed from 'pre_flop' to 'pre_game'
+        if game_state['current_round'] == 'pre_flop': # Changed from 'pre_flop' to 'pre_game'
             success, msg = await self.deal_flop(room_id)
             next_round = 'flop'
         elif game_state['current_round'] == 'flop':

@@ -240,6 +240,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         
         # Ensure players list is not empty for dealing
         if not game_state.get('players'):
+            # For a single-player game, this check might need to be adjusted
+            # If a game can start with 0 players, this should return True or be removed.
+            # Assuming at least one player must be seated to deal cards.
             return False, "No players in the game to deal cards."
 
         deck = Deck(game_state.get('deck', [])) # Use Deck from game_models
@@ -455,6 +458,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         sorted_players = self._get_sorted_players(game_state)
         if not sorted_players:
+            # If no players at all, return -1. This is fine for single-player if the game
+            # logic handles a single player's turn correctly without needing a "next" player.
             return -1
 
         num_players = len(sorted_players)
@@ -477,11 +482,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         sorted_players = self._get_sorted_players(game_state)
         current_player_index = game_state['current_player_turn_index']
 
-        if current_player_index == -1 or current_player_index >= len(sorted_players):
-            logger.error(f"Invalid current_player_turn_index: {current_player_index}")
-            game_state['timer_end_time'] = None
-            game_state['current_player_turn_index'] = -1
-            return
+        # Allow starting turn even if only one player, as long as index is valid
+        if not sorted_players or current_player_index == -1 or current_player_index >= len(sorted_players):
+            # For a single player, if current_player_turn_index is -1, set it to 0
+            if len(sorted_players) == 1 and current_player_index == -1:
+                game_state['current_player_turn_index'] = 0
+                current_player_index = 0
+                logger.info(f"Setting initial turn for single player {sorted_players[current_player_index]['name']}.")
+            else:
+                logger.error(f"Invalid current_player_turn_index: {current_player_index} with {len(sorted_players)} players. Cannot start turn.")
+                game_state['timer_end_time'] = None
+                game_state['current_player_turn_index'] = -1
+                return
 
         game_state['timer_end_time'] = int(time.time()) + self.PLAYER_TURN_TIME
         logger.info(f"Starting turn for player {sorted_players[current_player_index]['name']}. Timer ends at {game_state['timer_end_time']}")
@@ -494,8 +506,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         sorted_players = self._get_sorted_players(game_state)
         num_players = len(sorted_players)
 
-        if num_players < 2:
-            logger.warning("Not enough players to apply blinds.")
+        # Removed: if num_players < 2: logger.warning("Not enough players to apply blinds."); return
+        # Allowing blinds logic to run even with one player.
+        # For a single-player game, blinds might not be relevant or need custom logic.
+        # Current logic will try to apply blinds to non-existent players if num_players < 2,
+        # leading to index errors if not handled.
+        # For now, we'll assume a single player might implicitly post both blinds, or blinds are skipped.
+        # If the game is truly single-player, this section might need to be re-thought or skipped entirely.
+        if num_players == 0:
+            logger.warning("No players to apply blinds. Skipping.")
             return
 
         # Determine positions relative to the dealer button
@@ -505,35 +524,40 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         small_blind_pos_idx = (dealer_pos + 1) % num_players
         big_blind_pos_idx = (dealer_pos + 2) % num_players
 
-        small_blind_player = sorted_players[small_blind_pos_idx]
-        big_blind_player = sorted_players[big_blind_pos_idx]
+        # Ensure indices are valid before accessing players
+        small_blind_player = sorted_players[small_blind_pos_idx] if small_blind_pos_idx < num_players else None
+        big_blind_player = sorted_players[big_blind_pos_idx] if big_blind_pos_idx < num_players else None
 
-        # Deduct small blind
-        small_blind_amount = min(game_state['small_blind_amount'], small_blind_player['total_chips'])
-        small_blind_player['total_chips'] -= small_blind_amount
-        small_blind_player['current_bet_in_round'] += small_blind_amount
-        game_state['current_betting_round_pot'] += small_blind_amount
-        logger.info(f"Player {small_blind_player['name']} posts small blind: ${small_blind_amount}")
+        if small_blind_player:
+            # Deduct small blind
+            small_blind_amount = min(game_state['small_blind_amount'], small_blind_player['total_chips'])
+            small_blind_player['total_chips'] -= small_blind_amount
+            small_blind_player['current_bet_in_round'] += small_blind_amount
+            game_state['current_betting_round_pot'] += small_blind_amount
+            logger.info(f"Player {small_blind_player['name']} posts small blind: ${small_blind_amount}")
+            small_blind_player['has_acted_in_round'] = True # Mark as acted
 
-        # Deduct big blind
-        big_blind_amount = min(game_state['big_blind_amount'], big_blind_player['total_chips'])
-        big_blind_player['total_chips'] -= big_blind_amount
-        big_blind_player['current_bet_in_round'] += big_blind_amount
-        game_state['current_betting_round_pot'] += big_blind_amount
-        logger.info(f"Player {big_blind_player['name']} posts big blind: ${big_blind_amount}")
+        if big_blind_player:
+            # Deduct big blind
+            big_blind_amount = min(game_state['big_blind_amount'], big_blind_player['total_chips'])
+            big_blind_player['total_chips'] -= big_blind_amount
+            big_blind_player['current_bet_in_round'] += big_blind_amount
+            game_state['current_betting_round_pot'] += big_blind_amount
+            logger.info(f"Player {big_blind_player['name']} posts big blind: ${big_blind_amount}")
+            big_blind_player['has_acted_in_round'] = True # Big blind has acted by posting
 
         # Set the minimum bet for this round to the big blind amount
-        game_state['current_round_min_bet'] = game_state['big_blind_amount']
+        # If only one player, this might be 0 or a default.
+        if big_blind_player:
+            game_state['current_round_min_bet'] = game_state['big_blind_amount']
+        else:
+            game_state['current_round_min_bet'] = 0 # No big blind, min bet is 0
 
-        # Mark blinds players as having acted in this round initially
-        small_blind_player['has_acted_in_round'] = True
-        big_blind_player['has_acted_in_round'] = True # Big blind has acted by posting
-
-        # Update players list in game_state
+        # Update players list in game_state (ensure changes to player dicts are reflected)
         for i, player_in_state in enumerate(game_state['players']):
-            if player_in_state['discord_id'] == small_blind_player['discord_id']:
+            if small_blind_player and player_in_state['discord_id'] == small_blind_player['discord_id']:
                 game_state['players'][i] = small_blind_player
-            elif player_in_state['discord_id'] == big_blind_player['discord_id']:
+            elif big_blind_player and player_in_state['discord_id'] == big_blind_player['discord_id']:
                 game_state['players'][i] = big_blind_player
 
 
@@ -555,7 +579,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         num_players = len(sorted_players)
 
         if num_players == 0:
-            logger.warning("No players to start betting round.")
+            logger.warning("No players to start betting round. Skipping.")
             # If no players, perhaps end the game or wait. For now, just return.
             return
 
@@ -565,8 +589,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             big_blind_pos_idx = (dealer_pos + 2) % num_players
             first_player_index = (big_blind_pos_idx + 1) % num_players
             
-            # Apply blinds
+            # Apply blinds (logic updated to handle single player gracefully)
             await self._apply_blinds(game_state)
+            
+            # If only one player, that player is effectively the only one who can act.
+            # The first_player_index logic should still correctly point to them.
+            if num_players == 1:
+                first_player_index = 0 # The single player is always the first to act
             # Blinds logic is complex. For now, players who posted blinds are considered to have acted
             # for the amount of their blind. They will need to act again if there's a raise.
             # The 'has_acted_in_round' flag will be reset for all players (except folded)
@@ -615,7 +644,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         sorted_players = self._get_sorted_players(game_state)
         active_players = [p for p in sorted_players if not p.get('folded', False)]
 
-        if len(active_players) <= 1:
+        # For single-player, if the player is active, the round can be considered complete
+        # once they have acted (e.g., checked, bet).
+        if len(active_players) <= 1: # This condition already handles 0 or 1 active players
             logger.info("Betting round complete: 1 or fewer active players remaining.")
             return True # Round ends if only one player or no players left (e.g., all folded)
 
@@ -664,6 +695,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         elif game_state['current_round'] == 'showdown':
             # After showdown, automatically start new round after its timer expires (handled by frontend triggering auto_action_timeout)
             # The timer for post-showdown is set in evaluate_hands.
+            # For single player, this will immediately start a new round after showdown.
             success, msg = await self._start_new_round_pre_flop(room_id, game_state['guild_id'], game_state['channel_id'])
             next_round = 'pre_flop' # If successful, it moves to pre_flop
 
@@ -736,11 +768,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     return
                 success, message = await self._leave_player(room_id, discord_id)
             elif action == "start_new_round_pre_flop":
-                # Only initiator can start a new round if game hasn't started once
-                # Or auto-start after showdown timer
-                is_initiator = (sender_id == request_data.get('initiator_id'))
-                if (not game_state.get('game_started_once', False) and is_initiator) or \
-                   (game_state.get('current_round') == 'showdown' and int(time.time()) >= game_state.get('timer_end_time', 0)):
+                # For single-player, we don't need to check initiator or timer for auto-start after showdown.
+                # The game should just start if the button is pressed.
+                # Removed: is_initiator = (sender_id == request_data.get('initiator_id'))
+                # Removed: if (not game_state.get('game_started_once', False) and is_initiator) or \
+                # Removed:    (game_state.get('current_round') == 'showdown' and int(time.time()) >= game_state.get('timer_end_time', 0)):
+                
+                # Allow starting if current_round is 'pre_game' or 'showdown' (after a previous game)
+                if game_state.get('current_round') in ['pre_game', 'showdown']:
                     success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
                     if success:
                         # After successful start, ensure game_started_once is true and save
@@ -750,7 +785,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             game_state_after_start['game_started_once'] = True 
                             await self._save_game_state(room_id, game_state_after_start) # Save this flag
                 else:
-                    logger.warning(f"Attempt to start new round failed: Not initiator or timer not expired. {request_data}")
+                    logger.warning(f"Attempt to start new round failed: Game is already in progress or not in a startable state ({game_state.get('current_round')}). {request_data}")
                     return # No broadcast for invalid action
             elif action == "player_action":
                 player_id = request_data.get('player_id')
@@ -1124,11 +1159,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         # 2. Rotate dealer button
         sorted_players = self._get_sorted_players(game_state)
-        if len(sorted_players) > 0:
-            game_state['dealer_button_position'] = (game_state['dealer_button_position'] + 1) % len(sorted_players)
-            logger.info(f"Dealer button moved to player at index {game_state['dealer_button_position']}")
-        else:
+        if len(sorted_players) == 0: # If no players are seated, cannot start a round.
             return False, "Cannot start new round, no players available."
+        
+        # If there's at least one player, proceed with rotation.
+        game_state['dealer_button_position'] = (game_state['dealer_button_position'] + 1) % len(sorted_players)
+        logger.info(f"Dealer button moved to player at index {game_state['dealer_button_position']}")
+        
 
         # 3. Deal hole cards to players
         success_players, message_players = await self.deal_hole_cards(room_id)
@@ -1180,7 +1217,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             },
             "game_state": game_state # Include the current game state
         }
-        return True, "Message processed.", response_data
+        return True, "Message processed." , response_data
 
 
 # The setup function is needed for bot.py to load this as a cog.

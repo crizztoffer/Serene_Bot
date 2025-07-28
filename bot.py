@@ -43,6 +43,9 @@ bot.tree.add_command(serene_group)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- WebSocket specific global variable ---
+connected_clients = set()
+
 # DB methods
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
@@ -137,7 +140,7 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
                 return
 
             # Decode rules_json_bytes to string
-            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_str
+            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
             logger.debug(f"post_and_save_embed: Decoded rules_json_str for guild {guild_id}: {rules_json_str[:200]}...") # Log first 200 chars
             logger.debug(f"post_and_save_embed: Type of rules_json_str: {type(rules_json_str)}")
 
@@ -232,7 +235,7 @@ async def settings_saved_handler(request):
                     return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
 
                 # Decode new_rules_json from bytes to string
-                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_str
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
                 logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
                 logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
 
@@ -271,7 +274,7 @@ async def settings_saved_handler(request):
                     existing_message_id = bot_messages_row.get('message_id')
 
                     # Decode existing_message_json from bytes to string
-                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_str
+                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_bytes
                     logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...") # Log first 200 chars
                     logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
 
@@ -352,9 +355,46 @@ async def game_action_route_handler(request):
         logger.error(f"Overall error in game_action_route_handler: {e}", exc_info=True)
         return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
 
+# --- AIOHTTP App for WebSocket ---
+async def websocket_handler(request):
+    """
+    Handles WebSocket connections, receiving messages from clients and broadcasting them.
+    """
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+
+    connected_clients.add(ws)
+    logger.info("WebSocket client connected")
+
+    try:
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                logger.info(f"Message from WebSocket client: {msg.data}")
+                # Broadcast to all connected clients
+                for client in list(connected_clients): # Iterate over a copy to avoid issues if clients disconnect during iteration
+                    if not client.closed:
+                        await client.send_str(msg.data)
+                    else:
+                        connected_clients.discard(client) # Clean up disconnected clients
+
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"WebSocket error: {ws.exception()}")
+            elif msg.type == web.WSMsgType.CLOSE:
+                logger.info("WebSocket client closed connection.")
+                break # Exit the loop on close message
+    except asyncio.CancelledError:
+        logger.info("WebSocket connection cancelled (likely client disconnected).")
+    except Exception as e:
+        logger.error(f"Error in WebSocket handler: {e}", exc_info=True)
+    finally:
+        if ws in connected_clients: # Ensure we only try to remove if it's still there
+            connected_clients.remove(ws)
+        logger.info("WebSocket client disconnected")
+        return ws
+
 
 async def start_web_server():
-    """Starts the aiohttp web server."""
+    """Starts the aiohttp web server, including WebSocket."""
     app = web.Application()
     # Add OPTIONS handler for CORS preflight
     app.router.add_options('/settings_saved', cors_preflight_handler)
@@ -363,6 +403,9 @@ async def start_web_server():
     # NEW: Add the game action endpoint, pointing to our new dispatcher
     app.router.add_options('/game_action', cors_preflight_handler)
     app.router.add_post('/game_action', game_action_route_handler)
+
+    # --- Add WebSocket route ---
+    app.router.add_get('/ws', websocket_handler)
 
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(app)
@@ -533,7 +576,7 @@ async def load_cogs():
     # Then, load remaining cogs (including those in subdirectories)
     for root, dirs, files in os.walk("cogs"):
         for filename in files:
-            if filename.endswith(".py") and filename != "__init__.py":
+            if filename.endswith(".py") and filename != "__init__.py__":
                 # Calculate the full module path
                 relative_path = os.path.relpath(os.path.join(root, filename), start="cogs")
                 full_module_name = f"cogs.{relative_path[:-3].replace(os.sep, '.')}"

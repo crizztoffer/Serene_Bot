@@ -43,8 +43,9 @@ bot.tree.add_command(serene_group)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- WebSocket specific global variable ---
-connected_clients = set()
+# --- WebSocket specific global variable for rooms ---
+# This will map room_id to a set of connected WebSocket clients in that room.
+bot.ws_rooms = {} # Initialize this here so it's accessible to cogs
 
 # DB methods
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
@@ -323,73 +324,97 @@ async def settings_saved_handler(request):
         if conn:
             conn.close()
 
-# NEW: Centralized game action handler in bot.py
-async def game_action_route_handler(request):
-    """
-    Receives web requests for game actions and dispatches them to the MechanicsMain cog.
-    """
-    try:
-        data = await request.json()
-        bot_entry = data.get('bot_entry')
-
-        if bot_entry != BOT_ENTRY:
-            logger.warning(f"Unauthorized access attempt to /game_action. Invalid BOT_ENTRY: {bot_entry}")
-            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
-
-        # Get the MechanicsMain cog
-        mechanics_cog = bot.get_cog('MechanicsMain')
-        if not mechanics_cog:
-            logger.error("MechanicsMain cog not loaded or accessible for game_action_route_handler.")
-            return web.Response(text="Internal Server Error: Game mechanics not available", status=500, headers=CORS_HEADERS)
-
-        # Delegate the actual processing to the cog's method
-        response_data, status_code = await mechanics_cog.handle_web_game_action(
-            data # Removed GAME_WEBHOOK_URL as it's not used in handle_web_game_action directly
-        )
-        return web.json_response(response_data, status=status_code, headers=CORS_HEADERS)
-
-    except json.JSONDecodeError:
-        logger.error("Received malformed JSON for game_action_route_handler.")
-        return web.Response(text="Bad Request: Invalid JSON", status=400, headers=CORS_HEADERS)
-    except Exception as e:
-        logger.error(f"Overall error in game_action_route_handler: {e}", exc_info=True)
-        return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
+# REMOVED: game_action_route_handler and the /game_action POST route
+# as all game actions will now go through the WebSocket.
 
 # --- AIOHTTP App for WebSocket ---
 async def websocket_handler(request):
     """
-    Handles WebSocket connections, receiving messages from clients and broadcasting them.
+    Handles WebSocket connections for game rooms.
+    It registers the client to a specific room and dispatches messages
+    to the MechanicsMain cog for processing and broadcasting.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    connected_clients.add(ws)
-    logger.info("WebSocket client connected")
-
+    room_id = None # Initialize room_id for this specific websocket
     try:
+        # The first message from the client should contain room_id, guild_id, channel_id, sender_id
+        # to register this WebSocket connection to a specific game room.
+        first_msg = await ws.receive_str()
+        initial_data = json.loads(first_msg)
+        
+        room_id = initial_data.get('room_id')
+        guild_id = initial_data.get('guild_id')
+        channel_id = initial_data.get('channel_id')
+        sender_id = initial_data.get('sender_id')
+
+        if not all([room_id, guild_id, channel_id, sender_id]):
+            logger.error(f"Initial WebSocket message missing critical parameters: {initial_data}")
+            await ws.send_str(json.dumps({"status": "error", "message": "Missing room, guild, channel, or sender ID in initial message."}))
+            return # Close connection if initial data is bad
+
+        # Register the WebSocket to the bot's ws_rooms structure
+        if room_id not in bot.ws_rooms:
+            bot.ws_rooms[room_id] = set()
+        bot.ws_rooms[room_id].add(ws)
+        logger.info(f"WebSocket client connected and registered to room {room_id}. Total connections in room: {len(bot.ws_rooms[room_id])}")
+
+        # Get the MechanicsMain cog
+        mechanics_cog = bot.get_cog('MechanicsMain')
+        if not mechanics_cog:
+            logger.error("MechanicsMain cog not loaded or accessible in websocket_handler.")
+            await ws.send_str(json.dumps({"status": "error", "message": "Game mechanics not available."}))
+            return
+
+        # Process the initial message (e.g., 'get_state' or 'add_player')
+        # This will trigger the cog to handle the action and broadcast the state.
+        await mechanics_cog.handle_websocket_game_action(initial_data)
+
+        # Process subsequent messages
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                logger.info(f"Message from WebSocket client: {msg.data}")
-                # Broadcast to all connected clients
-                for client in list(connected_clients): # Iterate over a copy to avoid issues if clients disconnect during iteration
-                    if not client.closed:
-                        await client.send_str(msg.data)
-                    else:
-                        connected_clients.discard(client) # Clean up disconnected clients
+                logger.info(f"Message from WebSocket client in room {room_id}: {msg.data}")
+                try:
+                    request_data = json.loads(msg.data)
+                    # Ensure room_id, guild_id, channel_id, sender_id are always passed with requests
+                    # The frontend should be sending these with every action.
+                    request_data['room_id'] = room_id # Ensure room_id is consistent
+                    request_data['guild_id'] = guild_id
+                    request_data['channel_id'] = channel_id
+                    request_data['sender_id'] = sender_id
+
+                    # Delegate to the MechanicsMain cog for processing and broadcasting
+                    await mechanics_cog.handle_websocket_game_action(request_data)
+                except json.JSONDecodeError:
+                    logger.error(f"Received malformed JSON from WebSocket client in room {room_id}: {msg.data}")
+                    await ws.send_str(json.dumps({"status": "error", "message": "Invalid JSON format."}))
+                except Exception as e:
+                    logger.error(f"Error processing WebSocket message in room {room_id}: {e}", exc_info=True)
+                    await ws.send_str(json.dumps({"status": "error", "message": f"Internal server error: {e}"}))
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"WebSocket error: {ws.exception()}")
+                logger.error(f"WebSocket error in room {room_id}: {ws.exception()}")
             elif msg.type == web.WSMsgType.CLOSE:
-                logger.info("WebSocket client closed connection.")
+                logger.info(f"WebSocket client closed connection from room {room_id}.")
                 break # Exit the loop on close message
+
     except asyncio.CancelledError:
-        logger.info("WebSocket connection cancelled (likely client disconnected).")
+        logger.info(f"WebSocket connection to room {room_id} cancelled (likely client disconnected).")
     except Exception as e:
-        logger.error(f"Error in WebSocket handler: {e}", exc_info=True)
+        logger.error(f"Error in WebSocket handler for room {room_id}: {e}", exc_info=True)
     finally:
-        if ws in connected_clients: # Ensure we only try to remove if it's still there
-            connected_clients.remove(ws)
-        logger.info("WebSocket client disconnected")
+        # Clean up the WebSocket from the room's set
+        if room_id and ws in bot.ws_rooms.get(room_id, set()):
+            bot.ws_rooms[room_id].remove(ws)
+            if not bot.ws_rooms[room_id]: # If no more clients in room, remove room entry
+                del bot.ws_rooms[room_id]
+            logger.info(f"WebSocket client disconnected from room {room_id}. Remaining connections in room: {len(bot.ws_rooms.get(room_id, set()))}")
+        elif ws in bot.ws_rooms.get(room_id, set()): # Fallback if room_id somehow got unset but ws is still in a room
+             bot.ws_rooms[room_id].remove(ws)
+             if not bot.ws_rooms[room_id]:
+                del bot.ws_rooms[room_id]
+             logger.warning(f"WebSocket client disconnected, room_id was unset, but found in ws_rooms. Cleaned up.")
         return ws
 
 
@@ -400,9 +425,8 @@ async def start_web_server():
     app.router.add_options('/settings_saved', cors_preflight_handler)
     app.router.add_post('/settings_saved', settings_saved_handler)
 
-    # NEW: Add the game action endpoint, pointing to our new dispatcher
-    app.router.add_options('/game_action', cors_preflight_handler)
-    app.router.add_post('/game_action', game_action_route_handler)
+    # REMOVED: app.router.add_options('/game_action', cors_preflight_handler)
+    # REMOVED: app.router.add_post('/game_action', game_action_route_handler)
 
     # --- Add WebSocket route ---
     app.router.add_get('/ws', websocket_handler)

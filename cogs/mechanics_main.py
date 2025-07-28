@@ -1,6 +1,7 @@
 import logging
 import json
 import aiomysql
+import time # Import time for timestamps
 from discord.ext import commands
 
 # Import Card and Deck from the new game_models utility file
@@ -16,7 +17,6 @@ def get_rank_value(rank):
         return int(rank)
     elif rank == 'J': return 11
     elif rank == 'Q': return 12
-    elif rank == 'K': return 13
     elif rank == 'A': return 14
     return 0
 
@@ -98,6 +98,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self.db_host = self.bot.db_host
         self.db_name = "serene_users" # Assuming this is the database name
 
+        # Define game constants
+        self.PLAYER_TURN_TIME = 60 # seconds for betting rounds
+        self.POST_SHOWDOWN_TIME = 10 # seconds for new game countdown
+
     async def cog_load(self):
         logger.info("MechanicsMain cog loaded successfully.")
 
@@ -148,12 +152,21 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     new_deck.shuffle()
                     game_state = {
                         'room_id': room_id,
-                        'current_round': 'pre_game',
-                        'players': [],
+                        'current_round': 'pre_game', # pre_game, pre_flop, flop, turn, river, showdown
+                        'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded'
                         'dealer_hand': [], # Initialize dealer's hand
                         'deck': new_deck.to_output_format(),
                         'board_cards': [],
-                        'last_evaluation': None
+                        'last_evaluation': None,
+                        'current_player_turn_index': -1, # Index in the sorted players list
+                        'current_betting_round_pot': 0,
+                        'current_round_min_bet': 0, # The amount to call
+                        'last_aggressive_action_player_id': None, # Player who last bet or raised
+                        'timer_end_time': None, # Unix timestamp (seconds)
+                        'dealer_button_position': 0, # Index of the player with the dealer button
+                        'small_blind_amount': 5,
+                        'big_blind_amount': 10,
+                        'game_started_once': False # To track if the game has ever started
                     }
                 
                 # --- IMPORTANT: Ensure guild_id and channel_id are always present ---
@@ -165,6 +178,23 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if 'channel_id' not in game_state or game_state['channel_id'] is None:
                     game_state['channel_id'] = channel_id
                     logger.info(f"[_load_game_state] Set channel_id to {channel_id} for room {room_id} (was missing/None).")
+
+                # Ensure new fields are initialized if loading an older state
+                game_state.setdefault('current_player_turn_index', -1)
+                game_state.setdefault('current_betting_round_pot', 0)
+                game_state.setdefault('current_round_min_bet', 0)
+                game_state.setdefault('last_aggressive_action_player_id', None)
+                game_state.setdefault('timer_end_time', None)
+                game_state.setdefault('dealer_button_position', 0)
+                game_state.setdefault('small_blind_amount', 5)
+                game_state.setdefault('big_blind_amount', 10)
+                game_state.setdefault('game_started_once', False)
+
+                for player in game_state.get('players', []):
+                    player.setdefault('total_chips', 1000) # Default starting chips
+                    player.setdefault('current_bet_in_round', 0)
+                    player.setdefault('has_acted_in_round', False)
+                    player.setdefault('folded', False)
 
                 return game_state
         except Exception as e:
@@ -224,6 +254,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         for player in players_data:
             player['hand'] = [] # Clear existing hands
+            player['folded'] = False # Reset folded status
+            player['current_bet_in_round'] = 0 # Reset current bet
+            player['has_acted_in_round'] = False # Reset acted status
             card1 = deck.deal_card()
             card2 = deck.deal_card()
             if card1 and card2:
@@ -292,7 +325,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['deck'] = deck.to_output_format()
         game_state['board_cards'] = board_cards_output
         game_state['current_round'] = "flop"
-
+        
         await self._save_game_state(room_id, game_state)
         return True, "Flop dealt."
 
@@ -372,102 +405,562 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         game_state['current_round'] = "showdown"
         game_state['last_evaluation'] = player_evaluations
+        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME # 10-second timer after showdown
 
         await self._save_game_state(room_id, game_state)
         return True, "Hands evaluated."
 
-    # --- Central Web Request Handler for the State-Managing Dealer ---
-    async def handle_web_game_action(self, request_data: dict) -> tuple[dict, int]:
+    async def broadcast_game_state(self, room_id: str, game_state: dict, echo_message: dict = None):
         """
-        Receives raw request data from the web server (bot.py) and dispatches it
-        to the appropriate game action method. It loads and saves the game state internally.
+        Broadcasts the current game state to all connected WebSocket clients in the room.
+        Optionally includes an echo_message for chat.
+        """
+        if room_id not in self.bot.ws_rooms:
+            logger.warning(f"No WebSocket clients found for room_id: {room_id}. Cannot broadcast.")
+            return
 
-        Args:
-            request_data (dict): The JSON payload from the web request,
-                                 now containing only room_id, action, etc.
-                                 (NOT the full game_state).
+        payload = {
+            "game_state": game_state
+        }
+        if echo_message:
+            payload["echo_message"] = echo_message
+            logger.info(f"Broadcasting game state with echo_message for room {room_id}.")
+        else:
+            logger.info(f"Broadcasting game state (no echo_message) for room {room_id}.")
 
-        Returns:
-            tuple: (response_payload: dict, http_status_code: int)
+        message_json = json.dumps(payload)
+        
+        for websocket in list(self.bot.ws_rooms[room_id]): # Iterate over a copy to avoid issues if clients disconnect
+            try:
+                await websocket.send_str(message_json)
+            except Exception as e:
+                logger.error(f"Error sending WebSocket message to client in room {room_id}: {e}", exc_info=True)
+                # Optionally remove disconnected websocket here, or rely on on_disconnect
+                # self.bot.ws_rooms[room_id].remove(websocket) # This might be handled by aiohttp's ws_handler
+
+    # --- Helper for getting sorted players ---
+    def _get_sorted_players(self, game_state: dict) -> list:
+        """Returns a list of players sorted by their seat_id."""
+        players = game_state.get('players', [])
+        # Filter out players without a seat_id or folded players if needed for active turn
+        active_players = [p for p in players if p.get('seat_id') and not p.get('folded', False)]
+        return sorted(active_players, key=lambda p: int(p['seat_id'].replace('seat_', '')))
+
+    # --- Helper for getting next active player turn ---
+    def _get_next_active_player_index(self, game_state: dict, current_index: int) -> int:
+        """
+        Finds the index of the next active player in the sorted list,
+        skipping folded players. Returns -1 if no active players.
+        """
+        sorted_players = self._get_sorted_players(game_state)
+        if not sorted_players:
+            return -1
+
+        num_players = len(sorted_players)
+        
+        # Determine the starting point for finding the next player
+        start_search_index = (current_index + 1) % num_players if current_index != -1 else 0
+
+        for i in range(num_players):
+            idx = (start_search_index + i) % num_players
+            player = sorted_players[idx]
+            # Player is active if not folded and has not yet acted (or needs to match a new bet)
+            # The 'has_acted_in_round' needs to be carefully managed. For now, focus on folded.
+            if not player.get('folded', False):
+                return idx
+        return -1 # No active players found
+
+    # --- Helper to start a player's turn ---
+    async def _start_player_turn(self, room_id: str, game_state: dict):
+        """Sets the timer for the current player's turn."""
+        sorted_players = self._get_sorted_players(game_state)
+        current_player_index = game_state['current_player_turn_index']
+
+        if current_player_index == -1 or current_player_index >= len(sorted_players):
+            logger.error(f"Invalid current_player_turn_index: {current_player_index}")
+            game_state['timer_end_time'] = None
+            game_state['current_player_turn_index'] = -1
+            return
+
+        game_state['timer_end_time'] = int(time.time()) + self.PLAYER_TURN_TIME
+        logger.info(f"Starting turn for player {sorted_players[current_player_index]['name']}. Timer ends at {game_state['timer_end_time']}")
+        await self._save_game_state(room_id, game_state)
+
+
+    # --- Helper to apply blinds ---
+    async def _apply_blinds(self, game_state: dict):
+        """Applies small and big blinds to players."""
+        sorted_players = self._get_sorted_players(game_state)
+        num_players = len(sorted_players)
+
+        if num_players < 2:
+            logger.warning("Not enough players to apply blinds.")
+            return
+
+        # Determine positions relative to the dealer button
+        dealer_pos = game_state['dealer_button_position']
+        
+        # Small blind is next to dealer, big blind is after small blind
+        small_blind_pos_idx = (dealer_pos + 1) % num_players
+        big_blind_pos_idx = (dealer_pos + 2) % num_players
+
+        small_blind_player = sorted_players[small_blind_pos_idx]
+        big_blind_player = sorted_players[big_blind_pos_idx]
+
+        # Deduct small blind
+        small_blind_amount = min(game_state['small_blind_amount'], small_blind_player['total_chips'])
+        small_blind_player['total_chips'] -= small_blind_amount
+        small_blind_player['current_bet_in_round'] += small_blind_amount
+        game_state['current_betting_round_pot'] += small_blind_amount
+        logger.info(f"Player {small_blind_player['name']} posts small blind: ${small_blind_amount}")
+
+        # Deduct big blind
+        big_blind_amount = min(game_state['big_blind_amount'], big_blind_player['total_chips'])
+        big_blind_player['total_chips'] -= big_blind_amount
+        big_blind_player['current_bet_in_round'] += big_blind_amount
+        game_state['current_betting_round_pot'] += big_blind_amount
+        logger.info(f"Player {big_blind_player['name']} posts big blind: ${big_blind_amount}")
+
+        # Set the minimum bet for this round to the big blind amount
+        game_state['current_round_min_bet'] = game_state['big_blind_amount']
+
+        # Mark blinds players as having acted in this round initially
+        small_blind_player['has_acted_in_round'] = True
+        big_blind_player['has_acted_in_round'] = True # Big blind has acted by posting
+
+        # Update players list in game_state
+        for i, player_in_state in enumerate(game_state['players']):
+            if player_in_state['discord_id'] == small_blind_player['discord_id']:
+                game_state['players'][i] = small_blind_player
+            elif player_in_state['discord_id'] == big_blind_player['discord_id']:
+                game_state['players'][i] = big_blind_player
+
+
+    async def _start_betting_round(self, room_id: str, game_state: dict):
+        """Initializes variables for a new betting round."""
+        logger.info(f"Starting new betting round for {game_state['current_round']}")
+        
+        # Reset betting related stats for all active players
+        for player in game_state['players']:
+            if not player.get('folded', False):
+                player['current_bet_in_round'] = 0
+                player['has_acted_in_round'] = False
+        
+        game_state['current_round_min_bet'] = 0 # Reset for new round, will be set by blinds or first bet
+        game_state['last_aggressive_action_player_id'] = None # Reset for new round
+
+        # Determine who starts the betting for this round
+        sorted_players = self._get_sorted_players(game_state)
+        num_players = len(sorted_players)
+
+        if num_players == 0:
+            logger.warning("No players to start betting round.")
+            # If no players, perhaps end the game or wait. For now, just return.
+            return
+
+        if game_state['current_round'] == 'pre_flop':
+            # Pre-flop: Action starts after big blind (i.e., player after big blind)
+            dealer_pos = game_state['dealer_button_position']
+            big_blind_pos_idx = (dealer_pos + 2) % num_players
+            first_player_index = (big_blind_pos_idx + 1) % num_players
+            
+            # Apply blinds
+            await self._apply_blinds(game_state)
+            # Blinds logic is complex. For now, players who posted blinds are considered to have acted
+            # for the amount of their blind. They will need to act again if there's a raise.
+            # The 'has_acted_in_round' flag will be reset for all players (except folded)
+            # at the start of each betting round and then set to True when they act.
+            # The player after the big blind starts the action.
+
+        else: # Flop, Turn, River betting rounds: Action starts with the first active player after the dealer button
+            dealer_pos = game_state['dealer_button_position']
+            first_player_index = (dealer_pos + 1) % num_players
+            # Find the next *active* player after the dealer button
+            first_player_index = self._get_next_active_player_index(game_state, first_player_index - 1) 
+
+        if first_player_index != -1:
+            game_state['current_player_turn_index'] = first_player_index
+            await self._start_player_turn(room_id, game_state)
+        else:
+            logger.warning(f"No active players to start betting round in room {room_id}. Advancing phase.")
+            # If no active players, round might end immediately or game over.
+            await self._advance_game_phase(room_id, game_state)
+
+
+    async def _end_betting_round(self, room_id: str, game_state: dict):
+        """Collects bets into the main pot and prepares for the next phase."""
+        logger.info(f"Ending betting round for {game_state['current_round']}.")
+        
+        # Collect all current_bet_in_round into the main pot
+        for player in game_state['players']:
+            game_state['current_betting_round_pot'] += player['current_bet_in_round']
+            player['current_bet_in_round'] = 0 # Reset for next betting round
+            player['has_acted_in_round'] = False # Reset acted status for next round
+
+        game_state['current_round_min_bet'] = 0 # Reset min bet for next round
+        game_state['last_aggressive_action_player_id'] = None # Reset aggressive action
+
+        await self._save_game_state(room_id, game_state)
+
+
+    def _check_round_completion(self, game_state: dict) -> bool:
+        """
+        Checks if the current betting round is complete.
+        A round is complete if:
+        1. Only one player is not folded. (This player wins the pot)
+        2. All active players (not folded) have acted AND matched the highest bet.
+           If there was no aggressive action (all checks), then all must have acted.
+        """
+        sorted_players = self._get_sorted_players(game_state)
+        active_players = [p for p in sorted_players if not p.get('folded', False)]
+
+        if len(active_players) <= 1:
+            logger.info("Betting round complete: 1 or fewer active players remaining.")
+            return True # Round ends if only one player or no players left (e.g., all folded)
+
+        highest_bet_in_round = max([p.get('current_bet_in_round', 0) for p in active_players])
+
+        # Check if all active players have acted
+        all_active_players_acted = all(p.get('has_acted_in_round', False) for p in active_players)
+
+        # Check if all active players have matched the highest bet
+        all_matched_highest_bet = all(p.get('current_bet_in_round', 0) == highest_bet_in_round for p in active_players)
+
+        # If there was no aggressive action (i.e., highest_bet_in_round is 0), then everyone just needs to have acted (checked).
+        if highest_bet_in_round == 0:
+            return all_active_players_acted
+        else:
+            # If there was a bet/raise, everyone must have acted and matched the highest bet.
+            # A special case: if a player went all-in for less than the highest bet,
+            # others don't need to bet more than that all-in amount to call.
+            # For simplicity, we'll assume 'all_matched_highest_bet' covers this for now.
+            return all_active_players_acted and all_matched_highest_bet
+
+
+    async def _advance_game_phase(self, room_id: str, game_state: dict):
+        """Moves the game to the next phase (flop, turn, river, showdown)."""
+        logger.info(f"Advancing game phase from {game_state['current_round']}")
+        
+        # Collect bets into main pot before advancing phase
+        await self._end_betting_round(room_id, game_state) # This also saves the state
+
+        # Reload game_state after _end_betting_round has saved it
+        game_state = await self._load_game_state(room_id)
+
+        next_round = None
+        if game_state['current_round'] == 'pre_flop':
+            success, msg = await self.deal_flop(room_id)
+            next_round = 'flop'
+        elif game_state['current_round'] == 'flop':
+            success, msg = await self.deal_turn(room_id)
+            next_round = 'turn'
+        elif game_state['current_round'] == 'turn':
+            success, msg = await self.deal_river(room_id)
+            next_round = 'river'
+        elif game_state['current_round'] == 'river':
+            success, msg = await self.evaluate_hands(room_id)
+            next_round = 'showdown'
+        elif game_state['current_round'] == 'showdown':
+            # After showdown, automatically start new round after its timer expires (handled by frontend triggering auto_action_timeout)
+            # The timer for post-showdown is set in evaluate_hands.
+            success, msg = await self._start_new_round_pre_flop(room_id, game_state['guild_id'], game_state['channel_id'])
+            next_round = 'pre_flop' # If successful, it moves to pre_flop
+
+        if not success:
+            logger.error(f"Failed to advance game phase: {msg}")
+            # Handle error: perhaps notify players, or reset game.
+            return
+
+        # Reload game_state after dealing cards for the new phase
+        game_state = await self._load_game_state(room_id)
+
+        # Start the new betting round (if applicable)
+        if next_round in ['flop', 'turn', 'river', 'pre_flop']: # Pre-flop also starts a betting round
+            await self._start_betting_round(room_id, game_state) # This will set the first player's turn and timer
+        
+        # If it's showdown, the timer is already set in evaluate_hands.
+        # No new betting round starts after showdown, only a countdown to the next game.
+
+        # Save the final state after phase advance (already done in _start_betting_round or evaluate_hands)
+        # but ensure current_round is correctly set if not done by sub-functions.
+        if game_state['current_round'] != next_round: # Only update if sub-function didn't set it
+             game_state['current_round'] = next_round
+             await self._save_game_state(room_id, game_state) # Save final state if round changed
+
+
+    # --- New WebSocket Request Handler ---
+    async def handle_websocket_game_action(self, request_data: dict):
+        """
+        Receives raw request data from a WebSocket client and dispatches it
+        to the appropriate game action method.
+        After processing, it broadcasts the updated game state to all clients.
         """
         action = request_data.get('action')
         room_id = request_data.get('room_id')
-        guild_id = request_data.get('guild_id')    # Extract guild_id from request
-        channel_id = request_data.get('channel_id') # Extract channel_id from request
-        
-        if not all([action, room_id, guild_id, channel_id]): # Validate all required fields
-            logger.error(f"Missing required parameters for handle_web_game_action. Data: {request_data}")
-            return {"status": "error", "message": "Missing action, room_id, guild_id, or channel_id."}, 400
+        guild_id = request_data.get('guild_id')    
+        channel_id = request_data.get('channel_id') 
+        sender_id = request_data.get('sender_id') # Assuming sender_id is always present in WS requests
 
-        logger.info(f"Backend dealer received action: '{action}' for Room ID: {room_id}, Guild ID: {guild_id}, Channel ID: {channel_id}")
+        if not all([action, room_id, guild_id, channel_id, sender_id]):
+            logger.error(f"Missing required parameters for handle_websocket_game_action. Data: {request_data}")
+            # Broadcast an error message back to the sender if possible, or log.
+            # For simplicity, we'll just log and return for now.
+            return
+
+        logger.info(f"Backend dealer received WS action: '{action}' for Room ID: {room_id}, Sender: {sender_id}")
 
         success = False
         message = "Unknown action."
-        updated_game_state = None # Will hold the state after action
+        echo_message_data = None # To hold chat message data if applicable
 
         try:
-            # Pass guild_id and channel_id to _load_game_state
-            # This ensures that if a new game state is initialized, it includes these IDs.
+            # Load the current game state at the beginning of processing any action
+            game_state = await self._load_game_state(room_id, guild_id, channel_id)
+
             if action == "get_state":
-                updated_game_state = await self._load_game_state(room_id, guild_id, channel_id)
                 success = True
                 message = "Game state retrieved."
-            elif action == "deal_hole_cards":
-                success, message = await self.deal_hole_cards(room_id)
-            elif action == "deal_dealer_cards": # New action handler
-                success, message = await self.deal_dealer_cards(room_id)
-            elif action == "deal_flop":
-                success, message = await self.deal_flop(room_id)
-            elif action == "deal_turn":
-                success, message = await self.deal_turn(room_id)
-            elif action == "deal_river":
-                success, message = await self.deal_river(room_id)
-            elif action == "evaluate_hands":
-                success, message = await self.evaluate_hands(room_id)
-            elif action == "add_player": # New action to add players to a game
+                # No need to modify game_state, just broadcast its current form
+            elif action == "add_player":
                 player_data = request_data.get('player_data')
                 if not player_data or not isinstance(player_data, dict):
-                    return {"status": "error", "message": "Missing or invalid player_data for add_player."}, 400
-                # Pass guild_id and channel_id to _add_player_to_game if it needs to initialize a new game state
+                    logger.error("Missing or invalid player_data for add_player.")
+                    return # No broadcast for invalid request
                 success, message = await self._add_player_to_game(room_id, player_data, guild_id, channel_id)
-            elif action == "leave_player": # New action to remove a player
+            elif action == "leave_player":
                 discord_id = request_data.get('discord_id')
                 if not discord_id:
-                    return {"status": "error", "message": "Missing discord_id for leave_player."}, 400
+                    logger.error("Missing discord_id for leave_player.")
+                    return
                 success, message = await self._leave_player(room_id, discord_id)
-            elif action == "start_new_game": # Action to start a new game (resets state)
-                success, message = await self._start_new_game(room_id, guild_id, channel_id) # Pass guild/channel for new game init
-            elif action == "start_new_round_pre_flop": # New action to start a new round pre-flop
-                success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
-            elif action == "send_message":  # New action for in-game messages
-                message_content = request_data.get('message_content')
-                sender_id = request_data.get('sender_id')
-                if not message_content or not sender_id:
-                    return {"status": "error", "message": "Missing message_content or sender_id for send_message."}, 400
-                success, message, response_data = await self._handle_in_game_message(room_id, sender_id, message_content)
-                if success:
-                    return response_data, 200 # Return the specific message data
+            elif action == "start_new_round_pre_flop":
+                # Only initiator can start a new round if game hasn't started once
+                # Or auto-start after showdown timer
+                is_initiator = (sender_id == request_data.get('initiator_id'))
+                if (not game_state.get('game_started_once', False) and is_initiator) or \
+                   (game_state.get('current_round') == 'showdown' and int(time.time()) >= game_state.get('timer_end_time', 0)):
+                    success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
+                    if success and not game_state.get('game_started_once', False): # Only set if it was the very first start
+                        game_state['game_started_once'] = True 
+                        await self._save_game_state(room_id, game_state) # Save this flag
                 else:
-                    return {"status": "error", "message": message}, 500
+                    logger.warning(f"Attempt to start new round failed: Not initiator or timer not expired. {request_data}")
+                    return # No broadcast for invalid action
+            elif action == "player_action":
+                player_id = request_data.get('player_id')
+                action_type = request_data.get('action_type')
+                amount = request_data.get('amount', 0) # For bet/raise
+                
+                if not all([player_id, action_type]):
+                    logger.error("Missing player_id or action_type for player_action.")
+                    return
+                success, message = await self._handle_player_action(room_id, player_id, action_type, amount)
+            elif action == "auto_action_timeout":
+                player_id = request_data.get('player_id')
+                if not player_id:
+                    logger.error("Missing player_id for auto_action_timeout.")
+                    return
+                success, message = await self._auto_action_on_timeout(room_id, player_id)
+            elif action == "send_message":
+                message_content = request_data.get('message_content')
+                if not message_content:
+                    logger.error("Missing message_content for send_message.")
+                    return
+                success, message, response_data_from_handler = await self._handle_in_game_message(room_id, sender_id, message_content)
+                if success:
+                    echo_message_data = response_data_from_handler.get('echo_message')
+                    # The game_state from _handle_in_game_message is already the latest,
+                    # but we'll reload it below to ensure consistency after any potential save.
             else:
-                logger.warning(f"Received unsupported action: {action}")
-                return {"status": "error", "message": "Unsupported action"}, 400
+                logger.warning(f"Received unsupported WS action: {action}")
+                return # No broadcast for unsupported action
 
-            # After any action, load the latest state to return it
-            if success and action != "send_message": # Don't reload state if it's just a message echo
-                # Re-load the state to ensure it's the absolute latest from DB, including any updates
-                # from the action itself (e.g., player additions, card deals).
-                # This re-load will now correctly include guild_id/channel_id if it was a new game.
+            # After any action (if successful), reload the latest state and broadcast it.
+            # This ensures all clients get the most up-to-date game_state.
+            if success:
                 updated_game_state = await self._load_game_state(room_id, guild_id, channel_id)
-                return updated_game_state, 200
-            elif success and action == "send_message":
-                 return response_data, 200 # Already handled for send_message
+                await self.broadcast_game_state(room_id, updated_game_state, echo_message_data)
+                logger.info(f"Action '{action}' processed and state broadcast for room {room_id}.")
             else:
-                return {"status": "error", "message": message}, 500
+                logger.warning(f"Action '{action}' failed for room {room_id}: {message}")
+                # Optionally, broadcast an error message back to the sender only.
+                # For now, just log.
 
         except Exception as e:
-            logger.error(f"Error processing action '{action}' for room {room_id}: {e}", exc_info=True)
-            return {"status": "error", "message": f"Server error: {e}"}, 500
+            logger.error(f"Error processing WS action '{action}' for room {room_id}: {e}", exc_info=True)
+            # Optionally, broadcast a general error to the room or specific sender.
+
+
+    async def _handle_player_action(self, room_id: str, player_id: str, action_type: str, amount: int = 0) -> tuple[bool, str]:
+        """
+        Processes a player's action (call, check, bet, raise, fold).
+        Updates game state, advances turn, and triggers next phase if round completes.
+        """
+        game_state = await self._load_game_state(room_id)
+        sorted_players = self._get_sorted_players(game_state)
+        
+        # Find the actual player object in the game_state['players'] list
+        # to ensure updates persist correctly.
+        player_in_state = next((p for p in game_state['players'] if p['discord_id'] == player_id), None)
+        if not player_in_state:
+            return False, "Player not found in game."
+
+        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 else None
+
+        if not current_player_turn_obj or current_player_turn_obj['discord_id'] != player_id:
+            return False, "It's not your turn."
+        
+        if player_in_state.get('folded', False):
+            return False, "You have already folded."
+
+        min_bet_to_call = game_state['current_round_min_bet'] - player_in_state['current_bet_in_round']
+        
+        message = ""
+        success = False
+
+        if action_type == 'fold':
+            player_in_state['folded'] = True
+            player_in_state['has_acted_in_round'] = True
+            message = f"{player_in_state['name']} folded."
+            success = True
+            logger.info(message)
+        elif action_type == 'check':
+            if min_bet_to_call > 0:
+                return False, "Cannot check, a bet has been made. You must call or raise."
+            player_in_state['has_acted_in_round'] = True
+            message = f"{player_in_state['name']} checked."
+            success = True
+            logger.info(message)
+        elif action_type == 'call':
+            if player_in_state['total_chips'] < min_bet_to_call:
+                return False, f"Not enough chips to call ${min_bet_to_call}. You have ${player_in_state['total_chips']}."
+            
+            bet_amount = min_bet_to_call
+            player_in_state['total_chips'] -= bet_amount
+            player_in_state['current_bet_in_round'] += bet_amount
+            player_in_state['has_acted_in_round'] = True
+            message = f"{player_in_state['name']} called ${bet_amount}."
+            success = True
+            logger.info(message)
+        elif action_type == 'bet' or action_type == 'raise':
+            if amount <= min_bet_to_call:
+                return False, f"Bet/Raise amount must be greater than current call amount (${min_bet_to_call})."
+            if player_in_state['total_chips'] < amount:
+                return False, f"Not enough chips to bet/raise ${amount}. You have ${player_in_state['total_chips']}."
+            
+            player_in_state['total_chips'] -= amount
+            player_in_state['current_bet_in_round'] += amount
+            game_state['current_round_min_bet'] = player_in_state['current_bet_in_round'] # New highest bet
+            game_state['last_aggressive_action_player_id'] = player_id # Mark who made the aggressive action
+
+            # When a player bets/raises, all other players (who haven't folded) need to act again.
+            # So, reset 'has_acted_in_round' for all players except the current one and folded ones.
+            for p in game_state['players']:
+                if p['discord_id'] != player_id and not p.get('folded', False):
+                    p['has_acted_in_round'] = False
+            player_in_state['has_acted_in_round'] = True # Current player has acted
+
+            message = f"{player_in_state['name']} {action_type}d ${amount}."
+            success = True
+            logger.info(message)
+        elif action_type == 'all_in':
+            # Player goes all-in with remaining chips
+            amount = player_in_state['total_chips']
+            if amount == 0:
+                return False, "You have no chips to go all-in."
+
+            player_in_state['total_chips'] = 0
+            player_in_state['current_bet_in_round'] += amount
+            
+            # If all-in amount is greater than current min bet, it becomes the new min bet
+            if player_in_state['current_bet_in_round'] > game_state['current_round_min_bet']:
+                game_state['current_round_min_bet'] = player_in_state['current_bet_in_round']
+                game_state['last_aggressive_action_player_id'] = player_id
+                # Reset acted status for others if this all-in is a raise
+                for p in game_state['players']:
+                    if p['discord_id'] != player_id and not p.get('folded', False):
+                        p['has_acted_in_round'] = False
+            
+            player_in_state['has_acted_in_round'] = True
+            message = f"{player_in_state['name']} went All-In with ${amount}!"
+            success = True
+            logger.info(message)
+        else:
+            return False, "Invalid player action type."
+
+        if success:
+            # Update the player in the main game_state players list (already done by reference if player_in_state was used)
+            # Ensure the game_state is saved here as well.
+            await self._save_game_state(room_id, game_state)
+
+            # Check for round completion
+            if self._check_round_completion(game_state):
+                logger.info(f"Betting round {game_state['current_round']} completed. Advancing phase.")
+                await self._advance_game_phase(room_id, game_state)
+            else:
+                # Advance turn to next active player if round not complete
+                next_player_idx = self._get_next_active_player_index(game_state, game_state['current_player_turn_index'])
+                if next_player_idx != -1:
+                    game_state['current_player_turn_index'] = next_player_idx
+                    await self._start_player_turn(room_id, game_state)
+                else:
+                    # This case should ideally not happen if _check_round_completion is correct
+                    # but as a fallback, if no next player, advance phase.
+                    logger.warning("No next active player found, but round not marked complete. Advancing phase as fallback.")
+                    await self._advance_game_phase(room_id, game_state)
+            return True, message
+        return success, message
+
+    async def _auto_action_on_timeout(self, room_id: str, player_id: str) -> tuple[bool, str]:
+        """
+        Performs an automatic action (call/fold) for a player whose turn timed out.
+        """
+        game_state = await self._load_game_state(room_id)
+        sorted_players = self._get_sorted_players(game_state)
+        
+        # Find the actual player object in the game_state['players'] list
+        player_in_state = next((p for p in game_state['players'] if p['discord_id'] == player_id), None)
+        if not player_in_state:
+            return False, "Player not found in game for timeout action."
+
+        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 else None
+
+        if not current_player_turn_obj or current_player_turn_obj['discord_id'] != player_id:
+            return False, "Timeout action for incorrect player or not their turn."
+        
+        if int(time.time()) < game_state.get('timer_end_time', 0):
+            return False, "Player's turn has not timed out yet."
+
+        min_bet_to_call = game_state['current_round_min_bet'] - player_in_state['current_bet_in_round']
+        
+        action_message = ""
+        if min_bet_to_call > 0:
+            # If there's a bet to call, auto-fold
+            player_in_state['folded'] = True
+            action_message = f"{player_in_state['name']} automatically folded due to timeout."
+        else:
+            # If no bet to call, auto-check/call (if current bet is 0)
+            player_in_state['has_acted_in_round'] = True
+            action_message = f"{player_in_state['name']} automatically checked/called due to timeout."
+        
+        # Update the player in the main game_state players list (already done by reference)
+        await self._save_game_state(room_id, game_state) # Save state after auto-action
+
+        # Now, check for round completion and advance turn/phase
+        if self._check_round_completion(game_state):
+            logger.info(f"Betting round {game_state['current_round']} completed after timeout. Advancing phase.")
+            await self._advance_game_phase(room_id, game_state)
+        else:
+            next_player_idx = self._get_next_active_player_index(game_state, game_state['current_player_turn_index'])
+            if next_player_idx != -1:
+                game_state['current_player_turn_index'] = next_player_idx
+                await self._start_player_turn(room_id, game_state)
+            else:
+                logger.warning("No next active player after timeout, but round not marked complete. Advancing phase as fallback.")
+                await self._advance_game_phase(room_id, game_state)
+
+        return True, action_message
+
 
     async def _add_player_to_game(self, room_id: str, player_data: dict, guild_id: str = None, channel_id: str = None) -> tuple[bool, str]:
         """
@@ -519,7 +1012,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'name': player_name,
                 'hand': [],
                 'seat_id': seat_id, # Store the chosen seat ID
-                'avatar_url': player_data.get('avatar_url') # Store avatar URL if provided
+                'avatar_url': player_data.get('avatar_url'), # Store avatar URL if provided
+                'total_chips': 1000, # Default starting chips
+                'current_bet_in_round': 0,
+                'has_acted_in_round': False,
+                'folded': False
             }
             players.append(new_player)
             logger.info(f"[_add_player_to_game] New player {player_name} added to game state. Current players list: {players}")
@@ -585,10 +1082,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['board_cards'] = []
         game_state['dealer_hand'] = [] # Clear dealer's hand
         game_state['last_evaluation'] = None
-        
-        # Clear players' hands, but keep players in their seats
+        game_state['current_player_turn_index'] = -1
+        game_state['current_betting_round_pot'] = 0
+        game_state['current_round_min_bet'] = 0
+        game_state['last_aggressive_action_player_id'] = None
+        game_state['timer_end_time'] = None # No timer in pre_game
+        # game_state['dealer_button_position'] is not reset here, it rotates per round
+
+        # Clear players' hands and reset betting/folded status, but keep players in their seats
         for player in game_state['players']:
             player['hand'] = []
+            player['current_bet_in_round'] = 0
+            player['has_acted_in_round'] = False
+            player['folded'] = False
 
         logger.info(f"[_start_new_game] Game state reset for room {room_id}. Saving state.")
         await self._save_game_state(room_id, game_state)
@@ -601,25 +1107,41 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         logger.info(f"[_start_new_round_pre_flop] Starting new round pre-flop for room {room_id}.")
         
-        # 1. Reset the game state like _start_new_game
+        # 1. Reset the game state like _start_new_game (clears hands, resets betting states, etc.)
         success_reset, message_reset = await self._start_new_game(room_id, guild_id, channel_id)
         if not success_reset:
             return False, f"Failed to reset game for new round: {message_reset}"
 
-        # 2. Deal hole cards to players
+        # Reload game_state after reset to get the latest version
+        game_state = await self._load_game_state(room_id)
+
+        # 2. Rotate dealer button
+        sorted_players = self._get_sorted_players(game_state)
+        if len(sorted_players) > 0:
+            game_state['dealer_button_position'] = (game_state['dealer_button_position'] + 1) % len(sorted_players)
+            logger.info(f"Dealer button moved to player at index {game_state['dealer_button_position']}")
+        else:
+            return False, "Cannot start new round, no players available."
+
+        # 3. Deal hole cards to players
         success_players, message_players = await self.deal_hole_cards(room_id)
         if not success_players:
             return False, f"Failed to deal hole cards: {message_players}"
 
-        # 3. Deal two cards to the dealer
+        # 4. Deal two cards to the dealer
         success_dealer, message_dealer = await self.deal_dealer_cards(room_id)
         if not success_dealer:
             return False, f"Failed to deal dealer cards: {message_dealer}"
 
-        # 4. Set the current round to 'pre_flop'
+        # Reload game_state after card deals
         game_state = await self._load_game_state(room_id)
+
+        # 5. Set the current round to 'pre_flop'
         game_state['current_round'] = 'pre_flop'
-        await self._save_game_state(room_id, game_state)
+        
+        # 6. Start the first betting round (applies blinds and sets first player turn)
+        await self._start_betting_round(room_id, game_state) # This will also save the state and set the timer
+
         logger.info(f"[_start_new_round_pre_flop] New round for room {room_id} successfully moved to pre_flop.")
         
         return True, "New round started, hole cards and dealer cards dealt, moved to pre_flop."

@@ -152,7 +152,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     new_deck.shuffle()
                     game_state = {
                         'room_id': room_id,
-                        'current_round': 'pre_flop', # Changed from 'pre_game' to 'pre_flop' for initial state
+                        'current_round': 'pre_game', # Changed to 'pre_game' as requested
                         'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded'
                         'dealer_hand': [], # Initialize dealer's hand
                         'deck': new_deck.to_output_format(),
@@ -248,8 +248,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         deck = Deck(game_state.get('deck', [])) # Use Deck from game_models
         # Shuffle only if it's a new game or if the deck hasn't been shuffled yet for this round
-        # For simplicity, we'll re-shuffle here if it's a new round (current_round 'pre_flop')
-        if game_state['current_round'] == 'pre_flop' or not deck.cards: # Adjusted condition
+        # For simplicity, we'll re-shuffle here if it's a new round (current_round 'pre_game')
+        if game_state['current_round'] == 'pre_game' or not deck.cards: # Adjusted condition
             deck.build() # Rebuild a full deck
             deck.shuffle()
             logger.info(f"[deal_hole_cards] Deck rebuilt and shuffled for room {room_id}.")
@@ -275,7 +275,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['deck'] = deck.to_output_format()
         game_state['players'] = players_data
         game_state['board_cards'] = [] # Ensure board is empty for a new deal
-        # game_state['current_round'] = "pre_flop" # This will now be set by _start_new_round_pre_flop if applicable
+        # game_state['current_round'] = "pre_game" # This will now be set by _start_new_round_pre_flop if applicable
 
         await self._save_game_state(room_id, game_state)
         logger.info(f"[deal_hole_cards] Hole cards dealt for room {room_id}.")
@@ -312,7 +312,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def deal_flop(self, room_id: str) -> tuple[bool, str]:
         """Deals the three community cards (flop) for the specified room_id."""
         game_state = await self._load_game_state(room_id)
-        if game_state['current_round'] != 'pre_flop':
+        if game_state['current_round'] != 'pre_game': # Changed from 'pre_flop' to 'pre_game'
             logger.warning(f"[deal_flop] Cannot deal flop. Current round is {game_state['current_round']} for room {room_id}.")
             return False, f"Cannot deal flop. Current round is {game_state['current_round']}."
 
@@ -601,7 +601,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             # If no players, perhaps end the game or wait. For now, just return.
             return
 
-        if game_state['current_round'] == 'pre_flop':
+        if game_state['current_round'] == 'pre_game': # Changed from 'pre_flop' to 'pre_game'
             # Pre-flop: Action starts after big blind (i.e., player after big blind)
             dealer_pos = game_state['dealer_button_position']
             big_blind_pos_idx = (dealer_pos + 2) % num_players
@@ -626,7 +626,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             first_player_index = (dealer_pos + 1) % num_players
             # Find the next *active* player after the dealer button
             first_player_index = self._get_next_active_player_index(game_state, first_player_index - 1) 
-            logger.debug(f"[_start_betting_round] Non-pre_flop round: first_player_index determined as {first_player_index}.")
+            logger.debug(f"[_start_betting_round] Non-pre_game round: first_player_index determined as {first_player_index}.")
 
 
         if first_player_index != -1:
@@ -708,7 +708,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 
         next_round = None
-        if game_state['current_round'] == 'pre_flop':
+        if game_state['current_round'] == 'pre_game': # Changed from 'pre_flop' to 'pre_game'
             success, msg = await self.deal_flop(room_id)
             next_round = 'flop'
         elif game_state['current_round'] == 'flop':
@@ -725,8 +725,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             # The timer for post-showdown is set in evaluate_hands.
             # For single player, this will immediately start a new round after showdown.
             success, msg = await self._start_new_round_pre_flop(room_id, game_state['guild_id'], game_state['channel_id'])
-            next_round = 'pre_flop' # If successful, it moves to pre_flop
-
+            next_round = 'pre_game' # If successful, it moves to pre_game
+            
         if not success:
             logger.error(f"[_advance_game_phase] Failed to advance game phase from {game_state['current_round']}: {msg}")
             # Handle error: perhaps notify players, or reset game.
@@ -738,7 +738,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 
         # Start the new betting round (if applicable)
-        if next_round in ['flop', 'turn', 'river', 'pre_flop']: # Pre-flop also starts a betting round
+        if next_round in ['flop', 'turn', 'river', 'pre_game']: # Changed from 'pre_flop' to 'pre_game'
             logger.debug(f"[_advance_game_phase] Starting betting round for {next_round}.")
             await self._start_betting_round(room_id, game_state) # This will set the first player's turn and timer
         
@@ -799,9 +799,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.error("[handle_websocket_game_action] Missing discord_id for leave_player.")
                     return
                 success, message = await self._leave_player(room_id, discord_id)
-            elif action == "start_new_round_pre_flop":
-                # Allow starting if current_round is 'pre_flop' (initial state) or 'showdown' (after a previous game)
-                if game_state.get('current_round') in ['pre_flop', 'showdown']: # Adjusted condition
+            elif action == "start_new_round_pre_flop": # This action name will remain for now, but it will set 'pre_game'
+                # Allow starting if current_round is 'pre_game' (initial state) or 'showdown' (after a previous game)
+                if game_state.get('current_round') in ['pre_game', 'showdown']: # Adjusted condition
                     logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
                     success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
                     if success:
@@ -1164,7 +1164,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         new_deck.shuffle()
 
         # Reset relevant game state variables
-        game_state['current_round'] = 'pre_flop' # Changed from 'pre_game' to 'pre_flop'
+        game_state['current_round'] = 'pre_game' # Changed to 'pre_game'
         game_state['deck'] = new_deck.to_output_format()
         game_state['board_cards'] = []
         game_state['dealer_hand'] = [] # Clear dealer's hand
@@ -1190,9 +1190,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _start_new_round_pre_flop(self, room_id: str, guild_id: str = None, channel_id: str = None) -> tuple[bool, str]:
         """
         Starts a new round, dealing hole cards to players and two cards to the dealer,
-        and sets the round to 'pre_flop'.
+        and sets the round to 'pre_game'.
         """
-        logger.info(f"[_start_new_round_pre_flop] Starting new round pre-flop for room {room_id}.")
+        logger.info(f"[_start_new_round_pre_flop] Starting new round pre-game for room {room_id}.") # Updated log
         
         # 1. Reset the game state like _start_new_game (clears hands, resets betting states, etc.)
         success_reset, message_reset = await self._start_new_game(room_id, guild_id, channel_id)
@@ -1232,8 +1232,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.debug(f"[_start_new_round_pre_flop] Game state reloaded after card deals. Current round: {game_state.get('current_round', 'N/A')}")
 
 
-        # 5. Set the current round to 'pre_flop' (This line is now redundant as _start_new_game sets it to 'pre_flop')
-        # game_state['current_round'] = 'pre_flop'
+        # 5. Set the current round to 'pre_game' (This line is now redundant as _start_new_game sets it to 'pre_game')
+        # game_state['current_round'] = 'pre_game'
         # logger.info(f"[_start_new_round_pre_flop] Set current_round to {game_state['current_round']} for room {room_id}.")
         
         # 6. Start the first betting round (applies blinds and sets first player turn)
@@ -1241,9 +1241,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.debug(f"[_start_new_round_pre_flop] _start_betting_round completed. Current round after betting round start: {game_state.get('current_round', 'N/A')}")
 
 
-        logger.info(f"[_start_new_round_pre_flop] New round for room {room_id} successfully moved to pre_flop.")
+        logger.info(f"[_start_new_round_pre_flop] New round for room {room_id} successfully moved to pre_game.") # Updated log
         
-        return True, "New round started, hole cards and dealer cards dealt, moved to pre_flop."
+        return True, "New round started, hole cards and dealer cards dealt, moved to pre_game."
 
     async def _handle_in_game_message(self, room_id: str, sender_id: str, message_content: str) -> tuple[bool, str, dict]:
         """

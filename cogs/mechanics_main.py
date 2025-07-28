@@ -152,7 +152,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     new_deck.shuffle()
                     game_state = {
                         'room_id': room_id,
-                        'current_round': 'pre_game', # pre_game, pre_flop, flop, turn, river, showdown
+                        'current_round': 'pre_flop', # Changed from 'pre_game' to 'pre_flop' for initial state
                         'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded'
                         'dealer_hand': [], # Initialize dealer's hand
                         'deck': new_deck.to_output_format(),
@@ -248,8 +248,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         deck = Deck(game_state.get('deck', [])) # Use Deck from game_models
         # Shuffle only if it's a new game or if the deck hasn't been shuffled yet for this round
-        # For simplicity, we'll re-shuffle here if it's 'pre_game'
-        if game_state['current_round'] == 'pre_game' or not deck.cards:
+        # For simplicity, we'll re-shuffle here if it's a new round (current_round 'pre_flop')
+        if game_state['current_round'] == 'pre_flop' or not deck.cards: # Adjusted condition
             deck.build() # Rebuild a full deck
             deck.shuffle()
             logger.info(f"[deal_hole_cards] Deck rebuilt and shuffled for room {room_id}.")
@@ -664,7 +664,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
            If there was no aggressive action (all checks), then all must have acted.
         """
         sorted_players = self._get_sorted_players(game_state)
-        active_players = [p for p in sorted_players if not p.get('folded', False)]
+        active_players = [p for p in sorted_players if p.get('seat_id') and not p.get('folded', False)] # Ensure seated players are considered active
         logger.debug(f"[_check_round_completion] Active players count: {len(active_players)}")
 
         # For single-player, if the player is active, the round can be considered complete
@@ -800,11 +800,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     return
                 success, message = await self._leave_player(room_id, discord_id)
             elif action == "start_new_round_pre_flop":
-                # For single-player, we don't need to check initiator or timer for auto-start after showdown.
-                # The game should just start if the button is pressed.
-                
-                # Allow starting if current_round is 'pre_game' or 'showdown' (after a previous game)
-                if game_state.get('current_round') in ['pre_game', 'showdown']:
+                # Allow starting if current_round is 'pre_flop' (initial state) or 'showdown' (after a previous game)
+                if game_state.get('current_round') in ['pre_flop', 'showdown']: # Adjusted condition
                     logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
                     success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
                     if success:
@@ -1167,7 +1164,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         new_deck.shuffle()
 
         # Reset relevant game state variables
-        game_state['current_round'] = 'pre_game'
+        game_state['current_round'] = 'pre_flop' # Changed from 'pre_game' to 'pre_flop'
         game_state['deck'] = new_deck.to_output_format()
         game_state['board_cards'] = []
         game_state['dealer_hand'] = [] # Clear dealer's hand
@@ -1235,9 +1232,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.debug(f"[_start_new_round_pre_flop] Game state reloaded after card deals. Current round: {game_state.get('current_round', 'N/A')}")
 
 
-        # 5. Set the current round to 'pre_flop'
-        game_state['current_round'] = 'pre_flop'
-        logger.info(f"[_start_new_round_pre_flop] Set current_round to {game_state['current_round']} for room {room_id}.")
+        # 5. Set the current round to 'pre_flop' (This line is now redundant as _start_new_game sets it to 'pre_flop')
+        # game_state['current_round'] = 'pre_flop'
+        # logger.info(f"[_start_new_round_pre_flop] Set current_round to {game_state['current_round']} for room {room_id}.")
         
         # 6. Start the first betting round (applies blinds and sets first player turn)
         await self._start_betting_round(room_id, game_state) # This will also save the state and set the timer

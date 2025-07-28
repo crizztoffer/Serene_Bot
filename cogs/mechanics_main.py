@@ -425,8 +425,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if echo_message:
             payload["echo_message"] = echo_message
             logger.info(f"Broadcasting game state with echo_message for room {room_id}.")
-        else:
-            logger.info(f"Broadcasting game state (no echo_message) for room {room_id}.")
+        
+        # Add a debug log to see the current_round being broadcast
+        logger.debug(f"Broadcasting game state with current_round: {game_state.get('current_round', 'N/A')} for room {room_id}.")
 
         message_json = json.dumps(payload)
         
@@ -716,6 +717,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             # Load the current game state at the beginning of processing any action
             game_state = await self._load_game_state(room_id, guild_id, channel_id)
+            logger.debug(f"Current round loaded at start of handle_websocket_game_action: {game_state.get('current_round', 'N/A')}")
 
             if action == "get_state":
                 success = True
@@ -740,9 +742,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if (not game_state.get('game_started_once', False) and is_initiator) or \
                    (game_state.get('current_round') == 'showdown' and int(time.time()) >= game_state.get('timer_end_time', 0)):
                     success, message = await self._start_new_round_pre_flop(room_id, guild_id, channel_id)
-                    if success and not game_state.get('game_started_once', False): # Only set if it was the very first start
-                        game_state['game_started_once'] = True 
-                        await self._save_game_state(room_id, game_state) # Save this flag
+                    if success:
+                        # After successful start, ensure game_started_once is true and save
+                        # This flag is important for the frontend's "Play Game" button visibility
+                        game_state_after_start = await self._load_game_state(room_id) # Reload to get latest state
+                        if not game_state_after_start.get('game_started_once', False):
+                            game_state_after_start['game_started_once'] = True 
+                            await self._save_game_state(room_id, game_state_after_start) # Save this flag
                 else:
                     logger.warning(f"Attempt to start new round failed: Not initiator or timer not expired. {request_data}")
                     return # No broadcast for invalid action
@@ -779,6 +785,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             # This ensures all clients get the most up-to-date game_state.
             if success:
                 updated_game_state = await self._load_game_state(room_id, guild_id, channel_id)
+                logger.debug(f"Current round before save/broadcast: {updated_game_state.get('current_round', 'N/A')}")
                 await self.broadcast_game_state(room_id, updated_game_state, echo_message_data)
                 logger.info(f"Action '{action}' processed and state broadcast for room {room_id}.")
             else:
@@ -1138,6 +1145,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         # 5. Set the current round to 'pre_flop'
         game_state['current_round'] = 'pre_flop'
+        logger.info(f"[_start_new_round_pre_flop] Set current_round to {game_state['current_round']} for room {room_id}.")
         
         # 6. Start the first betting round (applies blinds and sets first player turn)
         await self._start_betting_round(room_id, game_state) # This will also save the state and set the timer

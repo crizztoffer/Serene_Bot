@@ -72,12 +72,12 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             (count,) = await cursor.fetchone()
             if count == 0:
                 initial_json_data = json.dumps({"warnings": {}})
-                # Updated to use guild_id column in the INSERT query
+                # Updated to set kekchipz to 2000 for new users
                 await cursor.execute(
                     "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
+                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data)
                 )
-                logger.info(f"Added new user '{user_name}' to DB.")
+                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz.")
     except Exception as e:
         logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
     finally:
@@ -238,7 +238,7 @@ async def settings_saved_handler(request):
                     return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
 
                 # Decode new_rules_json from bytes to string
-                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
+                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_str
                 logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...") # Log first 200 chars
                 logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
 

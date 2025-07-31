@@ -73,7 +73,7 @@ class TicTacToeView(ui.View):
             all(self.board[j][i] == player for j in range(3))
             for i in range(3)
         ) or all(self.board[i][i] == player for i in range(3)) or \
-               all(self.board[i][2 - i] == player for i in range(3))
+                all(self.board[i][2 - i] == player for i in range(3))
 
     async def give_kekchipz_reward(self, discord_id: int, outcome: str) -> int:
         """
@@ -106,14 +106,14 @@ class TicTacToeView(ui.View):
             async with conn.cursor() as cursor:
                 # Update balance
                 await cursor.execute(
-                    "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE channel_id = %s AND discord_id = %s",
+                    "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s",
                     (reward_amount, str(self.interaction.guild.id), str(discord_id))
                 )
                 print(f"User {discord_id} in guild {self.interaction.guild.id} awarded {reward_amount} kekchipz for {outcome_text}.")
                 
                 # Fetch new balance
                 await cursor.execute(
-                    "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                    "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
                     (str(self.interaction.guild.id), str(discord_id))
                 )
                 result = await cursor.fetchone()

@@ -468,7 +468,7 @@ async def on_ready():
             await bot.tree.sync(guild=guild)
             logger.info(f"✅ Resynced commands for guild: {guild.name} ({guild.id})")
         except Exception as e:
-        logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
+            logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
 
     # Ensure all users are in DB
     for guild in bot.guilds:

@@ -1164,7 +1164,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         new_deck.shuffle()
 
         # Reset relevant game state variables
-        game_state['current_round'] = 'pre_game' # Changed to 'pre_game'
+        game_state['current_round'] = 'pre_flop' # Changed to 'pre_game'
         game_state['deck'] = new_deck.to_output_format()
         game_state['board_cards'] = []
         game_state['dealer_hand'] = [] # Clear dealer's hand

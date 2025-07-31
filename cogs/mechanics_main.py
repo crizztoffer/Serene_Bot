@@ -725,7 +725,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             # The timer for post-showdown is set in evaluate_hands.
             # For single player, this will immediately start a new round after showdown.
             success, msg = await self._start_new_round_pre_flop(room_id, game_state['guild_id'], game_state['channel_id'])
-            next_round = 'pre_game' # If successful, it moves to pre_game
+            next_round = 'pre_flop' # If successful, it moves to pre_game
             
         if not success:
             logger.error(f"[_advance_game_phase] Failed to advance game phase from {game_state['current_round']}: {msg}")
@@ -738,7 +738,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 
         # Start the new betting round (if applicable)
-        if next_round in ['flop', 'turn', 'river', 'pre_game']: # Changed from 'pre_flop' to 'pre_game'
+        if next_round in ['pre_flop','flop', 'turn', 'river']: # Changed from 'pre_flop' to 'pre_game'
             logger.debug(f"[_advance_game_phase] Starting betting round for {next_round}.")
             await self._start_betting_round(room_id, game_state) # This will set the first player's turn and timer
         
@@ -1233,7 +1233,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 
         # 5. Set the current round to 'pre_game' (This line is now redundant as _start_new_game sets it to 'pre_game')
-        # game_state['current_round'] = 'pre_game'
+        # game_state['current_round'] = 'pre_flop'
         # logger.info(f"[_start_new_round_pre_flop] Set current_round to {game_state['current_round']} for room {room_id}.")
         
         # 6. Start the first betting round (applies blinds and sets first player turn)

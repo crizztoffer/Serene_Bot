@@ -128,6 +128,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         Loads the game state for a given room_id from the database.
         If not found, initializes a new state, using provided guild_id and channel_id.
         Ensures guild_id and channel_id are always present in the returned state.
+        Fetches kekchipz for each player from discord_users table.
         """
         conn = None
         try:
@@ -153,7 +154,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     game_state = {
                         'room_id': room_id,
                         'current_round': 'pre_game', # Changed to 'pre_game' as requested
-                        'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded'
+                        'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded', 'kekchipz_overall'
                         'dealer_hand': [], # Initialize dealer's hand
                         'deck': new_deck.to_output_format(),
                         'board_cards': [],
@@ -190,7 +191,26 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('big_blind_amount', 10)
                 game_state.setdefault('game_started_once', False)
 
+                # Fetch kekchipz for each player
                 for player in game_state.get('players', []):
+                    player_discord_id = player['discord_id']
+                    # Only fetch if channel_id is available
+                    if game_state['channel_id'] and player_discord_id:
+                        await cursor.execute(
+                            "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND channel_id = %s",
+                            (player_discord_id, game_state['channel_id'])
+                        )
+                        kekchipz_result = await cursor.fetchone()
+                        if kekchipz_result and 'kekchipz' in kekchipz_result:
+                            player['kekchipz_overall'] = kekchipz_result['kekchipz']
+                            logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
+                        else:
+                            player['kekchipz_overall'] = 0 # Default if not found
+                            logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in channel {game_state['channel_id']}. Setting to 0.")
+                    else:
+                        player['kekchipz_overall'] = 0 # Default if channel_id or discord_id is missing
+                        logger.warning(f"[_load_game_state] Missing channel_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
+
                     player.setdefault('total_chips', 1000) # Default starting chips
                     player.setdefault('current_bet_in_round', 0)
                     player.setdefault('has_acted_in_round', False)
@@ -1055,10 +1075,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'hand': [],
                 'seat_id': seat_id,
                 'avatar_url': player_data.get('avatar_url'),
-                'total_chips': 1000,
+                'total_chips': 1000, # This will be updated with kekchipz from _load_game_state
                 'current_bet_in_round': 0,
                 'has_acted_in_round': False,
-                'folded': False
+                'folded': False,
+                'kekchipz_overall': 0 # Initialize, will be fetched in _load_game_state
             }
             players.append(new_player)
             logger.info(f"[_add_player_to_game] New player {player_name} added to game state. Current players list: {players}")
@@ -1106,6 +1127,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             player['current_bet_in_round'] = 0
             player['has_acted_in_round'] = False
             player['folded'] = False
+            # When starting a new game, reset total_chips to their overall kekchipz balance
+            # This assumes kekchipz_overall has been loaded into the player dict by _load_game_state
+            player['total_chips'] = player.get('kekchipz_overall', 1000) # Use fetched kekchipz, or default to 1000
 
         logger.info(f"[_start_new_game] Game state reset for room {room_id}.")
         return True, "New game started successfully.", game_state

@@ -64,15 +64,17 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             autocommit=True
         )
         async with conn.cursor() as cursor:
+            # Updated to use guild_id column in the SELECT query
             await cursor.execute(
-                "SELECT COUNT(*) FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                "SELECT COUNT(*) FROM discord_users WHERE guild_id = %s AND discord_id = %s",
                 (str(guild_id), str(discord_id))
             )
             (count,) = await cursor.fetchone()
             if count == 0:
                 initial_json_data = json.dumps({"warnings": {}})
+                # Updated to use guild_id column in the INSERT query
                 await cursor.execute(
-                    "INSERT INTO discord_users (channel_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
+                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
                     (str(guild_id), user_name, str(discord_id), 0, initial_json_data)
                 )
                 logger.info(f"Added new user '{user_name}' to DB.")
@@ -466,7 +468,7 @@ async def on_ready():
             await bot.tree.sync(guild=guild)
             logger.info(f"✅ Resynced commands for guild: {guild.name} ({guild.id})")
         except Exception as e:
-            logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
+        logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
 
     # Ensure all users are in DB
     for guild in bot.guilds:

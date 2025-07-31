@@ -40,8 +40,9 @@ async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, bot_
         )
         async with conn.cursor() as cursor:
             # First, get the current kekchipz balance
+            # Corrected: Using guild_id instead of channel_id
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
                 (str(guild_id), str(discord_id))
             )
             result = await cursor.fetchone()
@@ -54,8 +55,9 @@ async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, bot_
                 new_kekchipz = 0
                 logger.info(f"User {discord_id} balance would go negative, setting to 0.")
 
+            # Corrected: Using guild_id instead of channel_id
             await cursor.execute(
-                "UPDATE discord_users SET kekchipz = %s WHERE channel_id = %s AND discord_id = %s",
+                "UPDATE discord_users SET kekchipz = %s WHERE guild_id = %s AND discord_id = %s",
                 (new_kekchipz, str(guild_id), str(discord_id))
             )
             logger.info(f"Updated user {discord_id} in guild {guild_id} kekchipz from {current_kekchipz} to {new_kekchipz} (change: {amount}).")
@@ -85,8 +87,9 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, bot_instance: comman
             autocommit=True
         )
         async with conn.cursor() as cursor:
+            # Corrected: Using guild_id instead of channel_id
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
                 (str(guild_id), str(discord_id))
             )
             result = await cursor.fetchone()

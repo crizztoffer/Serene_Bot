@@ -1090,7 +1090,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         new_deck.build()
         new_deck.shuffle()
 
-        game_state['current_round'] = 'pre_game'
+        game_state['current_round'] = 'pre_flop'
         game_state['deck'] = new_deck.to_output_format()
         game_state['board_cards'] = []
         game_state['dealer_hand'] = []

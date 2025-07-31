@@ -23,14 +23,13 @@ active_texasholdem_games = {}
 # --- Database Operations ---
 # These functions will now interact with the MySQL database using aiomysql.
 
-async def update_user_kekchipz(channel_or_guild_id: int, discord_id: int, amount: int, db_config: dict):
+async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_config: dict):
     """
     Updates a user's kekchipz balance in the database.
     Ensures the balance does not go below zero.
     
-    NOTE: The first argument is named channel_or_guild_id because the bot.py
-    currently stores guild_id in the channel_id column of the database.
-    This function expects the ID that is actually stored in the database's channel_id column.
+    NOTE: The first argument is now named guild_id to correctly match the
+    `guild_id` column in the database.
     """
     conn = None
     try:
@@ -45,8 +44,8 @@ async def update_user_kekchipz(channel_or_guild_id: int, discord_id: int, amount
         async with conn.cursor() as cursor:
             # First, get the current kekchipz
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
-                (str(channel_or_guild_id), str(discord_id))
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
             )
             result = await cursor.fetchone()
             current_kekchipz = result[0] if result else 0
@@ -56,24 +55,23 @@ async def update_user_kekchipz(channel_or_guild_id: int, discord_id: int, amount
                 new_kekchipz = 0 # Ensure balance doesn't go negative
 
             await cursor.execute(
-                "UPDATE discord_users SET kekchipz = %s WHERE channel_id = %s AND discord_id = %s",
-                (new_kekchipz, str(channel_or_guild_id), str(discord_id))
+                "UPDATE discord_users SET kekchipz = %s WHERE guild_id = %s AND discord_id = %s",
+                (new_kekchipz, str(guild_id), str(discord_id))
             )
-            logger.info(f"DB Update: User {discord_id} in channel/guild {channel_or_guild_id} kekchipz changed by {amount}. New balance: {new_kekchipz}.")
+            logger.info(f"DB Update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}. New balance: {new_kekchipz}.")
     except Exception as e:
         logger.error(f"DB error in update_user_kekchipz for user {discord_id}: {e}")
     finally:
         if conn:
             await conn.ensure_closed()
 
-async def get_user_kekchipz(channel_or_guild_id: int, discord_id: int, db_config: dict) -> int:
+async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> int:
     """
     Fetches a user's kekchipz balance from the database.
     Returns 0 if the user is not found or an error occurs.
     
-    NOTE: The first argument is named channel_or_guild_id because the bot.py
-    currently stores guild_id in the channel_id column of the database.
-    This function expects the ID that is actually stored in the database's channel_id column.
+    NOTE: The first argument is now named guild_id to correctly match the
+    `guild_id` column in the database.
     """
     conn = None
     try:
@@ -87,14 +85,14 @@ async def get_user_kekchipz(channel_or_guild_id: int, discord_id: int, db_config
         )
         async with conn.cursor() as cursor:
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
-                (str(channel_or_guild_id), str(discord_id))
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
             )
             result = await cursor.fetchone()
             if result:
                 return result[0]
             else:
-                logger.warning(f"User {discord_id} not found in DB for channel/guild {channel_or_guild_id}. Returning 0 kekchipz.")
+                logger.warning(f"User {discord_id} not found in DB for guild {guild_id}. Returning 0 kekchipz.")
                 return 0
     except Exception as e:
         logger.error(f"DB error in get_user_kekchipz for user {discord_id}: {e}")
@@ -1041,7 +1039,6 @@ class TexasHoldEmGame:
         Updates the single game message for Texas Hold 'em with the combined image and view.
         This function is used for subsequent edits to the game message after the initial send.
         """
-        # Pass self.player.guild.id instead of self.channel_id to match database's channel_id column
         player_kekchipz = await get_user_kekchipz(self.player.guild.id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,
@@ -1079,7 +1076,6 @@ class TexasHoldEmGame:
         Sends the initial game message to the channel.
         This function is called once at the start of the game.
         """
-        # Pass interaction.guild.id instead of self.channel_id to match database's channel_id column
         player_kekchipz = await get_user_kekchipz(interaction.guild.id, self.player.id, self.db_config)
         combined_image_pil = await self._create_combined_holdem_image(
             self.player.display_name,

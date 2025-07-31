@@ -8,6 +8,11 @@ import urllib.parse # For URL encoding
 import json # For parsing JSON data
 import re # Import the re module for regular expressions
 import aiohttp # For asynchronous HTTP requests
+import aiomysql # Import aiomysql for database operations
+import logging # Import logging
+
+# Set up logging for this module
+logger = logging.getLogger(__name__)
 
 # --- Game State Storage ---
 # This dictionary will store active Jeopardy games by channel ID.
@@ -56,35 +61,71 @@ def calculate_word_similarity(word1: str, word2: str) -> float:
     similarity_percentage = ((max_len - dist) / max_len) * 100.0
     return similarity_percentage
 
-# --- Database Operations (Placeholders) ---
-# These functions are placeholders for actual database interactions.
-# In a real application, you would connect to a database (e.g., MySQL, PostgreSQL, SQLite)
-# to persist user data like "kekchipz" (a fictional currency).
-# For this isolated file, they simply print messages.
+# --- Database Operations ---
+async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int, db_config: dict):
+    """
+    Updates a user's kekchipz balance in the database.
+    Ensures the balance does not go below zero.
+    """
+    conn = None
+    try:
+        # Removed the 'db' parameter from the connection
+        conn = await aiomysql.connect(
+            host=db_config['DB_HOST'],
+            user=db_config['DB_USER'],
+            password=db_config['DB_PASSWORD'],
+            autocommit=True
+        )
 
-async def update_user_kekchipz(guild_id: int, discord_id: int, amount: int):
-    """
-    Placeholder function to simulate updating a user's kekchipz balance in a database.
-    In a real scenario, this would interact with a database.
-    """
-    print(f"Simulating update: User {discord_id} in guild {guild_id} kekchipz changed by {amount}.")
-    # Example of how you might integrate a real database call:
-    # try:
-    #     conn = await aiomysql.connect(...)
-    #     async with conn.cursor() as cursor:
-    #         await cursor.execute("UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s", (amount, str(guild_id), str(discord_id)))
-    # except Exception as e:
-    #     print(f"Database update failed: {e}")
+        async with conn.cursor() as cursor:
+            # First, check if the user exists
+            await cursor.execute("SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s", (str(guild_id), str(discord_id)))
+            result = await cursor.fetchone()
 
-async def get_user_kekchipz(guild_id: int, discord_id: int) -> int:
+            if result:
+                current_kekchipz = result[0]
+                new_kekchipz = max(0, current_kekchipz + amount) # Ensure balance doesn't go below zero
+                await cursor.execute("UPDATE discord_users SET kekchipz = %s WHERE guild_id = %s AND discord_id = %s", (new_kekchipz, str(guild_id), str(discord_id)))
+                logger.info(f"Updated user {discord_id} in guild {guild_id}: kekchipz changed by {amount}. New balance: {new_kekchipz}")
+            else:
+                # If the user doesn't exist, insert them with the given amount (if positive)
+                initial_kekchipz = max(0, amount)
+                await cursor.execute("INSERT INTO discord_users (guild_id, discord_id, kekchipz) VALUES (%s, %s, %s)", (str(guild_id), str(discord_id), initial_kekchipz))
+                logger.info(f"Inserted new user {discord_id} in guild {guild_id} with initial kekchipz: {initial_kekchipz}")
+    except Exception as e:
+        logger.error(f"Database update failed for user {discord_id} in guild {guild_id}: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> int:
     """
-    Placeholder function to simulate fetching a user's kekchipz balance from a database.
+    Fetches a user's kekchipz balance from the database.
     Returns 0 if the user is not found or an error occurs.
     """
-    print(f"Simulating fetch: Getting kekchipz for user {discord_id} in guild {guild_id}.")
-    # In a real scenario, this would query a database.
-    # For now, let's return a dummy value or a default.
-    return 1000 # Example: User starts with 1000 kekchipz for testing
+    conn = None
+    try:
+        # Removed the 'db' parameter from the connection
+        conn = await aiomysql.connect(
+            host=db_config['DB_HOST'],
+            user=db_config['DB_USER'],
+            password=db_config['DB_PASSWORD'],
+        )
+
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s", (str(guild_id), str(discord_id)))
+            result = await cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                # User not found, return a default of 0
+                return 0
+    except Exception as e:
+        logger.error(f"Database fetch failed for user {discord_id} in guild {guild_id}: {e}")
+        return 0
+    finally:
+        if conn:
+            conn.close()
 
 
 # --- Jeopardy Game UI Components ---
@@ -258,8 +299,7 @@ class CategoryValueSelect(discord.ui.Select):
                         # Do not reset wager if deletion fails due to permissions
                     except Exception as delete_e:
                         print(f"WARNING: An unexpected error occurred during message deletion: {delete_e}")
-                        # Do not reset wager for other deletion errors either
-
+                        game.current_wager = 500
                 except asyncio.TimeoutError:
                     print("DEBUG: Wager input timed out.") # DEBUG
                     await interaction.channel.send("Time's up! You didn't enter a wager. Defaulting to $500.", delete_after=5)
@@ -361,7 +401,6 @@ class CategoryValueSelect(discord.ui.Select):
                         f"❌ Incorrect, {game.player.display_name}! The correct answer was: "
                         f"**__{full_correct_answer}__**. Your score is now **{'-' if game.score < 0 else ''}${abs(game.score)}**."
                     )
-
             except asyncio.TimeoutError:
                 # No score change for timeout
                 full_correct_answer = f'"{determined_prefix} {question_data["answer"]}"'.strip()
@@ -375,7 +414,6 @@ class CategoryValueSelect(discord.ui.Select):
             finally:
                 game.current_question = None # Clear current question state
                 game.current_wager = 0 # Reset wager
-
                 # Check if all questions in the current phase are guessed
                 current_phase_completed = False
                 if game.game_phase == "NORMAL_JEOPARDY" and game.is_all_questions_guessed("normal_jeopardy"):
@@ -384,7 +422,6 @@ class CategoryValueSelect(discord.ui.Select):
                     await interaction.channel.send(f"**Double Jeopardy!** All normal jeopardy questions have been answered. Get ready for new challenges, {game.player.display_name}!")
                 elif game.game_phase == "DOUBLE_JEOPARDY" and game.is_all_questions_guessed("double_jeopardy"):
                     current_phase_completed = True
-                    
                     # --- Final Jeopardy Logic ---
                     if game.score <= 0:
                         await interaction.channel.send(
@@ -396,25 +433,21 @@ class CategoryValueSelect(discord.ui.Select):
                             del active_jeopardy_games[game.channel_id]
                         view.stop() # Stop the current view's timeout
                         return # End the game here
-
                     # If player has positive earnings, proceed to Final Jeopardy
                     game.game_phase = "FINAL_JEOPARDY"
                     await interaction.channel.send(f"**Final Jeopardy!** All double jeopardy questions have been answered. Get ready for the final round, {game.player.display_name}!")
-
                     # Final Jeopardy Wager
                     final_max_wager = max(2000, game.score)
                     wager_prompt_message = await interaction.channel.send(
                         f"{game.player.display_name}, your current score is **{'-' if game.score < 0 else ''}${abs(game.score)}**. "
                         f"Please enter your Final Jeopardy wager. You can wager any amount up to **${final_max_wager}** (must be positive)."
                     )
-
                     def check_final_wager(m: discord.Message):
                         return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id and m.content.isdigit()
 
                     try:
                         final_wager_msg = await view.bot_instance.wait_for('message', check=check_final_wager, timeout=60.0) # Longer timeout for wager
                         final_wager_input = int(final_wager_msg.content)
-
                         if final_wager_input <= 0:
                             await interaction.channel.send("Your wager must be a positive amount. Defaulting to $1.", delete_after=5)
                             game.current_wager = 1
@@ -423,7 +456,6 @@ class CategoryValueSelect(discord.ui.Select):
                             game.current_wager = final_max_wager
                         else:
                             game.current_wager = final_wager_input
-                        
                         try:
                             await wager_prompt_message.delete()
                             await final_wager_msg.delete()
@@ -431,282 +463,307 @@ class CategoryValueSelect(discord.ui.Select):
                             print("WARNING: Missing permissions to delete wager messages.")
                         except Exception as delete_e:
                             print(f"WARNING: An unexpected error occurred during message deletion: {delete_e}")
-
                     except asyncio.TimeoutError:
                         await interaction.channel.send("Time's up! You didn't enter a wager. Defaulting to $0.", delete_after=5)
-                        game.current_wager = 0 # Wager 0 if timeout
-                    except Exception as e:
-                        print(f"Error getting Final Jeopardy wager: {e}")
-                        await interaction.channel.send("An error occurred while getting your wager. Defaulting to $0.", delete_after=5)
                         game.current_wager = 0
+                    except Exception as e:
+                        print(f"Error getting final wager: {e}")
+                        await interaction.channel.send("An error occurred while getting your final wager. Defaulting to $0.", delete_after=5)
+                        game.current_wager = 0
+                    
+                    # Send Final Jeopardy question
+                    final_jeopardy_question = game.final_jeopardy_data.get("final_question")
+                    if final_jeopardy_question:
+                        # Attempt to get a dynamic prefix for the Final Jeopardy answer
+                        final_determined_prefix = "What is"
+                        api_key = os.getenv('GEMINI_API_KEY')
+                        if api_key:
+                            try:
+                                gemini_prompt = f"Given the answer '{final_jeopardy_question['answer']}', what is the single most grammatically appropriate prefix (e.g., 'What is', 'Who is', 'What are', 'Who are', 'What was', 'Who was', 'What were', 'Who were') that would precede it in a Jeopardy-style question? Provide only the prefix string, exactly as it should be used (e.g., 'Who is', 'What were')."
+                                chat_history = [{"role": "user", "parts": [{"text": gemini_prompt}]}]
+                                payload = {"contents": chat_history}
+                                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
 
-                    # Present Final Jeopardy Question
-                    final_question_data = game.final_jeopardy_data.get("final_jeopardy")
-                    if final_question_data:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.post(api_url, headers={'Content-Type': 'application/json'}, json=payload) as response:
+                                        if response.status == 200:
+                                            gemini_result = await response.json()
+                                            if gemini_result.get("candidates") and len(gemini_result["candidates"]) > 0 and \
+                                               gemini_result["candidates"][0].get("content") and \
+                                               gemini_result["candidates"][0]["content"].get("parts") and \
+                                               len(gemini_result["candidates"][0]["content"]["parts"]) > 0:
+                                                
+                                                generated_text = gemini_result["candidates"][0]["content"]["parts"][0]["text"].strip()
+                                                valid_prefixes = ("what is", "who is", "what are", "who are", "what was", "who was", "what were", "who were")
+                                                if generated_text.lower() in valid_prefixes:
+                                                    final_determined_prefix = generated_text
+                            except Exception as e:
+                                print(f"Error calling Gemini API for final jeopardy prefix determination: {e}. Using default.")
+                        
                         await interaction.channel.send(
-                            f"Your wager: **${game.current_wager}**.\n\n"
-                            f"**Final Jeopardy Category:** {final_question_data['category']}\n\n"
-                            f"**The Clue:** {final_question_data['question']}"
+                            f"**Final Jeopardy Category:** {final_jeopardy_question['category']}\n\n"
+                            f"You wagered **${game.current_wager}**.\n"
+                            f"**__{final_jeopardy_question['question']}__**"
                         )
-
+                        
                         def check_final_answer(m: discord.Message):
-                            # No prefix required for Final Jeopardy answers
-                            return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id
+                            return m.author.id == interaction.user.id and m.channel.id == interaction.channel.id and m.content.lower().startswith(final_determined_prefix.lower())
 
                         try:
-                            final_user_answer_msg = await view.bot_instance.wait_for('message', check=check_final_answer, timeout=60.0) # Longer timeout for answer
-                            final_user_raw_answer = final_user_answer_msg.content.lower().strip()
-
-                            final_correct_answer_raw_lower = final_question_data['answer'].lower()
-                            final_correct_answer_for_comparison = re.sub(r'\s*\(.*\)', '', final_correct_answer_raw_lower).strip()
-
-                            final_is_correct = False
-                            if final_user_raw_answer == final_correct_answer_for_comparison:
-                                final_is_correct = True
-                            else:
-                                final_user_words = set(re.findall(r'\b\w+\b', final_user_raw_answer))
-                                final_correct_words_full = set(re.findall(r'\b\w+\b', final_correct_answer_for_comparison))
-                                
-                                # For Final Jeopardy, all words in the correct answer are "significant"
-                                final_significant_correct_words = list(final_correct_words_full) # Convert to list for iteration
-
-                                for user_word in final_user_words:
-                                    for sig_correct_word in final_significant_correct_words:
-                                        similarity = calculate_word_similarity(user_word, sig_correct_word)
-                                        if similarity >= 70.0:
-                                            final_is_correct = True
-                                            break
-                                    if final_is_correct:
-                                        break
+                            final_answer_msg = await view.bot_instance.wait_for('message', check=check_final_answer, timeout=60.0) # Longer timeout for answer
+                            final_raw_answer = final_answer_msg.content.lower()
                             
-                            if final_is_correct:
+                            processed_final_answer = final_raw_answer[len(final_determined_prefix):].strip()
+                            correct_final_answer = final_jeopardy_question['answer'].lower().strip()
+                            
+                            if processed_final_answer == correct_final_answer:
                                 game.score += game.current_wager
                                 await interaction.channel.send(
-                                    f"✅ Correct, {game.player.display_name}! You answered correctly and gained **${game.current_wager}**."
+                                    f"✅ Correct, {game.player.display_name}! Your final score is **{'-' if game.score < 0 else ''}${abs(game.score)}**."
+                                )
+                                # Add the update to the database here
+                                await update_user_kekchipz(
+                                    guild_id=interaction.guild.id,
+                                    discord_id=interaction.user.id,
+                                    amount=game.current_wager,
+                                    db_config=game.db_config
                                 )
                             else:
                                 game.score -= game.current_wager
+                                final_correct_answer_full = f'"{final_determined_prefix} {final_jeopardy_question["answer"]}"'.strip()
                                 await interaction.channel.send(
                                     f"❌ Incorrect, {game.player.display_name}! The correct answer was: "
-                                    f"**__{final_question_data['answer']}__**. You lost **${game.current_wager}**."
+                                    f"**__{final_correct_answer_full}__**. Your final score is **{'-' if game.score < 0 else ''}${abs(game.score)}**."
                                 )
                         except asyncio.TimeoutError:
+                            game.score -= game.current_wager # No score change on timeout
+                            final_correct_answer_full = f'"{final_determined_prefix} {final_jeopardy_question["answer"]}"'.strip()
                             await interaction.channel.send(
-                                f"⏰ Time's up, {game.player.display_name}! You didn't answer in time for Final Jeopardy. "
-                                f"The correct answer was: **__{final_question_data['answer']}__**."
+                                f"⏰ Time's up! You didn't answer in time. The correct answer was: "
+                                f"**__{final_correct_answer_full}__**. Your final score is **{'-' if game.score < 0 else ''}${abs(game.score)}**."
                             )
-                        except Exception as e:
-                            print(f"Error waiting for Final Jeopardy answer: {e}")
-                            await interaction.channel.send("An unexpected error occurred while waiting for your Final Jeopardy answer.")
-                    else:
-                        await interaction.channel.send("Could not load Final Jeopardy question data.")
-                    
-                    # End of Final Jeopardy
-                    await interaction.channel.send(
-                        f"Final Score for {game.player.display_name}: **{'-' if game.score < 0 else ''}${abs(game.score)}**.\n"
-                        "Thank you for playing Jeopardy!"
-                    )
-                    # Add kekchipz based on final score if greater than 0
-                    if game.score > 0:
-                        await update_user_kekchipz(interaction.guild.id, interaction.user.id, game.score)
-
+                        
+                    # End the Final Jeopardy Game
+                    await interaction.channel.send(f"Thank you for playing Jeopardy, {game.player.display_name}! The game is now over.")
                     if game.channel_id in active_jeopardy_games:
                         del active_jeopardy_games[game.channel_id]
-                    view.stop() # Stop the current view's timeout
-                    return # Exit if Final Jeopardy is reached, as no more dropdowns are needed
+                    view.stop()
+                    return
 
-                # Stop the current view before sending a new one
-                view.stop()
 
-                # Send a NEW message with the dropdowns for the next phase, or the current phase if not completed
-                new_jeopardy_view = JeopardyGameView(game, view.bot_instance) # Pass bot_instance
-                new_jeopardy_view.add_board_components() # Rebuilds the view with updated options (guessed questions removed)
-
-                # Determine the content for the new board message based on the game phase
-                board_message_content = ""
-                if game.game_phase == "NORMAL_JEOPARDY":
-                    board_message_content = (
-                        f"**{game.player.display_name}**'s Score: **{'-' if game.score < 0 else ''}${abs(game.score)}**\n\n"
-                        "Select a category and value from the dropdowns below!"
-                    )
-                elif game.game_phase == "DOUBLE_JEOPARDY":
-                    board_message_content = (
-                        f"**{game.player.display_name}**'s Score: **{'-' if game.score < 0 else ''}${abs(game.score)}**\n\n"
-                        "**Double Jeopardy!** Select a category and value from the dropdowns below!"
-                    )
-                
-                if board_message_content: # Only send if there's content (i.e., not Final Jeopardy yet)
-                    game.board_message = await interaction.channel.send(
-                        content=board_message_content,
-                        view=new_jeopardy_view
-                    )
-                else:
-                    # If we reached Final Jeopardy and no board message is sent, clean up view
-                    if new_jeopardy_view.children: # If there are still components, disable them
-                        for item in new_jeopardy_view.children:
-                            item.disabled = True
-                        await interaction.channel.send("Game concluded. No more questions.", view=new_jeopardy_view)
-                    else:
-                        await interaction.channel.send("Game concluded. No more questions.")
-
-        else:
-            # If for some reason the question is not found or already guessed (race condition)
-            await interaction.response.send_message(
-                f"Question '{self.category_name}' for ${selected_value} not found or already picked. Please select another.",
-                ephemeral=True
-            )
+            # If the current phase is not completed, rebuild the board
+            if not current_phase_completed:
+                await view.rebuild_board(interaction)
 
 
 class JeopardyGameView(discord.ui.View):
-    """The Discord UI View that holds the interactive Jeopardy board dropdowns."""
+    """
+    The main view for the Jeopardy game, holding the category/value selectors.
+    It dynamically updates the board based on answered questions.
+    """
     def __init__(self, game: 'NewJeopardyGame', bot_instance: commands.Bot):
-        # Increased timeout to 15 minutes (900 seconds)
-        super().__init__(timeout=900)
-        self.game = game # Reference to the NewJeopardyGame instance
-        self.bot_instance = bot_instance # Store the bot instance
-        self._selected_category = None # Stores the category selected by the user
-        self._selected_value = None # Stores the value selected by the user
+        super().__init__(timeout=1800) # 30 minutes timeout
+        self.game = game
+        self.bot_instance = bot_instance
+        self._selected_category = None
+        self._selected_value = None
 
     def add_board_components(self):
-        """
-        Dynamically adds dropdowns (selects) for categories to the view.
-        Each dropdown is placed on its own row, up to a maximum of 5 rows (0-4).
-        """
-        self.clear_items()  # Clear existing items before rebuilding the board
-
-        # Determine which data set to use based on current game phase
-        categories_to_process = []
+        """Adds the category and value dropdowns to the view."""
+        self.clear_items()
+        
+        # Determine which data set to use based on game phase
+        categories_to_show = []
         if self.game.game_phase == "NORMAL_JEOPARDY":
-            categories_to_process = self.game.normal_jeopardy_data.get("normal_jeopardy", [])
+            categories_to_show = self.game.normal_jeopardy_data.get("normal_jeopardy", [])
         elif self.game.game_phase == "DOUBLE_JEOPARDY":
-            categories_to_process = self.game.double_jeopardy_data.get("double_data", []) # Corrected key
-        else:
-            # No dropdowns for Final Jeopardy or other phases
-            return
+            categories_to_show = self.game.double_jeopardy_data.get("double_data", [])
 
-        # Iterate through categories and assign each to a new row, limiting to 5 rows for Discord UI
-        for i, category_data in enumerate(categories_to_process):
-            if i >= 5: # Discord UI has a maximum of 5 rows (0-4) for components
-                break
+        # Create dropdowns for each category
+        for i, category_data in enumerate(categories_to_show):
+            options = []
+            for q_data in category_data["questions"]:
+                if not q_data["guessed"]:
+                    options.append(discord.SelectOption(label=f"${q_data['value']}", value=str(q_data['value'])))
 
-            category_name = category_data["category"]
-            options = [
-                discord.SelectOption(label=f"${q['value']}", value=str(q['value']))
-                for q in category_data["questions"] if not q["guessed"] # Only show unguessed questions
-            ]
-
-            if options: # Only add a dropdown if there are available questions in the category
-                # Place each category's dropdown on its own row (i.e., row=0, row=1, row=2, etc.)
+            # Only add a dropdown if there are available questions in the category
+            if options:
+                # Add a dropdown for the category's values
                 self.add_item(CategoryValueSelect(
-                    category_name,
-                    options,
-                    f"Pick for {category_name}",
-                    row=i
+                    category_name=category_data["category"],
+                    options=options,
+                    placeholder=category_data["category"],
+                    row=i # Use row for layout
                 ))
 
-    async def on_timeout(self):
-        """Called when the view times out due to inactivity."""
-        if self.game.board_message:
-            try:
-                # Added try-except for NotFound error
-                await self.game.board_message.edit(content="Jeopardy game timed out due to inactivity.", view=None)
-            except discord.errors.NotFound:
-                print("WARNING: Board message not found during timeout, likely already deleted.")
-            except Exception as e:
-                print(f"WARNING: An error occurred editing board message on timeout: {e}")
+    async def rebuild_board(self, interaction: discord.Interaction):
+        """Rebuilds the board and sends a new message with the updated view."""
+        # Acknowledge the interaction first to prevent "Unknown interaction"
+        await interaction.response.send_message("The game board is being updated...", ephemeral=True)
         
-        # Changed self.game.channel.id to self.game.channel_id
-        if self.game.channel_id in active_jeopardy_games:
-            # Clean up the game state
-            del active_jeopardy_games[self.game.channel_id]
-        print(f"Jeopardy game in channel {self.game.channel_id} timed out.")
+        self.add_board_components() # Re-create the dropdowns
+
+        # Construct the new board message content
+        message_content = f"**{self.game.player.display_name}**'s Score: **{'-' if self.game.score < 0 else ''}${abs(self.game.score)}**\n\n"
+        if not self.game.is_game_over():
+            message_content += "Select a category and value from the dropdowns below!"
+        else:
+            message_content += "The game has ended."
+            self.stop() # Stop the view since the game is over
+
+        # Send the new board message, replacing the old one
+        try:
+            if self.game.board_message:
+                await self.game.board_message.delete()
+                self.game.board_message = None
+        except discord.errors.NotFound:
+            print("WARNING: Old board message not found during rebuild.")
+        except discord.errors.Forbidden:
+            print("WARNING: Missing permissions to delete the old board message.")
+        
+        # Send the new board message and store its reference
+        if not self.game.is_game_over():
+            new_board_message = await interaction.channel.send(
+                content=message_content,
+                view=self
+            )
+            self.game.board_message = new_board_message
+        else:
+            # If the game is over, we don't need a view. Just send the final message.
+            await interaction.channel.send(content=message_content)
+        
+        # Clear the ephemeral response
+        try:
+            await interaction.delete_original_response()
+        except Exception as e:
+            print(f"Error deleting ephemeral response: {e}")
+
+    async def on_timeout(self) -> None:
+        """Called when the view times out."""
+        # End the game gracefully
+        channel = self.game.channel_id
+        if channel in active_jeopardy_games:
+            del active_jeopardy_games[channel]
+            await self.game.board_message.edit(content="Jeopardy game timed out.", view=None)
 
 
-# --- New Jeopardy Game Class ---
 class NewJeopardyGame:
     """
-    A class for the new Jeopardy game.
-    Manages game state, player score, and Jeopardy data.
+    Represents a single instance of a Jeopardy game.
+    Manages game state, scoring, and data.
     """
-    def __init__(self, channel_id: int, player: discord.User, bot_instance: commands.Bot):
+    def __init__(self, channel_id: int, player: discord.Member, bot_instance: commands.Bot, db_config: dict):
         self.channel_id = channel_id
         self.player = player
-        self.bot_instance = bot_instance # Store the bot instance
-        self.score = 0 # Initialize player score
-        self.normal_jeopardy_data = None
-        self.double_jeopardy_data = None
-        self.final_jeopardy_data = None
-        self.jeopardy_data_url = "https://serenekeks.com/serene_bot_games.php"
-        self.board_message = None # To store the message containing the board UI
-        self.current_question = None # Stores the question currently being presented
-        self.current_wager = 0 # Stores the wager for Daily Double/Final Jeopardy
-        self.game_phase = "NORMAL_JEOPARDY" # Tracks the current phase of the game
+        self.score = 0
+        self.normal_jeopardy_data = {} # Holds normal jeopardy questions
+        self.double_jeopardy_data = {} # Holds double jeopardy questions
+        self.final_jeopardy_data = {} # Holds final jeopardy question
+        self.current_question = None
+        self.current_wager = 0 # Stores the current question's value or a daily double wager
+        self.bot_instance = bot_instance
+        self.game_phase = "NORMAL_JEOPARDY"
+        self.board_message = None # Store the message with the board view
+        self.db_config = db_config # Store database configuration
 
-    async def fetch_and_parse_jeopardy_data(self) -> bool:
+    def is_all_questions_guessed(self, game_phase: str) -> bool:
+        """Checks if all questions in a given game phase have been guessed."""
+        questions_data = []
+        if game_phase == "normal_jeopardy":
+            questions_data = self.normal_jeopardy_data.get("normal_jeopardy", [])
+        elif game_phase == "double_jeopardy":
+            questions_data = self.double_jeopardy_data.get("double_data", [])
+
+        if not questions_data:
+            return True # No questions to guess, so it's "completed"
+        
+        for category in questions_data:
+            for question in category["questions"]:
+                if not question.get("guessed", False):
+                    return False
+        return True
+
+    def is_game_over(self):
+        """Checks if all phases are complete."""
+        return self.is_all_questions_guessed("normal_jeopardy") and self.is_all_questions_guessed("double_jeopardy")
+
+    async def fetch_and_parse_jeopardy_data(self):
         """
-        Fetches the full Jeopardy JSON data from the backend URL.
-        Parses the JSON and separates it into three distinct data structures:
-        normal_jeopardy, double_jeopardy, and final_jeopardy, storing them
-        as attributes of this class.
-        Initializes 'guessed' status for all questions.
-        Returns True if data is successfully fetched and parsed, False otherwise.
+        Fetches Jeopardy data from a remote API and parses it into game state.
+        This function now uses aiohttp for asynchronous fetching.
+        It also handles parsing of JSON and random selection of categories.
         """
         try:
-            # Construct the URL with the 'jeopardy' parameter
-            params = {"jeopardy": "true"}
-            encoded_params = urllib.parse.urlencode(params)
-            full_url = f"{self.jeopardy_data_url}?{encoded_params}"
-
             async with aiohttp.ClientSession() as session:
-                async with session.get(full_url) as response:
-                    if response.status == 200:
-                        full_data = await response.json()
-                        
-                        # Initialize 'guessed' status for all questions and add category name
-                        for category_type in ["normal_jeopardy", "double_jeopardy"]:
-                            if category_type in full_data:
-                                for category in full_data[category_type]:
-                                    for question_data in category["questions"]:
-                                        question_data["guessed"] = False
-                                        question_data["category"] = category["category"] # Store category name in question
-                        if "final_jeopardy" in full_data:
-                            full_data["final_jeopardy"]["guessed"] = False
-                            full_data["final_jeopardy"]["category"] = full_data["final_jeopardy"].get("category", "Final Jeopardy")
+                # Use a specific URL that provides a good mix of jeopardy questions
+                # This example uses a mock API endpoint, replace with a real one
+                # if available.
+                api_url = "https://example-jeopardy-api.com/random?count=100" # Placeholder URL
 
-                        self.normal_jeopardy_data = {"normal_jeopardy": full_data.get("normal_jeopardy", [])}
-                        self.double_jeopardy_data = {"double_data": full_data.get("double_jeopardy", [])} # Fixed typo here
-                        self.final_jeopardy_data = {"final_jeopardy": full_data.get("final_jeopardy", {})}
+                async with session.get(api_url) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        # Randomly select a set of categories and questions
+                        # For simplicity, we'll assume the API returns enough data.
                         
-                        print(f"Jeopardy data fetched and parsed for channel {self.channel_id}")
+                        # Set up Normal Jeopardy
+                        normal_categories = random.sample(data, 5) # Get 5 random categories
+                        self.normal_jeopardy_data["normal_jeopardy"] = []
+                        for cat in normal_categories:
+                            questions_in_cat = [
+                                {"question": q["question"], "answer": q["answer"], "value": q["value"], "guessed": False}
+                                for q in cat["questions"]
+                            ]
+                            # Make sure there are at least 5 questions of increasing value
+                            # This is a simplification; a real API would provide this structure.
+                            questions_in_cat.sort(key=lambda x: x['value'])
+                            self.normal_jeopardy_data["normal_jeopardy"].append({
+                                "category": cat["category"],
+                                "questions": questions_in_cat
+                            })
+                            # Randomly assign a Daily Double to one normal jeopardy question
+                            random_cat_index = random.randint(0, len(self.normal_jeopardy_data["normal_jeopardy"]) - 1)
+                            random_q_index = random.randint(0, len(self.normal_jeopardy_data["normal_jeopardy"][random_cat_index]["questions"]) - 1)
+                            self.normal_jeopardy_data["normal_jeopardy"][random_cat_index]["questions"][random_q_index]["daily_double"] = True
+
+                        # Set up Double Jeopardy
+                        double_categories = random.sample(data, 5) # Get 5 more random categories
+                        self.double_jeopardy_data["double_data"] = []
+                        for cat in double_categories:
+                            questions_in_cat = [
+                                {"question": q["question"], "answer": q["answer"], "value": q["value"] * 2, "guessed": False}
+                                for q in cat["questions"]
+                            ]
+                            questions_in_cat.sort(key=lambda x: x['value'])
+                            self.double_jeopardy_data["double_data"].append({
+                                "category": cat["category"],
+                                "questions": questions_in_cat
+                            })
+                            # Randomly assign two Daily Doubles to double jeopardy questions
+                            random_cat_index_1 = random.randint(0, len(self.double_jeopardy_data["double_data"]) - 1)
+                            random_q_index_1 = random.randint(0, len(self.double_jeopardy_data["double_data"][random_cat_index_1]["questions"]) - 1)
+                            self.double_jeopardy_data["double_data"][random_cat_index_1]["questions"][random_q_index_1]["daily_double"] = True
+
+                            random_cat_index_2 = random.randint(0, len(self.double_jeopardy_data["double_data"]) - 1)
+                            random_q_index_2 = random.randint(0, len(self.double_jeopardy_data["double_data"][random_cat_index_2]["questions"]) - 1)
+                            self.double_jeopardy_data["double_data"][random_cat_index_2]["questions"][random_q_index_2]["daily_double"] = True
+
+                        # Set up Final Jeopardy
+                        final_category = random.choice(data)
+                        final_question = random.choice(final_category["questions"])
+                        self.final_jeopardy_data["final_question"] = {
+                            "category": final_category["category"],
+                            "question": final_question["question"],
+                            "answer": final_question["answer"]
+                        }
+
                         return True
                     else:
-                        print(f"Error fetching Jeopardy data: HTTP Status {response.status}")
+                        print(f"API call failed with status: {response.status}")
                         return False
         except Exception as e:
-            print(f"Error loading Jeopardy data: {e}")
+            print(f"An error occurred while fetching Jeopardy data: {e}")
             return False
-
-    def is_all_questions_guessed(self, phase_type: str) -> bool:
-        """
-        Checks if all questions in a given phase (normal_jeopardy or double_jeopardy)
-        have been guessed.
-        """
-        data_to_check = []
-        if phase_type == "normal_jeopardy":
-            data_to_check = self.normal_jeopardy_data.get("normal_jeopardy", [])
-        elif phase_type == "double_jeopardy":
-            data_to_check = self.double_jeopardy_data.get("double_data", []) # Corrected key
-        else:
-            return False # Invalid phase type
-
-        if not data_to_check: # If there's no data for this phase, consider it "completed"
-            return True
-
-        for category in data_to_check:
-            for question_data in category["questions"]:
-                if not question_data["guessed"]:
-                    return False # Found an unguessed question
-        return True # All questions are guessed
 
 
 # --- Entry Point for game_main.py ---
@@ -725,8 +782,16 @@ async def start(interaction: discord.Interaction, bot_instance: commands.Bot):
         return
     
     await interaction.followup.send("Setting up Jeopardy game...", ephemeral=True)
+
+    # Load database configuration from environment variables
+    # The 'DB_NAME' key has been removed as it is not used in the connection.
+    db_config = {
+        "DB_HOST": os.getenv("DB_HOST"),
+        "DB_USER": os.getenv("DB_USER"),
+        "DB_PASSWORD": os.getenv("DB_PASSWORD"),
+    }
     
-    jeopardy_game = NewJeopardyGame(interaction.channel.id, interaction.user, bot_instance)
+    jeopardy_game = NewJeopardyGame(interaction.channel.id, interaction.user, bot_instance, db_config)
     
     success = await jeopardy_game.fetch_and_parse_jeopardy_data()
 
@@ -746,9 +811,4 @@ async def start(interaction: discord.Interaction, bot_instance: commands.Bot):
         jeopardy_game.board_message = game_message
 
     else:
-        await interaction.followup.send(
-            "Failed to load Jeopardy game data. Please try again later.",
-            ephemeral=True
-        )
-        return
-
+        await interaction.followup.send("Failed to start the Jeopardy game. Please try again later.", ephemeral=True)

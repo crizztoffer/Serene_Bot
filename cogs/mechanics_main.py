@@ -906,10 +906,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if action == "get_state":
                 success = True
                 message = "Game state retrieved."
-                if success:
-                    # Non-mutating action: just broadcast the state
-                    await self.broadcast_game_state(room_id, game_state, echo_message_data)
-                    logger.info(f"[handle_websocket_game_action] Action '{action}' processed and state broadcast for room {room_id}.")
             elif action == "add_player":
                 player_data = request_data.get('player_data')
                 if not player_data or not isinstance(player_data, dict):
@@ -960,13 +956,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
                 return
 
-            # Save the game state only if the action was a mutating one and was successful
-            if success and action in mutating_actions:
-                await self._save_game_state(room_id, game_state)
+            # After action is processed, handle saving and broadcasting based on success
+            if success:
+                if action in mutating_actions:
+                    # Save the game state if it was a successful, mutating action
+                    await self._save_game_state(room_id, game_state)
+                    logger.info(f"[handle_websocket_game_action] Action '{action}' processed and state saved for room {room_id}.")
+                
+                # Always broadcast after a successful action (mutating or non-mutating)
                 logger.debug(f"[handle_websocket_game_action] Current round before broadcast: {game_state.get('current_round', 'N/A')}")
                 await self.broadcast_game_state(room_id, game_state, echo_message_data)
-                logger.info(f"[handle_websocket_game_action] Action '{action}' processed and state broadcast for room {room_id}.")
+                logger.info(f"[handle_websocket_game_action] State broadcast for room {room_id}.")
             else:
+                # Log a warning if the action failed
                 logger.warning(f"[handle_websocket_game_action] Action '{action}' failed for room {room_id}: {message}")
 
         except Exception as e:
@@ -1146,7 +1148,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.debug(f"[_auto_action_on_timeout] Advancing turn to player at index {next_player_idx}.")
                 game_state = await self._start_player_turn(room_id, game_state)
             else:
-                logger.warning(f"[_auto_action_on_timeout] No next active player after timeout, but round not marked complete. Advancing phase as fallback for room {room_id}.")
+                logger.warning(f"[_auto_action_on_timeout] No next active player found, but round not marked complete. Advancing phase as fallback for room {room_id}.")
                 game_state = await self._advance_game_phase(room_id, game_state)
 
         return True, action_message, game_state

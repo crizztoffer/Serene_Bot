@@ -167,6 +167,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}")
                     
                     # Proactively check for and correct data inconsistency
+                    # We no longer save immediately here, the main handler will do it once
                     if 'guild_id' not in game_state or game_state['guild_id'] is None:
                         logger.warning(f"[_load_game_state] Correcting missing guild_id for room {room_id}. Value from message: {guild_id}")
                         game_state['guild_id'] = guild_id
@@ -893,6 +894,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             game_state = await self._load_game_state(room_id, guild_id, channel_id)
             logger.debug(f"[handle_websocket_game_action] Current round loaded at start: {game_state.get('current_round', 'N/A')}")
 
+            # Define which actions modify the game state
+            mutating_actions = [
+                "add_player", 
+                "leave_player", 
+                "start_new_round_pre_flop", 
+                "player_action", 
+                "auto_action_timeout",
+            ]
+
             if action == "get_state":
                 success = True
                 message = "Game state retrieved."
@@ -946,8 +956,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
                 return
 
-            # Save the game state once at the end if the action was successful
-            if success:
+            # Save the game state only if the action was a mutating one and was successful
+            if success and action in mutating_actions:
                 await self._save_game_state(room_id, game_state)
                 logger.debug(f"[handle_websocket_game_action] Current round before broadcast: {game_state.get('current_round', 'N/A')}")
                 await self.broadcast_game_state(room_id, game_state, echo_message_data)

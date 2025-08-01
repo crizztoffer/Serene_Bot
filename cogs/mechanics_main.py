@@ -166,18 +166,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.info(f"[_load_game_state] Loaded existing game state for room_id: {room_id}. Players count: {len(game_state.get('players', []))}")
                     logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}")
                     
-                    # Proactively check for and fix data inconsistency
+                    # Proactively check for and correct data inconsistency
                     if 'guild_id' not in game_state or game_state['guild_id'] is None:
                         logger.warning(f"[_load_game_state] Correcting missing guild_id for room {room_id}. Value from message: {guild_id}")
                         game_state['guild_id'] = guild_id
-                        # Immediately save the corrected state to prevent future errors
-                        await self._save_game_state(room_id, game_state)
                         
                     if 'channel_id' not in game_state or game_state['channel_id'] is None:
                         logger.warning(f"[_load_game_state] Correcting missing channel_id for room {room_id}. Value from message: {channel_id}")
                         game_state['channel_id'] = channel_id
-                        # Immediately save the corrected state to prevent future errors
-                        await self._save_game_state(room_id, game_state)
+                        
                 else:
                     logger.warning(f"[_load_game_state] No existing game state found for room_id: {room_id}. Initializing new state.")
                     # Initialize with basic structure

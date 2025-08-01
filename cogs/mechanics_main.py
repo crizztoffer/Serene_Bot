@@ -252,17 +252,23 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}")
-                
-                await cursor.execute(
-                    "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
-                    (game_state_json, room_id)
-                )
+                # First, check if the room_id exists in the database.
+                check_query = "SELECT EXISTS(SELECT 1 FROM bot_game_rooms WHERE room_id = %s)"
+                logger.debug(f"[_save_game_state] Checking for room_id: {room_id} (type: {type(room_id)})")
+                await cursor.execute(check_query, (room_id,))
+                room_exists = (await cursor.fetchone())[check_query.split(' ')[1]]
+
+                if not room_exists:
+                    logger.error(f"[_save_game_state] UPDATE failed: Room ID '{room_id}' not found in DB. Game state: {game_state_json}")
+                    # Re-raise to ensure the caller knows the state wasn't saved.
+                    raise ValueError(f"Game room {room_id} not found for update.")
+
+                # If the room exists, proceed with the update.
+                update_query = "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s"
+                await cursor.execute(update_query, (game_state_json, room_id))
 
                 if cursor.rowcount == 0:
-                    logger.error(f"[_save_game_state] Failed to update game state for room_id: {room_id}. Room not found in DB. Game state: {game_state_json}")
-                    # Optionally, you could raise an exception here if a room not existing is a critical error
-                    # raise ValueError(f"Game room {room_id} not found for update.")
+                    logger.warning(f"[_save_game_state] Update query for room_id {room_id} executed, but no rows were affected. This could indicate a data problem.")
                 else:
                     logger.info(f"Game state updated for room_id: {room_id} in bot_game_rooms.")
             await conn.commit() # Explicitly commit the transaction
@@ -275,6 +281,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         finally:
             if conn:
                 conn.close()
+                if logger.handlers:
+                    logger.handlers[0].flush() # Ensure the logs are flushed even on error
+
 
     async def deal_hole_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
         """Deals two hole cards to each player for the specified room_id."""

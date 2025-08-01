@@ -859,6 +859,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         to the appropriate game action method.
         After processing, it broadcasts the updated game state to all clients.
         """
+        logger.info(f"[handle_websocket_game_action] Processing WebSocket action: {request_data.get('action')}") # Added this line to confirm entry
         action = request_data.get('action')
         room_id = request_data.get('room_id')
         guild_id = request_data.get('guild_id')    
@@ -944,7 +945,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.warning(f"[handle_websocket_game_action] Action '{action}' failed for room {room_id}: {message}")
 
         except Exception as e:
-            logger.error(f"[handle_websocket_game_action] Error processing WS action '{action}' for room {room_id}: {e}", exc_info=True)
+            # This will catch any unexpected exceptions and log them
+            logger.error(f"[handle_websocket_game_action] An unhandled exception occurred while processing action '{action}' for room {room_id}: {e}", exc_info=True)
 
 
     async def _handle_player_action(self, room_id: str, player_id: str, action_type: str, amount: int = 0, game_state: dict = None) -> tuple[bool, str, dict]:

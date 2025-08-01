@@ -1,4 +1,3 @@
-
 import logging
 import json
 import aiomysql
@@ -139,7 +138,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             password=self.db_password,
             db=self.db_name,
             charset='utf8mb4',
-            autocommit=True,
+            autocommit=False, # Changed to False for explicit commit control
             cursorclass=aiomysql.cursors.DictCursor
         )
 
@@ -202,10 +201,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('last_aggressive_action_player_id', None)
                 game_state.setdefault('timer_end_time', None)
                 game_state.setdefault('dealer_button_position', 0)
-                game_state.setdefault('small_blind_amount', 5)
-                game_state.setdefault('big_blind_amount', 10)
-                game_state.setdefault('game_started_once', False)
-    
+            
                 # Fetch kekchipz for each player using guild_id instead of channel_id
                 for player in game_state.get('players', []):
                     player_discord_id = player['discord_id']
@@ -230,10 +226,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     player.setdefault('has_acted_in_round', False)
                     player.setdefault('folded', False)
     
-                return game_state
+            await conn.commit() # Commit after all read operations
+            return game_state
     
         except Exception as e:
             logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
+            # Rollback if an error occurs
+            if conn:
+                await conn.rollback()
             raise
         finally:
             if conn:
@@ -252,15 +252,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                game_state_json = json.dumps(game_state)
-                logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}") # Add this debug log
+                logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}")
                 
-                # Changed from INSERT...ON DUPLICATE KEY UPDATE to a pure UPDATE
                 await cursor.execute(
                     "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
                     (game_state_json, room_id)
                 )
-                await conn.commit() # Explicitly commit the transaction
 
                 if cursor.rowcount == 0:
                     logger.error(f"[_save_game_state] Failed to update game state for room_id: {room_id}. Room not found in DB. Game state: {game_state_json}")
@@ -268,9 +265,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     # raise ValueError(f"Game room {room_id} not found for update.")
                 else:
                     logger.info(f"Game state updated for room_id: {room_id} in bot_game_rooms.")
+            await conn.commit() # Explicitly commit the transaction
         except Exception as e:
             logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
-            raise # Re-raise to be caught by the handler
+            # Rollback if an error occurs
+            if conn:
+                await conn.rollback()
+            raise
         finally:
             if conn:
                 conn.close()
@@ -489,6 +490,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         winnings_per_player = winnings // num_winners if num_winners > 0 else 0
 
         # Update kekchipz in the database for each winner
+        conn = None
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
@@ -498,8 +500,16 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         (winnings_per_player, winner_id, game_state['guild_id'])
                     )
                     logger.info(f"[evaluate_hands] Updated kekchipz for winner {winner_id} by +{winnings_per_player}.")
+            
+            # Explicitly commit the transaction for this operation
+            await conn.commit()
+            logger.info("[evaluate_hands] Kekchipz updates successfully committed to the database.")
+
         except Exception as e:
             logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
+            # Rollback if an error occurs
+            if conn:
+                await conn.rollback()
         finally:
             if conn:
                 conn.close()

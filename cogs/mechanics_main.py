@@ -947,6 +947,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         except Exception as e:
             # This will catch any unexpected exceptions and log them
             logger.error(f"[handle_websocket_game_action] An unhandled exception occurred while processing action '{action}' for room {room_id}: {e}", exc_info=True)
+            # Flush the log handler to ensure the error is written to the console.
+            if logger.handlers:
+                logger.handlers[0].flush()
+            # Re-raise the exception to allow the calling function to handle it as well.
+            raise
 
 
     async def _handle_player_action(self, room_id: str, player_id: str, action_type: str, amount: int = 0, game_state: dict = None) -> tuple[bool, str, dict]:
@@ -1289,4 +1294,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 # The setup function is needed for bot.py to load this as a cog.
 async def setup(bot):
-    await bot.add_cog(MechanicsMain(bot))
+    try:
+        await bot.add_cog(MechanicsMain(bot))
+    except Exception as e:
+        # Catch and log any errors during cog setup
+        logging.error(f"An error occurred during the setup of MechanicsMain cog: {e}", exc_info=True)
+        # Flush the log handler to ensure the error is written
+        if logging.getLogger().handlers:
+            logging.getLogger().handlers[0].flush()

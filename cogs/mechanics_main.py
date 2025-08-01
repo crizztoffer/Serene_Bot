@@ -475,6 +475,27 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         }
         game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME # 10-second timer after showdown
 
+        # Calculate winnings per player (equal split of the pot for now)
+        winnings = game_state.get('current_betting_round_pot', 0)
+        num_winners = len(winning_players)
+        winnings_per_player = winnings // num_winners if num_winners > 0 else 0
+
+        # Update kekchipz in the database for each winner
+        try:
+            conn = await self._get_db_connection()
+            async with conn.cursor() as cursor:
+                for winner_id in winning_players:
+                    await cursor.execute(
+                        "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE discord_id = %s AND guild_id = %s",
+                        (winnings_per_player, winner_id, game_state['guild_id'])
+                    )
+                    logger.info(f"[evaluate_hands] Updated kekchipz for winner {winner_id} by +{winnings_per_player}.")
+        except Exception as e:
+            logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
+        finally:
+            if conn:
+                conn.close()
+
         logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Current round set to {game_state['current_round']}. Winner(s): {winning_players}")
         return True, "Hands evaluated.", game_state
 

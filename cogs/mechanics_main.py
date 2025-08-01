@@ -3,13 +3,27 @@ import json
 import aiomysql
 import time # Import time for timestamps
 from discord.ext import commands
+from itertools import combinations
 
 # Import Card and Deck from the new game_models utility file
 from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
 
-# --- Texas Hold'em Hand Evaluation Logic (Simplified Placeholder) ---
+# --- Texas Hold'em Hand Evaluation Logic (Improved) ---
+HAND_RANKINGS = {
+    "High Card": 0,
+    "One Pair": 1,
+    "Two Pair": 2,
+    "Three of a Kind": 3,
+    "Straight": 4,
+    "Flush": 5,
+    "Full House": 6,
+    "Four of a Kind": 7,
+    "Straight Flush": 8,
+    "Royal Flush": 9
+}
+
 def get_rank_value(rank):
     """Returns numerical value for poker ranks for comparison."""
     if rank.isdigit():
@@ -17,73 +31,78 @@ def get_rank_value(rank):
         return int(rank)
     elif rank == 'J': return 11
     elif rank == 'Q': return 12
+    elif rank == 'K': return 13
     elif rank == 'A': return 14
     return 0
 
 def evaluate_poker_hand(cards):
     """
-    Evaluates a 7-card poker hand (5 community + 2 hole) and returns its type and value.
-    This is a very simplified placeholder and DOES NOT correctly implement full poker rules.
+    Evaluates the best possible 5-card poker hand from a set of 7 cards.
+    Returns a tuple: (hand_name: str, score_vector: tuple[int])
+    The score_vector can be used to break ties between equal hands.
     """
-    if len(cards) < 5:
-        return "Not enough cards", 0
+    def rank_value(card):
+        return get_rank_value(card.rank)
 
-    processed_cards = []
-    for card in cards:
-        processed_cards.append((get_rank_value(card.rank), card.suit[0].upper()))
+    def is_straight(ranks):
+        ranks = sorted(list(set(ranks)), reverse=True)
+        # Check for ace-low straight (A, 5, 4, 3, 2)
+        if set([14, 2, 3, 4, 5]).issubset(set(ranks)):
+            return True, 5
+        for i in range(len(ranks) - 4):
+            window = ranks[i:i + 5]
+            if all(window[j] - window[j+1] == 1 for j in range(4)):
+                return True, window[0]
+        return False, None
 
-    suit_groups = {}
-    for r_val, suit_char in processed_cards:
-        suit_groups.setdefault(suit_char, []).append(r_val)
-    for suit_char, ranks_in_suit in suit_groups.items():
-        if len(ranks_in_suit) >= 5:
-            return "Flush", max(ranks_in_suit)
+    def classify_hand(hand):
+        ranks = sorted([rank_value(c) for c in hand], reverse=True)
+        suits = [c.suit[0].upper() for c in hand]
 
-    unique_ranks = sorted(list(set([c[0] for c in processed_cards])), reverse=True)
-    if 14 in unique_ranks and 2 in unique_ranks and 3 in unique_ranks and 4 in unique_ranks and 5 in unique_ranks:
-        return "Straight", 5
+        rank_counts = {r: ranks.count(r) for r in set(ranks)}
+        count_groups = sorted(rank_counts.items(), key=lambda x: (-x[1], -x[0]))
+        grouped_ranks = [r for r, _ in count_groups]
 
-    for i in range(len(unique_ranks) - 4):
-        is_straight = True
-        for j in range(4):
-            if unique_ranks[i+j] - unique_ranks[i+j+1] != 1:
-                is_straight = False
-                break
-        if is_straight:
-            return "Straight", unique_ranks[i]
+        is_flush = len(set(suits)) == 1
+        straight, high_straight = is_straight(ranks)
 
-    rank_counts = {}
-    for rank_val, _ in processed_cards:
-        rank_counts[rank_val] = rank_counts.get(rank_val, 0) + 1
+        if is_flush and straight:
+            if high_straight == 14:
+                return "Royal Flush", (HAND_RANKINGS["Royal Flush"],)
+            return "Straight Flush", (HAND_RANKINGS["Straight Flush"], high_straight)
 
-    quads = []
-    trips = []
-    pairs = []
-    singles = []
+        if count_groups[0][1] == 4:
+            return "Four of a Kind", (HAND_RANKINGS["Four of a Kind"], count_groups[0][0], grouped_ranks[1])
 
-    for rank_val, count in rank_counts.items():
-        if count == 4: quads.append(rank_val)
-        elif count == 3: trips.append(rank_val)
-        elif count == 2: pairs.append(rank_val)
-        else: singles.append(rank_val)
+        if count_groups[0][1] == 3 and count_groups[1][1] >= 2:
+            return "Full House", (HAND_RANKINGS["Full House"], count_groups[0][0], count_groups[1][0])
 
-    quads.sort(reverse=True)
-    trips.sort(reverse=True)
-    pairs.sort(reverse=True)
-    singles.sort(reverse=True)
+        if is_flush:
+            return "Flush", (HAND_RANKINGS["Flush"], *ranks)
 
-    if quads:
-        return "Four of a Kind", quads[0]
-    if trips and pairs:
-        return "Full House", trips[0]
-    if trips:
-        return "Three of a Kind", trips[0]
-    if len(pairs) >= 2:
-        return "Two Pair", pairs[0]
-    if pairs:
-        return "One Pair", pairs[0]
-    
-    return "High Card", processed_cards[0][0]
+        if straight:
+            return "Straight", (HAND_RANKINGS["Straight"], high_straight)
+
+        if count_groups[0][1] == 3:
+            return "Three of a Kind", (HAND_RANKINGS["Three of a Kind"], count_groups[0][0], *grouped_ranks[1:3])
+
+        if count_groups[0][1] == 2 and count_groups[1][1] == 2:
+            return "Two Pair", (HAND_RANKINGS["Two Pair"], count_groups[0][0], count_groups[1][0], grouped_ranks[2])
+
+        if count_groups[0][1] == 2:
+            return "One Pair", (HAND_RANKINGS["One Pair"], count_groups[0][0], *grouped_ranks[1:4])
+
+        return "High Card", (HAND_RANKINGS["High Card"], *ranks)
+
+    best_score = (-1,)
+    best_hand_name = ""
+    for combo in combinations(cards, 5):
+        hand_name, score = classify_hand(combo)
+        if score > best_score:
+            best_score = score
+            best_hand_name = hand_name
+
+    return best_hand_name, best_score
 
 
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
@@ -392,36 +411,71 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return True, "River dealt.", game_state
 
     async def evaluate_hands(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
-        """Evaluates all players' hands against the community cards for the specified room_id."""
+        """
+        Evaluates all players' hands against the community cards, determines the winner(s),
+        and adds this information to the game state.
+        """
         if game_state['current_round'] != 'river':
             logger.warning(f"[evaluate_hands] Cannot evaluate hands. Current round is {game_state['current_round']} for room {room_id}.")
             return False, f"Cannot evaluate hands. Current round is {game_state['current_round']}.", game_state
 
         players_data = game_state.get('players', [])
         board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])] # Use Card from game_models
+        active_players = [p for p in players_data if not p.get('folded', False)]
 
         if len(board_cards_obj) != 5:
             logger.error(f"[evaluate_hands] Board not complete for evaluation in room {room_id}.")
             return False, "Board not complete.", game_state
 
         player_evaluations = []
-        for player_data in players_data:
+        best_score = (-1,)
+        winning_players = []
+
+        for player_data in active_players:
             player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])] # Use Card from game_models
             combined_cards = player_hand_obj + board_cards_obj
-            hand_type, hand_value = evaluate_poker_hand(combined_cards)
+            hand_type, hand_score_vector = evaluate_poker_hand(combined_cards)
+
             player_evaluations.append({
                 "discord_id": player_data['discord_id'],
                 "name": player_data['name'],
                 "hand_type": hand_type,
-                "hand_value": hand_value,
-                "hole_cards": [c.to_output_format() for c in player_hand_obj]
+                "hand_score_vector": hand_score_vector,
+                "hole_cards": [c.to_output_format() for c in player_hand_obj],
+                "is_winner": False # Will be set below
             })
+            
+            # Check for winner
+            if hand_score_vector > best_score:
+                best_score = hand_score_vector
+                winning_players = [player_data['discord_id']]
+            elif hand_score_vector == best_score:
+                winning_players.append(player_data['discord_id'])
+
+        # Sort the evaluations from best to worst hand
+        player_evaluations.sort(key=lambda x: x['hand_score_vector'], reverse=True)
+
+        # Mark the winners in the sorted evaluation data
+        for eval_data in player_evaluations:
+            if eval_data['discord_id'] in winning_players:
+                eval_data['is_winner'] = True
+        
+        winning_hand_name = "N/A"
+        if player_evaluations:
+            winning_hand_name = player_evaluations[0]['hand_type']
 
         game_state['current_round'] = "showdown"
-        game_state['last_evaluation'] = player_evaluations
+        game_state['last_evaluation'] = {
+            "evaluations": player_evaluations,
+            "winning_info": {
+                "hand_type": winning_hand_name,
+                "score_vector": best_score,
+                "winners": winning_players
+            }
+        }
         game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME # 10-second timer after showdown
 
-        logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Current round set to {game_state['current_round']}.")
+        logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Current round set to {game_state['current_round']}. Winner(s): {winning_players}")
         return True, "Hands evaluated.", game_state
 
     async def broadcast_game_state(self, room_id: str, game_state: dict, echo_message: dict = None):
@@ -519,7 +573,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # --- Helper to apply blinds ---
     async def _apply_blinds(self, game_state: dict):
-        """Applies small and big blinds to players."""
+        """Applics small and big blinds to players."""
         sorted_players = self._get_sorted_players(game_state)
         num_players = len(sorted_players)
 

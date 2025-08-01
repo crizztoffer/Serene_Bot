@@ -10,6 +10,15 @@ from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
 
+async def create_db_pool():
+    return await aiomysql.create_pool(
+        host=os.getenv("DB_HOST"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        db="serene_users",  # ✅ confirmed database name
+        autocommit=True
+    )
+
 # --- Texas Hold'em Hand Evaluation Logic (Improved) ---
 HAND_RANKINGS = {
     "High Card": 0,
@@ -108,6 +117,7 @@ def evaluate_poker_hand(cards):
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot # Bot instance is passed but not used by this pure dealer for Discord comms
+        self.pool = pool
         logger.info("MechanicsMain (backend state management) initialized as a Discord Cog.")
     
         # Database credentials - NOW using credentials assigned to bot object
@@ -126,6 +136,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def cog_unload(self):
         logger.info("MechanicsMain cog unloaded.")
+        if self.pool:
+            self.pool.close()
+            await self.pool.wait_closed()
 
     async def _get_db_connection(self):
         """Helper to get a database connection."""
@@ -1237,4 +1250,5 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
 # The setup function is needed for bot.py to load this as a cog.
 async def setup(bot):
+    pool = await create_db_pool()
     await bot.add_cog(MechanicsMain(bot))

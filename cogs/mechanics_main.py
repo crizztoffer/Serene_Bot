@@ -864,11 +864,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         action = request_data.get('action')
         room_id = request_data.get('room_id')
         guild_id = request_data.get('guild_id')    
-        channel_id = request_data.get('channel_id') 
         sender_id = request_data.get('sender_id') # Assuming sender_id is always present in WS requests
+        channel_id = request_data.get('channel_id') # Now making channel_id an optional parameter
 
-        if not all([action, room_id, guild_id, channel_id, sender_id]):
-            logger.error(f"[handle_websocket_game_action] Missing required parameters. Data: {request_data}")
+        # Only require the mandatory parameters for every message
+        if not all([action, room_id, guild_id, sender_id]):
+            logger.error(f"[handle_websocket_game_action] Initial WebSocket message missing critical parameters. Data: {request_data}")
             return
 
         logger.info(f"[handle_websocket_game_action] Backend dealer received WS action: '{action}' for Room ID: {room_id}, Sender: {sender_id}")

@@ -12,11 +12,12 @@ logger = logging.getLogger(__name__)
 
 async def create_db_pool():
     return await aiomysql.create_pool(
-        host=os.getenv("DB_HOST"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        db="serene_users",  # ✅ confirmed database name
-        autocommit=True
+        host=self.db_host,
+        user=self.db_user,
+        password=self.db_password,
+        db=self.db_name,
+        charset='utf8mb4',
+        autocommit=True,
     )
 
 # --- Texas Hold'em Hand Evaluation Logic (Improved) ---

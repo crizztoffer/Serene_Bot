@@ -252,28 +252,20 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                # First, check if the room_id exists in the database.
-                check_query = "SELECT EXISTS(SELECT 1 FROM bot_game_rooms WHERE room_id = %s)"
-                logger.debug(f"[_save_game_state] Checking for room_id: {room_id} (type: {type(room_id)})")
-                await cursor.execute(check_query, (room_id,))
-                room_exists = (await cursor.fetchone())[check_query.split(' ')[1]]
-
-                if not room_exists:
-                    logger.error(f"[_save_game_state] UPDATE failed: Room ID '{room_id}' not found in DB. Game state: {game_state_json}")
-                    # Re-raise to ensure the caller knows the state wasn't saved.
-                    raise ValueError(f"Game room {room_id} not found for update.")
-
-                # If the room exists, proceed with the update.
-                update_query = "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s"
+                update_query = "UPDATE bot_game_rooms SET game_state = %s WHERE TRIM(room_id) = %s"
+                logger.info(f"[_save_game_state] Attempting UPDATE for room_id: '{room_id}'")
                 await cursor.execute(update_query, (game_state_json, room_id))
 
                 if cursor.rowcount == 0:
-                    logger.warning(f"[_save_game_state] Update query for room_id {room_id} executed, but no rows were affected. This could indicate a data problem.")
+                    logger.error(f"[_save_game_state] UPDATE failed: No rows were affected for room_id: '{room_id}'. This suggests the room does not exist or there is a data inconsistency. Game state: {game_state_json}")
+                    # Re-raise the exception to propagate the error.
+                    raise ValueError(f"Game room '{room_id}' not found for update, or update failed.")
                 else:
-                    logger.info(f"Game state updated for room_id: {room_id} in bot_game_rooms.")
+                    logger.info(f"[_save_game_state] Successfully updated {cursor.rowcount} row(s) for room_id: '{room_id}'.")
+            
             await conn.commit() # Explicitly commit the transaction
         except Exception as e:
-            logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
+            logger.error(f"Error saving game state for room '{room_id}': {e}", exc_info=True)
             # Rollback if an error occurs
             if conn:
                 await conn.rollback()

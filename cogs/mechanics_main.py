@@ -167,7 +167,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}")
                     
                     # Proactively check for and correct data inconsistency
-                    # We no longer save immediately here, the main handler will do it once
                     if 'guild_id' not in game_state or game_state['guild_id'] is None:
                         logger.warning(f"[_load_game_state] Correcting missing guild_id for room {room_id}. Value from message: {guild_id}")
                         game_state['guild_id'] = guild_id
@@ -204,12 +203,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     }
     
                 # Ensure required fields are present for backward compatibility
+                # This is the primary fix to handle old/inconsistent data
                 game_state.setdefault('current_player_turn_index', -1)
                 game_state.setdefault('current_betting_round_pot', 0)
                 game_state.setdefault('current_round_min_bet', 0)
                 game_state.setdefault('last_aggressive_action_player_id', None)
                 game_state.setdefault('timer_end_time', None)
                 game_state.setdefault('dealer_button_position', 0)
+                game_state.setdefault('small_blind_amount', 5)
+                game_state.setdefault('big_blind_amount', 10)
             
                 # Fetch kekchipz for each player using guild_id instead of channel_id
                 for player in game_state.get('players', []):
@@ -638,13 +640,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         small_blind_pos_idx = (dealer_pos + 1) % num_players
         big_blind_pos_idx = (dealer_pos + 2) % num_players
 
+        # Use .get() with a default value to prevent KeyError
+        small_blind_amount = game_state.get('small_blind_amount', 5)
+        big_blind_amount = game_state.get('big_blind_amount', 10)
+
         # Ensure indices are valid before accessing players
         small_blind_player = sorted_players[small_blind_pos_idx] if num_players > small_blind_pos_idx else None
         big_blind_player = sorted_players[big_blind_pos_idx] if num_players > big_blind_pos_idx else None
 
         if small_blind_player:
             # Deduct small blind
-            small_blind_amount = min(game_state['small_blind_amount'], small_blind_player['total_chips'])
+            small_blind_amount = min(small_blind_amount, small_blind_player['total_chips'])
             small_blind_player['total_chips'] -= small_blind_amount
             small_blind_player['current_bet_in_round'] += small_blind_amount
             game_state['current_betting_round_pot'] += small_blind_amount
@@ -653,7 +659,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         if big_blind_player:
             # Deduct big blind
-            big_blind_amount = min(game_state['big_blind_amount'], big_blind_player['total_chips'])
+            big_blind_amount = min(big_blind_amount, big_blind_player['total_chips'])
             big_blind_player['total_chips'] -= big_blind_amount
             big_blind_player['current_bet_in_round'] += big_blind_amount
             game_state['current_betting_round_pot'] += big_blind_amount
@@ -663,7 +669,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         # Set the minimum bet for this round to the big blind amount
         # If only one player, this might be 0 or a default.
         if big_blind_player:
-            game_state['current_round_min_bet'] = game_state['big_blind_amount']
+            game_state['current_round_min_bet'] = big_blind_amount
         else:
             game_state['current_round_min_bet'] = 0 # No big blind, min bet is 0
             logger.info(f"[_apply_blinds] No big blind player, current_round_min_bet set to {game_state['current_round_min_bet']}.")
@@ -848,7 +854,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             next_round = 'showdown'
         elif game_state['current_round'] == 'showdown':
             success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
-            next_round = 'pre_flop' # If successful, it moves to pre_game
+            # NOTE: The return message from _start_new_round_pre_flop will correctly reflect 'pre_flop'
+            # state, but the return from this function to the handler will still use the `msg`
+            # variable from the _start_new_round_pre_flop call.
+            next_round = 'pre_flop'
             
         if not success:
             logger.error(f"[_advance_game_phase] Failed to advance game phase from {game_state['current_round']}: {msg}")
@@ -1007,7 +1016,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"[_handle_player_action] Player {player_id} already folded in room {room_id}.")
             return False, "You have already folded.", game_state
 
-        min_bet_to_call = game_state['current_round_min_bet'] - player_in_state['current_bet_in_round']
+        min_bet_to_call = game_state.get('current_round_min_bet', 0) - player_in_state.get('current_bet_in_round', 0)
         logger.debug(f"[_handle_player_action] Player {player_id} action: {action_type}, amount: {amount}, min_bet_to_call: {min_bet_to_call}.")
         
         message = ""
@@ -1125,7 +1134,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"[_auto_action_on_timeout] Player {player_id}'s turn has not timed out yet in room {room_id}.")
             return False, "Player's turn has not timed out yet.", game_state
 
-        min_bet_to_call = game_state['current_round_min_bet'] - player_in_state['current_bet_in_round']
+        min_bet_to_call = game_state.get('current_round_min_bet', 0) - player_in_state.get('current_bet_in_round', 0)
         logger.debug(f"[_auto_action_on_timeout] Player {player_id} timeout action. min_bet_to_call: {min_bet_to_call}.")
         
         action_message = ""

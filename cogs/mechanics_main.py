@@ -239,33 +239,31 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 conn.close()
 
     async def _save_game_state(self, room_id: str, game_state: dict):
-        """Saves the game state for a given room_id to the database."""
-        conn = None
-        try:
-            conn = await self._get_db_connection()
+        # ✅ Use room_id from game_state if available and valid
+        room_id_from_state = game_state.get("room_id")
+        if room_id_from_state and room_id_from_state != room_id:
+            logger.warning(f"[_save_game_state] room_id mismatch: argument={room_id}, game_state={room_id_from_state}")
+            room_id = room_id_from_state
+    
+        room_id = str(room_id).strip()
+        game_state_json = json.dumps(game_state)
+    
+        async with self.pool.acquire() as conn:
             async with conn.cursor() as cursor:
-                game_state_json = json.dumps(game_state)
-                logger.debug(f"[_save_game_state] Saving game_state for room {room_id}: {game_state_json}") # Add this debug log
-                
-                # Changed from INSERT...ON DUPLICATE KEY UPDATE to a pure UPDATE
                 await cursor.execute(
                     "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
                     (game_state_json, room_id)
                 )
-                await conn.commit() # Explicitly commit the transaction
-
                 if cursor.rowcount == 0:
-                    logger.error(f"[_save_game_state] Failed to update game state for room_id: {room_id}. Room not found in DB. Game state: {game_state_json}")
-                    # Optionally, you could raise an exception here if a room not existing is a critical error
-                    # raise ValueError(f"Game room {room_id} not found for update.")
+                    logger.error(f"[_save_game_state] Failed to update game state for room_id: {room_id}")
+                    
+                    # Helpful debug: show all available room_ids
+                    await cursor.execute("SELECT room_id FROM bot_game_rooms")
+                    rows = await cursor.fetchall()
+                    existing_ids = [row["room_id"] for row in rows]
+                    logger.debug(f"[_save_game_state] Existing room_ids in DB: {existing_ids}")
                 else:
-                    logger.info(f"Game state updated for room_id: {room_id} in bot_game_rooms.")
-        except Exception as e:
-            logger.error(f"Error saving game state for room {room_id}: {e}", exc_info=True)
-            raise # Re-raise to be caught by the handler
-        finally:
-            if conn:
-                conn.close()
+                    logger.debug(f"[_save_game_state] Successfully updated game state for room_id: {room_id}")
 
     async def deal_hole_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
         """Deals two hole cards to each player for the specified room_id."""
@@ -410,94 +408,64 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[deal_river] River dealt for room {room_id}. Current round set to {game_state['current_round']}.")
         return True, "River dealt.", game_state
 
-    async def evaluate_hands(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
-        """
-        Evaluates all players' hands against the community cards, determines the winner(s),
-        and adds this information to the game state.
-        """
-        if game_state['current_round'] != 'river':
-            logger.warning(f"[evaluate_hands] Cannot evaluate hands. Current round is {game_state['current_round']} for room {room_id}.")
-            return False, f"Cannot evaluate hands. Current round is {game_state['current_round']}.", game_state
-
-        players_data = game_state.get('players', [])
-        board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])] # Use Card from game_models
-        active_players = [p for p in players_data if not p.get('folded', False)]
-
-        if len(board_cards_obj) != 5:
-            logger.error(f"[evaluate_hands] Board not complete for evaluation in room {room_id}.")
-            return False, "Board not complete.", game_state
-
-        player_evaluations = []
-        best_score = (-1,)
-        winning_players = []
-
-        for player_data in active_players:
-            player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])] # Use Card from game_models
-            combined_cards = player_hand_obj + board_cards_obj
-            hand_type, hand_score_vector = evaluate_poker_hand(combined_cards)
-
-            player_evaluations.append({
-                "discord_id": player_data['discord_id'],
-                "name": player_data['name'],
-                "hand_type": hand_type,
-                "hand_score_vector": hand_score_vector,
-                "hole_cards": [c.to_output_format() for c in player_hand_obj],
-                "is_winner": False # Will be set below
-            })
-            
-            # Check for winner
-            if hand_score_vector > best_score:
-                best_score = hand_score_vector
-                winning_players = [player_data['discord_id']]
-            elif hand_score_vector == best_score:
-                winning_players.append(player_data['discord_id'])
-
-        # Sort the evaluations from best to worst hand
-        player_evaluations.sort(key=lambda x: x['hand_score_vector'], reverse=True)
-
-        # Mark the winners in the sorted evaluation data
-        for eval_data in player_evaluations:
-            if eval_data['discord_id'] in winning_players:
-                eval_data['is_winner'] = True
-        
-        winning_hand_name = "N/A"
-        if player_evaluations:
-            winning_hand_name = player_evaluations[0]['hand_type']
-
-        game_state['current_round'] = "showdown"
-        game_state['last_evaluation'] = {
-            "evaluations": player_evaluations,
-            "winning_info": {
-                "hand_type": winning_hand_name,
-                "score_vector": best_score,
-                "winners": winning_players
-            }
+    async def _evaluate_hands(self, interaction, room_id, game_state):
+        # ✅ Use room_id from game_state to ensure consistency
+        room_id_from_state = game_state.get("room_id")
+        if room_id_from_state and room_id_from_state != room_id:
+            logger.warning(f"[_evaluate_hands] room_id mismatch: arg={room_id}, state={room_id_from_state}")
+            room_id = room_id_from_state
+    
+        logger.debug(f"[_evaluate_hands] Starting hand evaluation for room_id: {room_id}")
+    
+        players = game_state.get("players", [])
+        board = game_state.get("board_cards", [])
+        pot = game_state.get("current_betting_round_pot", 0)
+    
+        # Filter out folded players
+        active_players = [p for p in players if not p.get("folded", False)]
+    
+        if not active_players:
+            logger.warning(f"[_evaluate_hands] No active players to evaluate in room {room_id}")
+            return
+    
+        # Evaluate hand strengths
+        player_scores = []
+        for player in active_players:
+            hand = player.get("hand", [])
+            try:
+                score = evaluate_hand(hand, board)
+                player_scores.append((player, score))
+                logger.debug(f"[_evaluate_hands] Player {player['name']} score: {score}")
+            except Exception as e:
+                logger.exception(f"[_evaluate_hands] Failed to evaluate hand for {player.get('name', 'unknown')}: {e}")
+    
+        if not player_scores:
+            logger.error(f"[_evaluate_hands] No valid hand scores generated for room {room_id}")
+            return
+    
+        # Determine winners (can be a tie)
+        player_scores.sort(key=lambda x: x[1], reverse=True)
+        best_score = player_scores[0][1]
+        winners = [p for p, s in player_scores if s == best_score]
+    
+        # Distribute pot among winners
+        split_pot = pot // len(winners)
+        for winner in winners:
+            winner["total_chips"] += split_pot
+            logger.debug(f"[_evaluate_hands] {winner['name']} wins {split_pot} chips")
+    
+        # Update game state
+        game_state["last_evaluation"] = {
+            "winners": [w["discord_id"] for w in winners],
+            "hand_strength": best_score
         }
-        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME # 10-second timer after showdown
-
-        # Calculate winnings per player (equal split of the pot for now)
-        winnings = game_state.get('current_betting_round_pot', 0)
-        num_winners = len(winning_players)
-        winnings_per_player = winnings // num_winners if num_winners > 0 else 0
-
-        # Update kekchipz in the database for each winner
-        try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                for winner_id in winning_players:
-                    await cursor.execute(
-                        "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE discord_id = %s AND guild_id = %s",
-                        (winnings_per_player, winner_id, game_state['guild_id'])
-                    )
-                    logger.info(f"[evaluate_hands] Updated kekchipz for winner {winner_id} by +{winnings_per_player}.")
-        except Exception as e:
-            logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
-        finally:
-            if conn:
-                conn.close()
-
-        logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Current round set to {game_state['current_round']}. Winner(s): {winning_players}")
-        return True, "Hands evaluated.", game_state
+    
+        # Optional: reset pot, etc.
+        game_state["current_betting_round_pot"] = 0
+    
+        # Save state
+        await self._save_game_state(room_id, game_state)
+        logger.debug(f"[_evaluate_hands] Evaluation complete and game state saved for room_id: {room_id}")
 
     async def broadcast_game_state(self, room_id: str, game_state: dict, echo_message: dict = None):
         """

@@ -153,8 +153,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
+                # Use TRIM to handle potential whitespace issues in the database entry
                 await cursor.execute(
-                    "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
+                    "SELECT game_state FROM bot_game_rooms WHERE TRIM(room_id) = %s",
                     (room_id,)
                 )
                 result = await cursor.fetchone()
@@ -164,6 +165,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     game_state = json.loads(result['game_state'])
                     logger.info(f"[_load_game_state] Loaded existing game state for room_id: {room_id}. Players count: {len(game_state.get('players', []))}")
                     logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}")
+                    
+                    # Proactively check for and fix data inconsistency
+                    if 'guild_id' not in game_state or game_state['guild_id'] is None:
+                        logger.warning(f"[_load_game_state] Correcting missing guild_id for room {room_id}. Value from message: {guild_id}")
+                        game_state['guild_id'] = guild_id
+                        # Immediately save the corrected state to prevent future errors
+                        await self._save_game_state(room_id, game_state)
+                        
+                    if 'channel_id' not in game_state or game_state['channel_id'] is None:
+                        logger.warning(f"[_load_game_state] Correcting missing channel_id for room {room_id}. Value from message: {channel_id}")
+                        game_state['channel_id'] = channel_id
+                        # Immediately save the corrected state to prevent future errors
+                        await self._save_game_state(room_id, game_state)
                 else:
                     logger.warning(f"[_load_game_state] No existing game state found for room_id: {room_id}. Initializing new state.")
                     # Initialize with basic structure
@@ -186,13 +200,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         'dealer_button_position': 0,
                         'small_blind_amount': 5,
                         'big_blind_amount': 10,
-                        'game_started_once': False
+                        'game_started_once': False,
+                        'guild_id': guild_id,
+                        'channel_id': channel_id # Set channel_id on new state
                     }
-    
-                # Ensure guild_id is always present
-                if 'guild_id' not in game_state or game_state['guild_id'] is None:
-                    game_state['guild_id'] = guild_id
-                    logger.info(f"[_load_game_state] Set guild_id to {guild_id} for room {room_id} (was missing/None).")
     
                 # Ensure required fields are present for backward compatibility
                 game_state.setdefault('current_player_turn_index', -1)
@@ -252,6 +263,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
+                # Use TRIM() on both sides of the comparison to be safe
                 update_query = "UPDATE bot_game_rooms SET game_state = %s WHERE TRIM(room_id) = %s"
                 logger.info(f"[_save_game_state] Attempting UPDATE for room_id: '{room_id}'")
                 await cursor.execute(update_query, (game_state_json, room_id))

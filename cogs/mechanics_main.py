@@ -124,105 +124,100 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         )
 
     async def _load_game_state(self, room_id: str, guild_id: str = None, channel_id: str = None) -> dict:
-        """
-        Loads the game state for a given room_id from the database.
-        If not found, initializes a new state, using provided guild_id and channel_id.
-        Ensures guild_id and channel_id are always present in the returned state.
-        Fetches kekchipz for each player from discord_users table.
-        """
-        conn = None
-        try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                await cursor.execute(
-                    "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
-                    (room_id,)
-                )
-                result = await cursor.fetchone()
-                
-                game_state = {}
-                if result and result['game_state']:
-                    game_state = json.loads(result['game_state'])
-                    logger.info(f"[_load_game_state] Loaded existing game state for room_id: {room_id}. Players count: {len(game_state.get('players', []))}")
-                    logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}") # Add this debug log
-                else:
-                    logger.warning(f"[_load_game_state] No existing game state found for room_id: {room_id}. Initializing new state.")
-                    # Initialize with basic structure, including provided guild_id and channel_id
-                    new_deck = Deck()
-                    new_deck.build()
-                    new_deck.shuffle()
-                    game_state = {
-                        'room_id': room_id,
-                        'current_round': 'pre_game', # Changed to 'pre_game' as requested
-                        'players': [], # Each player will have 'discord_id', 'name', 'hand', 'seat_id', 'avatar_url', 'total_chips', 'current_bet_in_round', 'has_acted_in_round', 'folded', 'kekchipz_overall'
-                        'dealer_hand': [], # Initialize dealer's hand
-                        'deck': new_deck.to_output_format(),
-                        'board_cards': [],
-                        'last_evaluation': None,
-                        'current_player_turn_index': -1, # Index in the sorted players list
-                        'current_betting_round_pot': 0,
-                        'current_round_min_bet': 0, # The amount to call
-                        'last_aggressive_action_player_id': None, # Player who last bet or raised
-                        'timer_end_time': None, # Unix timestamp (seconds)
-                        'dealer_button_position': 0, # Index of the player with the dealer button
-                        'small_blind_amount': 5,
-                        'big_blind_amount': 10,
-                        'game_started_once': False # To track if the game has ever started
-                    }
-                
-                # --- IMPORTANT: Ensure guild_id and channel_id are always present ---
-                # If they were missing from the loaded state (e.g., old DB entry)
-                # or if a new state was just initialized, set them from the arguments.
-                if 'guild_id' not in game_state or game_state['guild_id'] is None:
-                    game_state['guild_id'] = guild_id
-                    logger.info(f"[_load_game_state] Set guild_id to {guild_id} for room {room_id} (was missing/None).")
-                if 'channel_id' not in game_state or game_state['channel_id'] is None:
-                    game_state['channel_id'] = channel_id
-                    logger.info(f"[_load_game_state] Set channel_id to {channel_id} for room {room_id} (was missing/None).")
+    """
+    Loads the game state for a given room_id from the database.
+    If not found, initializes a new state, using provided guild_id.
+    Ensures guild_id is always present in the returned state.
+    Fetches kekchipz for each player from discord_users table.
+    """
+    conn = None
+    try:
+        conn = await self._get_db_connection()
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT game_state FROM bot_game_rooms WHERE room_id = %s",
+                (room_id,)
+            )
+            result = await cursor.fetchone()
+            
+            game_state = {}
+            if result and result['game_state']:
+                game_state = json.loads(result['game_state'])
+                logger.info(f"[_load_game_state] Loaded existing game state for room_id: {room_id}. Players count: {len(game_state.get('players', []))}")
+                logger.debug(f"[_load_game_state] Raw DB game_state: {result['game_state']}")
+            else:
+                logger.warning(f"[_load_game_state] No existing game state found for room_id: {room_id}. Initializing new state.")
+                # Initialize with basic structure
+                new_deck = Deck()
+                new_deck.build()
+                new_deck.shuffle()
+                game_state = {
+                    'room_id': room_id,
+                    'current_round': 'pre_game',
+                    'players': [],
+                    'dealer_hand': [],
+                    'deck': new_deck.to_output_format(),
+                    'board_cards': [],
+                    'last_evaluation': None,
+                    'current_player_turn_index': -1,
+                    'current_betting_round_pot': 0,
+                    'current_round_min_bet': 0,
+                    'last_aggressive_action_player_id': None,
+                    'timer_end_time': None,
+                    'dealer_button_position': 0,
+                    'small_blind_amount': 5,
+                    'big_blind_amount': 10,
+                    'game_started_once': False
+                }
 
-                # Ensure new fields are initialized if loading an older state
-                game_state.setdefault('current_player_turn_index', -1)
-                game_state.setdefault('current_betting_round_pot', 0)
-                game_state.setdefault('current_round_min_bet', 0)
-                game_state.setdefault('last_aggressive_action_player_id', None)
-                game_state.setdefault('timer_end_time', None)
-                game_state.setdefault('dealer_button_position', 0)
-                game_state.setdefault('small_blind_amount', 5)
-                game_state.setdefault('big_blind_amount', 10)
-                game_state.setdefault('game_started_once', False)
+            # Ensure guild_id is always present
+            if 'guild_id' not in game_state or game_state['guild_id'] is None:
+                game_state['guild_id'] = guild_id
+                logger.info(f"[_load_game_state] Set guild_id to {guild_id} for room {room_id} (was missing/None).")
 
-                # Fetch kekchipz for each player
-                for player in game_state.get('players', []):
-                    player_discord_id = player['discord_id']
-                    # Only fetch if channel_id is available
-                    if game_state['channel_id'] and player_discord_id:
-                        await cursor.execute(
-                            "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND channel_id = %s",
-                            (player_discord_id, game_state['channel_id'])
-                        )
-                        kekchipz_result = await cursor.fetchone()
-                        if kekchipz_result and 'kekchipz' in kekchipz_result:
-                            player['kekchipz_overall'] = kekchipz_result['kekchipz']
-                            logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
-                        else:
-                            player['kekchipz_overall'] = 0 # Default if not found
-                            logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in channel {game_state['channel_id']}. Setting to 0.")
+            # Ensure required fields are present for backward compatibility
+            game_state.setdefault('current_player_turn_index', -1)
+            game_state.setdefault('current_betting_round_pot', 0)
+            game_state.setdefault('current_round_min_bet', 0)
+            game_state.setdefault('last_aggressive_action_player_id', None)
+            game_state.setdefault('timer_end_time', None)
+            game_state.setdefault('dealer_button_position', 0)
+            game_state.setdefault('small_blind_amount', 5)
+            game_state.setdefault('big_blind_amount', 10)
+            game_state.setdefault('game_started_once', False)
+
+            # Fetch kekchipz for each player using guild_id instead of channel_id
+            for player in game_state.get('players', []):
+                player_discord_id = player['discord_id']
+                if game_state['guild_id'] and player_discord_id:
+                    await cursor.execute(
+                        "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND guild_id = %s",
+                        (player_discord_id, game_state['guild_id'])
+                    )
+                    kekchipz_result = await cursor.fetchone()
+                    if kekchipz_result and 'kekchipz' in kekchipz_result:
+                        player['kekchipz_overall'] = kekchipz_result['kekchipz']
+                        logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
                     else:
-                        player['kekchipz_overall'] = 0 # Default if channel_id or discord_id is missing
-                        logger.warning(f"[_load_game_state] Missing channel_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
+                        player['kekchipz_overall'] = 0
+                        logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in guild {game_state['guild_id']}. Setting to 0.")
+                else:
+                    player['kekchipz_overall'] = 0
+                    logger.warning(f"[_load_game_state] Missing guild_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
 
-                    player.setdefault('total_chips', 1000) # Default starting chips
-                    player.setdefault('current_bet_in_round', 0)
-                    player.setdefault('has_acted_in_round', False)
-                    player.setdefault('folded', False)
+                player.setdefault('total_chips', 1000)
+                player.setdefault('current_bet_in_round', 0)
+                player.setdefault('has_acted_in_round', False)
+                player.setdefault('folded', False)
 
-                return game_state
-        except Exception as e:
-            logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
-            raise # Re-raise to be caught by the handler
-        finally:
-            if conn:
-                conn.close()
+            return game_state
+
+    except Exception as e:
+        logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
+        raise
+    finally:
+        if conn:
+            conn.close()
 
     async def _save_game_state(self, room_id: str, game_state: dict):
         """Saves the game state for a given room_id to the database."""

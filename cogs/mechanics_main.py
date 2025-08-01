@@ -89,7 +89,7 @@ def evaluate_poker_hand(cards):
         if count_groups[0][1] == 2 and count_groups[1][1] == 2:
             return "Two Pair", (HAND_RANKINGS["Two Pair"], count_groups[0][0], count_groups[1][0], grouped_ranks[2])
 
-        if count_groups[0][1] == 2:
+        if count_counts[0][1] == 2:
             return "One Pair", (HAND_RANKINGS["One Pair"], count_groups[0][0], *grouped_ranks[1:4])
 
         return "High Card", (HAND_RANKINGS["High Card"], *ranks)
@@ -329,7 +329,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[deal_hole_cards] Hole cards dealt for room {room_id}.")
         return True, "Hole cards dealt.", game_state
 
-    async def deal_dealer_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
+    async def deal_dealer_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict):
         """Deals two cards to the dealer for the specified room_id."""
         deck = Deck(game_state.get('deck', []))
 
@@ -592,7 +592,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not player.get('folded', False):
                 logger.debug(f"[_get_next_active_player_index] Next active player found at index {idx}: {player['name']}.")
                 return idx
-        logger.debug("[_get_next_active_action_player_id] No active players found after full iteration.")
+        logger.debug("[_get_next_active_player_index] No active players found after full iteration.")
         return -1 # No active players found
 
     # --- Helper to start a player's turn ---
@@ -853,7 +853,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             success, msg, game_state = await self.evaluate_hands(room_id, game_state)
             next_round = 'showdown'
         elif game_state['current_round'] == 'showdown':
-            success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
+            success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state.get('guild_id'), game_state.get('channel_id'))
             # NOTE: The return message from _start_new_round_pre_flop will correctly reflect 'pre_flop'
             # state, but the return from this function to the handler will still use the `msg`
             # variable from the _start_new_round_pre_flop call.
@@ -903,70 +903,83 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             game_state = await self._load_game_state(room_id, guild_id, channel_id)
             logger.debug(f"[handle_websocket_game_action] Current round loaded at start: {game_state.get('current_round', 'N/A')}")
 
-            # Define which actions modify the game state
-            mutating_actions = [
-                "add_player", 
-                "leave_player", 
-                "start_new_round_pre_flop", 
-                "player_action", 
-                "auto_action_timeout",
-            ]
-
-            if action == "get_state":
-                success = True
-                message = "Game state retrieved."
-            elif action == "add_player":
-                player_data = request_data.get('player_data')
-                if not player_data or not isinstance(player_data, dict):
-                    logger.error("[handle_websocket_game_action] Missing or invalid player_data for add_player.")
-                    return
-                success, message, game_state = await self._add_player_to_game(room_id, player_data, game_state, guild_id, channel_id)
-            elif action == "leave_player":
-                discord_id = request_data.get('discord_id')
-                if not discord_id:
-                    logger.error("[handle_websocket_game_action] Missing discord_id for leave_player.")
-                    return
-                success, message, game_state = await self._leave_player(room_id, discord_id, game_state)
-            elif action == "start_new_round_pre_flop":
-                if game_state.get('current_round') in ['pre_game', 'showdown']:
-                    logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
-                    success, message, game_state = await self._start_new_round_pre_flop(room_id, game_state, guild_id, channel_id)
-                    if success:
-                        if not game_state.get('game_started_once', False):
-                            game_state['game_started_once'] = True 
+            # Check for a timeout condition
+            if game_state.get('timer_end_time') and int(time.time()) > game_state['timer_end_time']:
+                current_player_index = game_state.get('current_player_turn_index', -1)
+                sorted_players = self._get_sorted_players(game_state)
+                if current_player_index != -1 and current_player_index < len(sorted_players):
+                    player_id_to_timeout = sorted_players[current_player_index]['discord_id']
+                    logger.warning(f"[handle_websocket_game_action] Player {player_id_to_timeout} timed out. Initiating auto-action.")
+                    success, message, game_state = await self._auto_action_on_timeout(room_id, player_id_to_timeout, game_state)
                 else:
-                    logger.warning(f"[handle_websocket_game_action] Attempt to start new round failed: Game is already in progress or not in a startable state ({game_state.get('current_round')}) for room {room_id}. {request_data}")
+                    logger.warning("[handle_websocket_game_action] Timer expired, but no current player is set. Skipping auto-action.")
+            
+            # If a timeout occurred, we've already processed an action, so we can skip the rest
+            if not success:
+                # This new conditional block handles both successful mutating and non-mutating actions correctly
+                if action == "get_state":
+                    success = True
+                    message = "Game state retrieved."
+                elif action == "add_player":
+                    player_data = request_data.get('player_data')
+                    if not player_data or not isinstance(player_data, dict):
+                        logger.error("[handle_websocket_game_action] Missing or invalid player_data for add_player.")
+                        return
+                    success, message, game_state = await self._add_player_to_game(room_id, player_data, game_state, guild_id, channel_id)
+                elif action == "leave_player":
+                    discord_id = request_data.get('discord_id')
+                    if not discord_id:
+                        logger.error("[handle_websocket_game_action] Missing discord_id for leave_player.")
+                        return
+                    success, message, game_state = await self._leave_player(room_id, discord_id, game_state)
+                elif action == "start_new_round_pre_flop":
+                    if game_state.get('current_round') in ['pre_game', 'showdown']:
+                        logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
+                        success, message, game_state = await self._start_new_round_pre_flop(room_id, game_state, guild_id, channel_id)
+                        if success:
+                            if not game_state.get('game_started_once', False):
+                                game_state['game_started_once'] = True 
+                    else:
+                        logger.warning(f"[handle_websocket_game_action] Attempt to start new round failed: Game is already in progress or not in a startable state ({game_state.get('current_round')}) for room {room_id}. {request_data}")
+                        return
+                elif action == "player_action":
+                    player_id = request_data.get('player_id')
+                    action_type = request_data.get('action_type')
+                    amount = request_data.get('amount', 0)
+                    
+                    if not all([player_id, action_type]):
+                        logger.error("[handle_websocket_game_action] Missing player_id or action_type for player_action.")
+                        return
+                    success, message, game_state = await self._handle_player_action(room_id, player_id, action_type, amount, game_state)
+                elif action == "auto_action_timeout":
+                    player_id = request_data.get('player_id')
+                    if not player_id:
+                        logger.error("[handle_websocket_game_action] Missing player_id for auto_action_timeout.")
+                        return
+                    success, message, game_state = await self._auto_action_on_timeout(room_id, player_id, game_state)
+                elif action == "send_message":
+                    message_content = request_data.get('message_content')
+                    if not message_content:
+                        logger.error("[handle_websocket_game_action] Missing message_content for send_message.")
+                        return
+                    success, message, response_data_from_handler = await self._handle_in_game_message(room_id, sender_id, message_content, game_state)
+                    if success:
+                        echo_message_data = response_data_from_handler.get('echo_message')
+                        game_state = response_data_from_handler.get('game_state', game_state) # Ensure game_state is updated from handler
+                else:
+                    logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
                     return
-            elif action == "player_action":
-                player_id = request_data.get('player_id')
-                action_type = request_data.get('action_type')
-                amount = request_data.get('amount', 0)
-                
-                if not all([player_id, action_type]):
-                    logger.error("[handle_websocket_game_action] Missing player_id or action_type for player_action.")
-                    return
-                success, message, game_state = await self._handle_player_action(room_id, player_id, action_type, amount, game_state)
-            elif action == "auto_action_timeout":
-                player_id = request_data.get('player_id')
-                if not player_id:
-                    logger.error("[handle_websocket_game_action] Missing player_id for auto_action_timeout.")
-                    return
-                success, message, game_state = await self._auto_action_on_timeout(room_id, player_id, game_state)
-            elif action == "send_message":
-                message_content = request_data.get('message_content')
-                if not message_content:
-                    logger.error("[handle_websocket_game_action] Missing message_content for send_message.")
-                    return
-                success, message, response_data_from_handler = await self._handle_in_game_message(room_id, sender_id, message_content, game_state)
-                if success:
-                    echo_message_data = response_data_from_handler.get('echo_message')
-                    game_state = response_data_from_handler.get('game_state', game_state) # Ensure game_state is updated from handler
-            else:
-                logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
-                return
 
             # After action is processed, handle saving and broadcasting based on success
             if success:
+                mutating_actions = [
+                    "add_player", 
+                    "leave_player", 
+                    "start_new_round_pre_flop", 
+                    "player_action", 
+                    "auto_action_timeout",
+                ]
+
                 if action in mutating_actions:
                     # Save the game state if it was a successful, mutating action
                     await self._save_game_state(room_id, game_state)

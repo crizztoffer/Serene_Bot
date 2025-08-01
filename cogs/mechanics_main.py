@@ -590,7 +590,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not player.get('folded', False):
                 logger.debug(f"[_get_next_active_player_index] Next active player found at index {idx}: {player['name']}.")
                 return idx
-        logger.debug("[_get_next_active_player_index] No active players found after full iteration.")
+        logger.debug("[_get_next_active_action_player_id] No active players found after full iteration.")
         return -1 # No active players found
 
     # --- Helper to start a player's turn ---
@@ -906,6 +906,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if action == "get_state":
                 success = True
                 message = "Game state retrieved."
+                if success:
+                    # Non-mutating action: just broadcast the state
+                    await self.broadcast_game_state(room_id, game_state, echo_message_data)
+                    logger.info(f"[handle_websocket_game_action] Action '{action}' processed and state broadcast for room {room_id}.")
             elif action == "add_player":
                 player_data = request_data.get('player_data')
                 if not player_data or not isinstance(player_data, dict):
@@ -1139,7 +1143,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             next_player_idx = self._get_next_active_player_index(game_state, game_state['current_player_turn_index'])
             if next_player_idx != -1:
                 game_state['current_player_turn_index'] = next_player_idx
-                logger.debug(f"[_auto_action_on_timeout] Advancing turn to player at index {next_player_idx} after timeout.")
+                logger.debug(f"[_auto_action_on_timeout] Advancing turn to player at index {next_player_idx}.")
                 game_state = await self._start_player_turn(room_id, game_state)
             else:
                 logger.warning(f"[_auto_action_on_timeout] No next active player after timeout, but round not marked complete. Advancing phase as fallback for room {room_id}.")

@@ -623,7 +623,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return game_state
 
 
-    # --- Helper to apply blinds ---
     async def _apply_blinds(self, game_state: dict):
         """Applics small and big blinds to players."""
         sorted_players = self._get_sorted_players(game_state)

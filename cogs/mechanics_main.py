@@ -4,7 +4,6 @@ import aiomysql
 import time # Import time for timestamps
 from discord.ext import commands
 from itertools import combinations
-import discord # Import discord to access API functionality
 
 # Import Card and Deck from the new game_models utility file
 from cogs.utils.game_models import Card, Deck
@@ -143,37 +142,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             cursorclass=aiomysql.cursors.DictCursor
         )
 
-    async def _fetch_discord_user_details(self, user_id, guild_id):
-        """Fetches a user's display name and avatar URL from the Discord API, prioritizing guild-specific data."""
-        try:
-            guild = self.bot.get_guild(int(guild_id))
-            if guild:
-                member = await guild.fetch_member(int(user_id))
-                if member:
-                    # Prefer nickname, then global_name, then username
-                    name = member.nick or member.global_name or member.name
-                    # Prefer guild avatar, then global avatar, then default
-                    avatar_url = member.guild_avatar.url if member.guild_avatar else member.display_avatar.url
-                    return {"name": name, "avatar_url": avatar_url}
-
-        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-            logger.warning(f"Failed to fetch guild member details for {user_id} in guild {guild_id}: {e}")
-            # Fallback to fetching user details globally
-            try:
-                user = await self.bot.fetch_user(int(user_id))
-                return {"name": user.global_name or user.name, "avatar_url": user.display_avatar.url}
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-                logger.error(f"Failed to fetch global user details for {user_id}: {e}")
-                return {"name": "Unknown User", "avatar_url": "https://cdn.discordapp.com/embed/avatars/0.png"}
-        return {"name": "Unknown User", "avatar_url": "https://cdn.discordapp.com/embed/avatars/0.png"}
-
-
     async def _load_game_state(self, room_id: str, guild_id: str = None, channel_id: str = None) -> dict:
         """
         Loads the game state for a given room_id from the database.
         If not found, initializes a new state, using provided guild_id.
         Ensures guild_id is always present in the returned state.
-        Fetches kekchipz and Discord details for each player from the database or API.
+        Fetches kekchipz for each player from discord_users table.
         """
         conn = None
         try:
@@ -229,6 +203,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     }
     
                 # Ensure required fields are present for backward compatibility
+                # This is the primary fix to handle old/inconsistent data
                 game_state.setdefault('current_player_turn_index', -1)
                 game_state.setdefault('current_betting_round_pot', 0)
                 game_state.setdefault('current_round_min_bet', 0)
@@ -238,40 +213,29 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('small_blind_amount', 5)
                 game_state.setdefault('big_blind_amount', 10)
             
-                # Fetch kekchipz for each player from discord_users table and update player data with correct name and avatar
-                updated_players = []
+                # Fetch kekchipz for each player using guild_id instead of channel_id
                 for player in game_state.get('players', []):
-                    player_discord_id = player.get('discord_id')
-                    if not player_discord_id:
-                        continue
-                    
-                    # Fetch kekchipz
-                    kekchipz_overall = 0
-                    if game_state['guild_id']:
+                    player_discord_id = player['discord_id']
+                    if game_state['guild_id'] and player_discord_id:
                         await cursor.execute(
                             "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND guild_id = %s",
                             (player_discord_id, game_state['guild_id'])
                         )
                         kekchipz_result = await cursor.fetchone()
                         if kekchipz_result and 'kekchipz' in kekchipz_result:
-                            kekchipz_overall = kekchipz_result['kekchipz']
-                            logger.debug(f"[_load_game_state] Fetched kekchipz {kekchipz_overall} for player {player_discord_id}.")
+                            player['kekchipz_overall'] = kekchipz_result['kekchipz']
+                            logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
                         else:
+                            player['kekchipz_overall'] = 0
                             logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in guild {game_state['guild_id']}. Setting to 0.")
                     else:
-                        logger.warning(f"[_load_game_state] Missing guild_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
-                    
-                    player['kekchipz_overall'] = kekchipz_overall
-                    player.setdefault('total_chips', 1000) # Ensure total_chips is always set
-
-                    # Fetch user details from Discord API for name and avatar
-                    user_details = await self._fetch_discord_user_details(player_discord_id, game_state['guild_id'])
-                    player['name'] = user_details['name']
-                    player['avatar_url'] = user_details['avatar_url']
-                    
-                    updated_players.append(player)
-                
-                game_state['players'] = updated_players
+                        player['kekchipz_overall'] = 0
+                        logger.warning(f"[_load_game_state] Missing guild_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
+    
+                    player.setdefault('total_chips', 1000)
+                    player.setdefault('current_bet_in_round', 0)
+                    player.setdefault('has_acted_in_round', False)
+                    player.setdefault('folded', False)
     
             await conn.commit() # Commit after all read operations
             return game_state
@@ -365,7 +329,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[deal_hole_cards] Hole cards dealt for room {room_id}.")
         return True, "Hole cards dealt.", game_state
 
-    async def deal_dealer_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict):
+    async def deal_dealer_cards(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
         """Deals two cards to the dealer for the specified room_id."""
         deck = Deck(game_state.get('deck', []))
 
@@ -628,7 +592,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not player.get('folded', False):
                 logger.debug(f"[_get_next_active_player_index] Next active player found at index {idx}: {player['name']}.")
                 return idx
-        logger.debug("[_get_next_active_player_index] No active players found after full iteration.")
+        logger.debug("[_get_next_active_action_player_id] No active players found after full iteration.")
         return -1 # No active players found
 
     # --- Helper to start a player's turn ---
@@ -659,6 +623,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return game_state
 
 
+    # --- Helper to apply blinds ---
     async def _apply_blinds(self, game_state: dict):
         """Applics small and big blinds to players."""
         sorted_players = self._get_sorted_players(game_state)
@@ -888,7 +853,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             success, msg, game_state = await self.evaluate_hands(room_id, game_state)
             next_round = 'showdown'
         elif game_state['current_round'] == 'showdown':
-            success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state.get('guild_id'), game_state.get('channel_id'))
+            success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
             # NOTE: The return message from _start_new_round_pre_flop will correctly reflect 'pre_flop'
             # state, but the return from this function to the handler will still use the `msg`
             # variable from the _start_new_round_pre_flop call.
@@ -938,83 +903,70 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             game_state = await self._load_game_state(room_id, guild_id, channel_id)
             logger.debug(f"[handle_websocket_game_action] Current round loaded at start: {game_state.get('current_round', 'N/A')}")
 
-            # Check for a timeout condition
-            if game_state.get('timer_end_time') and int(time.time()) > game_state['timer_end_time']:
-                current_player_index = game_state.get('current_player_turn_index', -1)
-                sorted_players = self._get_sorted_players(game_state)
-                if current_player_index != -1 and current_player_index < len(sorted_players):
-                    player_id_to_timeout = sorted_players[current_player_index]['discord_id']
-                    logger.warning(f"[handle_websocket_game_action] Player {player_id_to_timeout} timed out. Initiating auto-action.")
-                    success, message, game_state = await self._auto_action_on_timeout(room_id, player_id_to_timeout, game_state)
-                else:
-                    logger.warning("[handle_websocket_game_action] Timer expired, but no current player is set. Skipping auto-action.")
-            
-            # If a timeout occurred, we've already processed an action, so we can skip the rest
-            if not success:
-                # This new conditional block handles both successful mutating and non-mutating actions correctly
-                if action == "get_state":
-                    success = True
-                    message = "Game state retrieved."
-                elif action == "add_player":
-                    player_data = request_data.get('player_data')
-                    if not player_data or not isinstance(player_data, dict):
-                        logger.error("[handle_websocket_game_action] Missing or invalid player_data for add_player.")
-                        return
-                    success, message, game_state = await self._add_player_to_game(room_id, player_data, game_state, guild_id, channel_id)
-                elif action == "leave_player":
-                    discord_id = request_data.get('discord_id')
-                    if not discord_id:
-                        logger.error("[handle_websocket_game_action] Missing discord_id for leave_player.")
-                        return
-                    success, message, game_state = await self._leave_player(room_id, discord_id, game_state)
-                elif action == "start_new_round_pre_flop":
-                    if game_state.get('current_round') in ['pre_game', 'showdown']:
-                        logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
-                        success, message, game_state = await self._start_new_round_pre_flop(room_id, game_state, guild_id, channel_id)
-                        if success:
-                            if not game_state.get('game_started_once', False):
-                                game_state['game_started_once'] = True 
-                    else:
-                        logger.warning(f"[handle_websocket_game_action] Attempt to start new round failed: Game is already in progress or not in a startable state ({game_state.get('current_round')}) for room {room_id}. {request_data}")
-                        return
-                elif action == "player_action":
-                    player_id = request_data.get('player_id')
-                    action_type = request_data.get('action_type')
-                    amount = request_data.get('amount', 0)
-                    
-                    if not all([player_id, action_type]):
-                        logger.error("[handle_websocket_game_action] Missing player_id or action_type for player_action.")
-                        return
-                    success, message, game_state = await self._handle_player_action(room_id, player_id, action_type, amount, game_state)
-                elif action == "auto_action_timeout":
-                    player_id = request_data.get('player_id')
-                    if not player_id:
-                        logger.error("[handle_websocket_game_action] Missing player_id for auto_action_timeout.")
-                        return
-                    success, message, game_state = await self._auto_action_on_timeout(room_id, player_id, game_state)
-                elif action == "send_message":
-                    message_content = request_data.get('message_content')
-                    if not message_content:
-                        logger.error("[handle_websocket_game_action] Missing message_content for send_message.")
-                        return
-                    success, message, response_data_from_handler = await self._handle_in_game_message(room_id, sender_id, message_content, game_state)
-                    if success:
-                        echo_message_data = response_data_from_handler.get('echo_message')
-                        game_state = response_data_from_handler.get('game_state', game_state) # Ensure game_state is updated from handler
-                else:
-                    logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
+            # Define which actions modify the game state
+            mutating_actions = [
+                "add_player", 
+                "leave_player", 
+                "start_new_round_pre_flop", 
+                "player_action", 
+                "auto_action_timeout",
+            ]
+
+            if action == "get_state":
+                success = True
+                message = "Game state retrieved."
+            elif action == "add_player":
+                player_data = request_data.get('player_data')
+                if not player_data or not isinstance(player_data, dict):
+                    logger.error("[handle_websocket_game_action] Missing or invalid player_data for add_player.")
                     return
+                success, message, game_state = await self._add_player_to_game(room_id, player_data, game_state, guild_id, channel_id)
+            elif action == "leave_player":
+                discord_id = request_data.get('discord_id')
+                if not discord_id:
+                    logger.error("[handle_websocket_game_action] Missing discord_id for leave_player.")
+                    return
+                success, message, game_state = await self._leave_player(room_id, discord_id, game_state)
+            elif action == "start_new_round_pre_flop":
+                if game_state.get('current_round') in ['pre_game', 'showdown']:
+                    logger.info(f"[handle_websocket_game_action] Attempting to start new round from {game_state.get('current_round')} for room {room_id}.")
+                    success, message, game_state = await self._start_new_round_pre_flop(room_id, game_state, guild_id, channel_id)
+                    if success:
+                        if not game_state.get('game_started_once', False):
+                            game_state['game_started_once'] = True 
+                else:
+                    logger.warning(f"[handle_websocket_game_action] Attempt to start new round failed: Game is already in progress or not in a startable state ({game_state.get('current_round')}) for room {room_id}. {request_data}")
+                    return
+            elif action == "player_action":
+                player_id = request_data.get('player_id')
+                action_type = request_data.get('action_type')
+                amount = request_data.get('amount', 0)
+                
+                if not all([player_id, action_type]):
+                    logger.error("[handle_websocket_game_action] Missing player_id or action_type for player_action.")
+                    return
+                success, message, game_state = await self._handle_player_action(room_id, player_id, action_type, amount, game_state)
+            elif action == "auto_action_timeout":
+                player_id = request_data.get('player_id')
+                if not player_id:
+                    logger.error("[handle_websocket_game_action] Missing player_id for auto_action_timeout.")
+                    return
+                success, message, game_state = await self._auto_action_on_timeout(room_id, player_id, game_state)
+            elif action == "send_message":
+                message_content = request_data.get('message_content')
+                if not message_content:
+                    logger.error("[handle_websocket_game_action] Missing message_content for send_message.")
+                    return
+                success, message, response_data_from_handler = await self._handle_in_game_message(room_id, sender_id, message_content, game_state)
+                if success:
+                    echo_message_data = response_data_from_handler.get('echo_message')
+                    game_state = response_data_from_handler.get('game_state', game_state) # Ensure game_state is updated from handler
+            else:
+                logger.warning(f"[handle_websocket_game_action] Received unsupported WS action: {action} for room {room_id}.")
+                return
 
             # After action is processed, handle saving and broadcasting based on success
             if success:
-                mutating_actions = [
-                    "add_player", 
-                    "leave_player", 
-                    "start_new_round_pre_flop", 
-                    "player_action", 
-                    "auto_action_timeout",
-                ]
-
                 if action in mutating_actions:
                     # Save the game state if it was a successful, mutating action
                     await self._save_game_state(room_id, game_state)
@@ -1221,44 +1173,39 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[_add_player_to_game] Current players in game state: {players}")
         
         player_discord_id = player_data['discord_id']
+        player_name = player_data['name']
         seat_id = player_data.get('seat_id')
 
         if not seat_id:
-            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_discord_id}.")
+            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_name}.")
             return False, "Seat ID is required to add a player.", game_state
 
         existing_player = next((p for p in players if p['discord_id'] == player_discord_id), None)
         if existing_player:
-            logger.info(f"[_add_player_to_game] Player {player_discord_id} already exists in game state.")
+            logger.info(f"[_add_player_to_game] Player {player_name} ({player_discord_id}) already exists in game state.")
             if existing_player.get('seat_id') == seat_id:
-                logger.info(f"[_add_player_to_game] Player {player_discord_id} already in seat {seat_id}.")
-                return False, f"Player {player_discord_id} is already in seat {seat_id}.", game_state
+                logger.info(f"[_add_player_to_game] Player {player_name} already in seat {seat_id}.")
+                return False, f"Player {player_name} is already in seat {seat_id}.", game_state
             else:
                 if existing_player.get('seat_id'):
-                    logger.warning(f"[_add_player_to_game] Player {player_discord_id} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id')}.")
-                    return False, f"Player {player_discord_id} is already seated elsewhere. Please leave your current seat first.", game_state
+                    logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id')}.")
+                    return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first.", game_state
                 else:
                     existing_player['seat_id'] = seat_id
-                    # Update name and avatar if they exist in player_data from the frontend, but we'll prioritize backend fetching
-                    if 'name' in player_data:
-                        existing_player['name'] = player_data['name']
-                    if 'avatar_url' in player_data:
-                        existing_player['avatar_url'] = player_data['avatar_url']
-                    logger.info(f"[_add_player_to_game] Player {player_discord_id} updated with seat {seat_id}.")
+                    existing_player['name'] = player_name
+                    existing_player['avatar_url'] = player_data.get('avatar_url')
+                    logger.info(f"[_add_player_to_game] Player {player_name} updated with seat {seat_id}.")
         else:
             if any(p.get('seat_id') == seat_id for p in players):
                 logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
                 return False, f"Seat {seat_id} is already occupied by another player.", game_state
-            
-            # Fetch user details from Discord API for name and avatar
-            user_details = await self._fetch_discord_user_details(player_discord_id, guild_id)
 
             new_player = {
                 'discord_id': player_discord_id,
-                'name': user_details['name'],
+                'name': player_name,
                 'hand': [],
                 'seat_id': seat_id,
-                'avatar_url': user_details['avatar_url'],
+                'avatar_url': player_data.get('avatar_url'),
                 'total_chips': 1000, # This will be updated with kekchipz from _load_game_state
                 'current_bet_in_round': 0,
                 'has_acted_in_round': False,
@@ -1266,11 +1213,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'kekchipz_overall': 0 # Initialize, will be fetched in _load_game_state
             }
             players.append(new_player)
-            logger.info(f"[_add_player_to_game] New player {new_player['name']} added to game state. Current players list: {players}")
+            logger.info(f"[_add_player_to_game] New player {player_name} added to game state. Current players list: {players}")
 
         game_state['players'] = players
         
-        logger.info(f"[_add_player_to_game] Player {player_discord_id} added/updated in seat {seat_id} in room {room_id}.")
+        logger.info(f"[_add_player_to_game] Player {player_name} added/updated in seat {seat_id} in room {room_id}.")
         return True, "Player added successfully.", game_state
 
     async def _leave_player(self, room_id: str, discord_id: str, game_state: dict) -> tuple[bool, str, dict]:

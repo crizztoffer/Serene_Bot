@@ -572,6 +572,83 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 # Optionally remove disconnected websocket here, or rely on on_disconnect
                 # self.bot.ws_rooms[room_id].remove(websocket) # This might be handled by aiohttp's ws_handler
 
+    async def _award_pot_to_last_player(self, room_id: str, game_state: dict) -> dict:
+        """Awards the pot to the last remaining player and ends the hand."""
+        logger.info(f"[_award_pot_to_last_player] Awarding pot to last player in room {room_id}.")
+        
+        # Collect all bets into the main pot
+        total_pot = game_state.get('current_betting_round_pot', 0)
+        for p in game_state['players']:
+            total_pot += p.get('current_bet_in_round', 0)
+            p['current_bet_in_round'] = 0
+
+        game_state['current_betting_round_pot'] = total_pot
+
+        winner = next((p for p in game_state['players'] if not p.get('folded', False)), None)
+        
+        if not winner:
+            logger.error(f"[_award_pot_to_last_player] Could not find a winner in room {room_id}.")
+            # Reset for next round anyway
+            game_state['current_round'] = 'showdown'
+            game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
+            return game_state
+
+        winner_id = winner['discord_id']
+        winnings = game_state['current_betting_round_pot']
+
+        # Update kekchipz in the database for the winner
+        conn = None
+        try:
+            conn = await self._get_db_connection()
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE discord_id = %s AND guild_id = %s",
+                    (winnings, winner_id, game_state['guild_id'])
+                )
+                logger.info(f"[_award_pot_to_last_player] Updated kekchipz for winner {winner_id} by +{winnings}.")
+            await conn.commit()
+        except Exception as e:
+            logger.error(f"[_award_pot_to_last_player] Failed to update kekchipz for winner: {e}", exc_info=True)
+            if conn: await conn.rollback()
+        finally:
+            if conn: conn.close()
+
+        game_state['current_round'] = "showdown"
+        game_state['last_evaluation'] = {
+            "evaluations": [],
+            "winning_info": {
+                "hand_type": "Win by Default",
+                "score_vector": (0,),
+                "winners": [winner_id],
+                "message": f"{winner['name']} wins ${winnings} as the last player remaining."
+            }
+        }
+        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
+        
+        logger.info(f"[_award_pot_to_last_player] Hand ended. Winner: {winner['name']}.")
+        return game_state
+
+    async def _reveal_board_and_dealer(self, room_id: str, game_state: dict) -> dict:
+        """For single player games, reveals the rest of the board and dealer hand when player folds post-flop."""
+        logger.info(f"[_reveal_board_and_dealer] Revealing board and dealer for single player fold in room {room_id}.")
+
+        # Deal remaining cards
+        if game_state['current_round'] == 'flop':
+            _, _, game_state = await self.deal_turn(room_id, game_state)
+            _, _, game_state = await self.deal_river(room_id, game_state)
+        elif game_state['current_round'] == 'turn':
+            _, _, game_state = await self.deal_river(room_id, game_state)
+
+        game_state['current_round'] = "showdown"
+        game_state['last_evaluation'] = {
+            "winning_info": {
+                "message": "Player folded. Revealing dealer hand and board."
+            }
+        }
+        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
+        
+        return game_state
+
     # --- Helper for getting sorted players ---
     def _get_sorted_players(self, game_state: dict) -> list:
         """Returns a list of players sorted by their seat_id."""
@@ -843,10 +920,26 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return False
 
     async def _advance_game_phase(self, room_id: str, game_state: dict) -> dict:
-        """Moves the game to the next phase (flop, turn, river, showdown)."""
+        """Moves the game to the next phase (flop, turn, river, showdown) or handles win by default."""
         logger.info(f"[_advance_game_phase] Advancing game phase from {game_state['current_round']} for room {room_id}.")
-        
-        # Collect bets into main pot before advancing phase
+
+        active_players = [p for p in game_state['players'] if not p.get('folded', False)]
+        num_active_players = len(active_players)
+
+        # Handle win by default (multiplayer) or single player fold scenarios
+        if num_active_players <= 1:
+            game_state = await self._end_betting_round(room_id, game_state) # Collect final bets first
+            if num_active_players == 1:
+                return await self._award_pot_to_last_player(room_id, game_state)
+            elif num_active_players == 0: # Single player game and player folded
+                if game_state['current_round'] == 'pre_flop':
+                    logger.info(f"[_advance_game_phase] Single player folded pre-flop. Starting new round for room {room_id}.")
+                    return await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
+                else: # Post-flop fold
+                    logger.info(f"[_advance_game_phase] Single player folded post-flop. Revealing board for room {room_id}.")
+                    return await self._reveal_board_and_dealer(room_id, game_state)
+
+        # Original logic for advancing betting rounds
         game_state = await self._end_betting_round(room_id, game_state)
 
         next_round = None
@@ -867,9 +960,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             next_round = 'showdown'
         elif game_state['current_round'] == 'showdown':
             success, msg, game_state = await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
-            # NOTE: The return message from _start_new_round_pre_flop will correctly reflect 'pre_flop'
-            # state, but the return from this function to the handler will still use the `msg`
-            # variable from the _start_new_round_pre_flop call.
             next_round = 'pre_flop'
             
         if not success:
@@ -1019,7 +1109,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"[_handle_player_action] Player {player_id} not found in game {room_id}.")
             return False, "Player not found in game.", game_state
 
-        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 else None
+        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 and len(sorted_players) > game_state['current_player_turn_index'] else None
 
         if not current_player_turn_obj or current_player_turn_obj['discord_id'] != player_id:
             logger.warning(f"[_handle_player_action] It's not player {player_id}'s turn in room {room_id}. Current turn: {current_player_turn_obj['discord_id'] if current_player_turn_obj else 'None'}.")
@@ -1037,6 +1127,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         if action_type == 'fold':
             player_in_state['folded'] = True
+            player_in_state['hand_revealed'] = True # Reveal hand on fold
             player_in_state['has_acted_in_round'] = True
             message = f"{player_in_state['name']} folded."
             success = True
@@ -1153,10 +1244,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         action_message = ""
         if min_bet_to_call > 0:
             player_in_state['folded'] = True
+            player_in_state['hand_revealed'] = True # Also reveal hand on timeout fold
             action_message = f"{player_in_state['name']} automatically folded due to timeout."
         else:
             player_in_state['has_acted_in_round'] = True
-            action_message = f"{player_in_state['name']} automatically checked/called due to timeout."
+            action_message = f"{player_in_state['name']} automatically checked due to timeout."
         
         logger.info(f"[_auto_action_on_timeout] Player {player_id} auto-action completed in room {room_id}. Message: {action_message}.")
 
@@ -1236,6 +1328,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'current_bet_in_round': 0,
                 'has_acted_in_round': False,
                 'folded': False,
+                'hand_revealed': False, # Initialize revealed status
                 'kekchipz_overall': 0 # Initialize, will be fetched in _load_game_state
             }
             players.append(new_player)
@@ -1284,6 +1377,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             player['current_bet_in_round'] = 0
             player['has_acted_in_round'] = False
             player['folded'] = False
+            player['hand_revealed'] = False # Reset revealed status
             # When starting a new game, reset total_chips to their overall kekchipz balance
             # This assumes kekchipz_overall has been loaded into the player dict by _load_game_state
             player['total_chips'] = player.get('kekchipz_overall', 1000) # Use fetched kekchipz, or default to 1000

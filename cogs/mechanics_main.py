@@ -214,6 +214,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('big_blind_amount', 10)
             
                 # Fetch kekchipz for each player using guild_id instead of channel_id
+                # And refresh their display name and avatar from Discord
+                guild = self.bot.get_guild(int(guild_id)) if guild_id else None
                 for player in game_state.get('players', []):
                     player_discord_id = player['discord_id']
                     if game_state['guild_id'] and player_discord_id:
@@ -232,6 +234,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         player['kekchipz_overall'] = 0
                         logger.warning(f"[_load_game_state] Missing guild_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
     
+                    # --- NEWLY ADDED: Refresh player name and avatar from Discord ---
+                    if guild:
+                        try:
+                            member = await guild.fetch_member(int(player_discord_id))
+                            player['name'] = member.display_name
+                            player['avatar_url'] = str(member.avatar.url) if member.avatar else str(member.default_avatar.url)
+                            logger.debug(f"[_load_game_state] Refreshed Discord info for player {player_discord_id}: {player['name']}")
+                        except Exception as e:
+                            logger.warning(f"Could not refresh member info for {player_discord_id} from Discord: {e}. Using stored data.")
+                    # --- END OF NEWLY ADDED CODE ---
+
                     player.setdefault('total_chips', 1000)
                     player.setdefault('current_bet_in_round', 0)
                     player.setdefault('has_acted_in_round', False)
@@ -298,7 +311,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             return False, "No players in the game to deal cards.", game_state
 
         deck = Deck(game_state.get('deck', [])) # Use Deck from game_models
-        # Shuffle only if it's a new game or if the deck hasn't_been shuffled yet for this round
+        # Shuffle only if it's a new game or if the deck hasn't been shuffled yet for this round
         if game_state['current_round'] == 'pre_game' or not deck.cards:
             deck.build() # Rebuild a full deck
             deck.shuffle()
@@ -1200,12 +1213,25 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
                 return False, f"Seat {seat_id} is already occupied by another player.", game_state
 
+            # --- NEWLY ADDED: Fetch player name and avatar from Discord ---
+            guild = self.bot.get_guild(int(guild_id)) if guild_id else None
+            avatar_url = None
+            if guild:
+                try:
+                    member = await guild.fetch_member(int(player_discord_id))
+                    player_name = member.display_name
+                    avatar_url = str(member.avatar.url) if member.avatar else str(member.default_avatar.url)
+                    logger.debug(f"[_add_player_to_game] Fetched Discord info for new player {player_discord_id}: {player_name}")
+                except Exception as e:
+                    logger.warning(f"Could not fetch member info for new player {player_discord_id} from Discord: {e}. Using provided name.")
+            # --- END OF NEWLY ADDED CODE ---
+
             new_player = {
                 'discord_id': player_discord_id,
                 'name': player_name,
                 'hand': [],
                 'seat_id': seat_id,
-                'avatar_url': player_data.get('avatar_url'),
+                'avatar_url': avatar_url, # Use fetched avatar_url
                 'total_chips': 1000, # This will be updated with kekchipz from _load_game_state
                 'current_bet_in_round': 0,
                 'has_acted_in_round': False,

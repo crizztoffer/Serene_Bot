@@ -249,6 +249,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     player.setdefault('current_bet_in_round', 0)
                     player.setdefault('has_acted_in_round', False)
                     player.setdefault('folded', False)
+                    player.setdefault('hand_revealed', False) # Backwards compatibility
     
             await conn.commit() # Commit after all read operations
             return game_state
@@ -265,6 +266,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def _save_game_state(self, room_id: str, game_state: dict):
         """Saves the game state for a given room_id to the database."""
+        if not isinstance(game_state, dict):
+            logger.error(f"[_save_game_state] Attempted to save non-dict game_state for room {room_id}. Type: {type(game_state)}. State: {game_state}")
+            return # Prevent saving incorrect data type
+
         room_id_from_state = game_state.get("room_id")
         if room_id_from_state and room_id_from_state != room_id:
             logger.warning(f"[_save_game_state] room_id mismatch: argument={room_id}, game_state={room_id_from_state}")
@@ -933,8 +938,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 return await self._award_pot_to_last_player(room_id, game_state)
             elif num_active_players == 0: # Single player game and player folded
                 if game_state['current_round'] == 'pre_flop':
-                    logger.info(f"[_advance_game_phase] Single player folded pre-flop. Starting new round for room {room_id}.")
-                    return await self._start_new_round_pre_flop(room_id, game_state, game_state['guild_id'], game_state['channel_id'])
+                    logger.info(f"[_advance_game_phase] Single player folded pre-flop. Ending hand for room {room_id}.")
+                    game_state['current_round'] = 'showdown'
+                    game_state['last_evaluation'] = {
+                        "winning_info": {
+                            "message": "You folded. A new hand will begin shortly."
+                        }
+                    }
+                    game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
+                    return game_state
                 else: # Post-flop fold
                     logger.info(f"[_advance_game_phase] Single player folded post-flop. Revealing board for room {room_id}.")
                     return await self._reveal_board_and_dealer(room_id, game_state)
@@ -1228,7 +1240,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"[_auto_action_on_timeout] Player {player_id} not found in game for timeout action in room {room_id}.")
             return False, "Player not found in game for timeout action.", game_state
 
-        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 else None
+        current_player_turn_obj = sorted_players[game_state['current_player_turn_index']] if game_state['current_player_turn_index'] != -1 and len(sorted_players) > game_state['current_player_turn_index'] else None
 
         if not current_player_turn_obj or current_player_turn_obj['discord_id'] != player_id:
             logger.warning(f"[_auto_action_on_timeout] Timeout action for incorrect player ({player_id}) or not their turn in room {room_id}. Current turn: {current_player_turn_obj['discord_id'] if current_player_turn_obj else 'None'}.")
@@ -1397,12 +1409,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.error(f"[_start_new_round_pre_flop] Failed to reset game for new round: {message_reset} for room {room_id}.")
             return False, f"Failed to reset game for new round: {message_reset}", game_state
 
-        sorted_players = self._get_sorted_players(game_state)
-        if len(sorted_players) == 0:
+        all_players = game_state.get('players', [])
+        seated_players = [p for p in all_players if p.get('seat_id')]
+
+        if len(seated_players) == 0:
             logger.warning(f"[_start_new_round_pre_flop] No players seated in room {room_id}. Cannot start new round.")
             return False, "Cannot start new round, no players available.", game_state
         
-        game_state['dealer_button_position'] = (game_state['dealer_button_position'] + 1) % len(sorted_players)
+        game_state['dealer_button_position'] = (game_state.get('dealer_button_position', -1) + 1) % len(seated_players)
         logger.info(f"[_start_new_round_pre_flop] Dealer button moved to player at index {game_state['dealer_button_position']} for room {room_id}.")
         
         success_players, message_players, game_state = await self.deal_hole_cards(room_id, game_state)

@@ -89,7 +89,7 @@ def evaluate_poker_hand(cards):
         if count_groups[0][1] == 2 and count_groups[1][1] == 2:
             return "Two Pair", (HAND_RANKINGS["Two Pair"], count_groups[0][0], count_groups[1][0], grouped_ranks[2])
 
-        if count_counts[0][1] == 2:
+        if count_groups[0][1] == 2:
             return "One Pair", (HAND_RANKINGS["One Pair"], count_groups[0][0], *grouped_ranks[1:4])
 
         return "High Card", (HAND_RANKINGS["High Card"], *ranks)

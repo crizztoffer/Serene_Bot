@@ -249,6 +249,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     player.setdefault('current_bet_in_round', 0)
                     player.setdefault('has_acted_in_round', False)
                     player.setdefault('folded', False)
+                    player.setdefault('hand_revealed', False) # Backwards compatibility
     
             await conn.commit() # Commit after all read operations
             return game_state
@@ -265,6 +266,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def _save_game_state(self, room_id: str, game_state: dict):
         """Saves the game state for a given room_id to the database."""
+        if not isinstance(game_state, dict):
+            logger.error(f"[_save_game_state] Attempted to save non-dict game_state for room {room_id}. Type: {type(game_state)}. State: {game_state}")
+            return # Prevent saving incorrect data type
+
         room_id_from_state = game_state.get("room_id")
         if room_id_from_state and room_id_from_state != room_id:
             logger.warning(f"[_save_game_state] room_id mismatch: argument={room_id}, game_state={room_id_from_state}")

@@ -452,27 +452,39 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def evaluate_hands(self, room_id: str, game_state: dict) -> tuple[bool, str, dict]:
         """
-        Evaluates all players' hands against the community cards, determines the winner(s),
-        and adds this information to the game state.
+        Evaluates all players' hands and the dealer's hand against the community cards,
+        determines the winner(s) (players who beat the dealer), and adds this
+        information to the game state.
         """
         if game_state['current_round'] != 'river':
             logger.warning(f"[evaluate_hands] Cannot evaluate hands. Current round is {game_state['current_round']} for room {room_id}.")
             return False, f"Cannot evaluate hands. Current round is {game_state['current_round']}.", game_state
 
         players_data = game_state.get('players', [])
-        board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])] # Use Card from game_models
+        board_cards_obj = [Card.from_output_format(c_str) for c_str in game_state.get('board_cards', [])]
+        dealer_hand_obj = [Card.from_output_format(c_str) for c_str in game_state.get('dealer_hand', [])]
         active_players = [p for p in players_data if not p.get('folded', False)]
 
         if len(board_cards_obj) != 5:
             logger.error(f"[evaluate_hands] Board not complete for evaluation in room {room_id}.")
             return False, "Board not complete.", game_state
 
+        # Evaluate Dealer's Hand
+        dealer_combined_cards = dealer_hand_obj + board_cards_obj
+        dealer_hand_type, dealer_score_vector = evaluate_poker_hand(dealer_combined_cards)
+        dealer_evaluation = {
+            "name": "Dealer",
+            "hand_type": dealer_hand_type,
+            "hand_score_vector": dealer_score_vector,
+            "hole_cards": [c.to_output_format() for c in dealer_hand_obj]
+        }
+
         player_evaluations = []
-        best_score = (-1,)
+        best_player_score = dealer_score_vector # Players must beat the dealer
         winning_players = []
 
         for player_data in active_players:
-            player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])] # Use Card from game_models
+            player_hand_obj = [Card.from_output_format(c_str) for c_str in player_data.get('hand', [])]
             combined_cards = player_hand_obj + board_cards_obj
             hand_type, hand_score_vector = evaluate_poker_hand(combined_cards)
 
@@ -485,14 +497,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 "is_winner": False # Will be set below
             })
             
-            # Check for winner
-            if hand_score_vector > best_score:
-                best_score = hand_score_vector
+            # Check if player beats the current best hand (which starts with the dealer)
+            if hand_score_vector > best_player_score:
+                best_player_score = hand_score_vector
                 winning_players = [player_data['discord_id']]
-            elif hand_score_vector == best_score:
+            elif hand_score_vector == best_player_score and best_player_score > dealer_score_vector:
+                # Only a tie if they also beat the dealer
                 winning_players.append(player_data['discord_id'])
 
-        # Sort the evaluations from best to worst hand
+        # Sort the evaluations from best to worst hand for display
         player_evaluations.sort(key=lambda x: x['hand_score_vector'], reverse=True)
 
         # Mark the winners in the sorted evaluation data
@@ -501,51 +514,58 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 eval_data['is_winner'] = True
         
         winning_hand_name = "N/A"
-        if player_evaluations:
-            winning_hand_name = player_evaluations[0]['hand_type']
+        if winning_players and player_evaluations:
+            # Find the winning hand name from the first winner in the sorted list
+            winning_hand_name = next((p['hand_type'] for p in player_evaluations if p['discord_id'] in winning_players), "N/A")
+        elif not winning_players:
+            winning_hand_name = dealer_hand_type # Dealer's hand is the winning type
 
         game_state['current_round'] = "showdown"
         game_state['last_evaluation'] = {
+            "dealer_evaluation": dealer_evaluation,
             "evaluations": player_evaluations,
             "winning_info": {
                 "hand_type": winning_hand_name,
-                "score_vector": best_score,
+                "score_vector": best_player_score,
                 "winners": winning_players
             }
         }
-        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME # 10-second timer after showdown
+        game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
 
-        # Calculate winnings per player (equal split of the pot for now)
-        winnings = game_state.get('current_betting_round_pot', 0)
-        num_winners = len(winning_players)
-        winnings_per_player = winnings // num_winners if num_winners > 0 else 0
+        # Calculate winnings per player
+        if winning_players:
+            winnings = game_state.get('current_betting_round_pot', 0)
+            num_winners = len(winning_players)
+            winnings_per_player = winnings // num_winners if num_winners > 0 else 0
 
-        # Update kekchipz in the database for each winner
-        conn = None
-        try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                for winner_id in winning_players:
-                    await cursor.execute(
-                        "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE discord_id = %s AND guild_id = %s",
-                        (winnings_per_player, winner_id, game_state['guild_id'])
-                    )
-                    logger.info(f"[evaluate_hands] Updated kekchipz for winner {winner_id} by +{winnings_per_player}.")
+            # Update kekchipz in the database for each winner
+            conn = None
+            try:
+                conn = await self._get_db_connection()
+                async with conn.cursor() as cursor:
+                    for winner_id in winning_players:
+                        await cursor.execute(
+                            "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE discord_id = %s AND guild_id = %s",
+                            (winnings_per_player, winner_id, game_state['guild_id'])
+                        )
+                        logger.info(f"[evaluate_hands] Updated kekchipz for winner {winner_id} by +{winnings_per_player}.")
+                
+                await conn.commit()
+                logger.info("[evaluate_hands] Kekchipz updates successfully committed to the database.")
+
+            except Exception as e:
+                logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
+                if conn:
+                    await conn.rollback()
+            finally:
+                if conn:
+                    conn.close()
+        
+        if winning_players:
+            logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Winner(s): {winning_players}")
+        else:
+            logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Dealer wins.")
             
-            # Explicitly commit the transaction for this operation
-            await conn.commit()
-            logger.info("[evaluate_hands] Kekchipz updates successfully committed to the database.")
-
-        except Exception as e:
-            logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
-            # Rollback if an error occurs
-            if conn:
-                await conn.rollback()
-        finally:
-            if conn:
-                conn.close()
-
-        logger.info(f"[evaluate_hands] Hands evaluated for room {room_id}. Current round set to {game_state['current_round']}. Winner(s): {winning_players}")
         return True, "Hands evaluated.", game_state
 
     async def broadcast_game_state(self, room_id: str, game_state: dict, echo_message: dict = None):

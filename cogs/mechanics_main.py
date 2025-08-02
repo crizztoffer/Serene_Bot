@@ -852,77 +852,36 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def _check_round_completion(self, game_state: dict) -> bool:
         """
         Checks if the current betting round is complete.
-        A round is complete if:
-        1. Only one player is not folded. (This player wins the pot)
-        2. All active players (not folded) have had a chance to act and have either:
-           a) Matched the highest current bet (called).
-           b) Gone all-in for less than the highest bet.
-           c) Checked (if no bet has been made).
-           d) Folded.
-        And the action has returned to the player who made the last aggressive action,
-        or there was no aggressive action and everyone has acted once.
+        A round is complete if all active players have acted and have contributed the same amount to the pot (or are all-in).
         """
-        sorted_players = self._get_sorted_players(game_state)
-        active_players = [p for p in sorted_players if not p.get('folded', False)]
+        active_players = [p for p in game_state['players'] if p.get('seat_id') and not p.get('folded', False)]
         logger.debug(f"[_check_round_completion] Active players count: {len(active_players)}")
 
         if len(active_players) <= 1:
             logger.info("[_check_round_completion] Betting round complete: 1 or fewer active players remaining.")
             return True
 
+        # Check if everyone who is still in the hand has acted at least once in this round.
+        # This is crucial for the big blind having the option to raise.
+        if not all(p.get('has_acted_in_round', False) for p in active_players):
+            logger.debug("[_check_round_completion] Not all active players have acted yet.")
+            return False
+
         highest_bet_in_round = max([p.get('current_bet_in_round', 0) for p in active_players])
         logger.debug(f"[_check_round_completion] Highest bet in round: {highest_bet_in_round}")
 
-        # Determine if all active players have 'settled' their action relative to the highest bet
-        all_settled = True
+        # Check if all active players have either matched the highest bet or are all-in.
         for player in active_players:
-            # If player has not acted yet, round is not complete
-            if not player.get('has_acted_in_round', False):
-                logger.debug(f"[_check_round_completion] Player {player.get('name', 'N/A')} has not acted yet. Round not complete.")
-                all_settled = False
-                break
+            is_all_in = player.get('total_chips', 0) == 0
+            has_matched = player.get('current_bet_in_round', 0) == highest_bet_in_round
             
-            # If player's current bet is less than highest and they still have chips,
-            # they need to act again (unless they are the one who made the highest bet).
-            if player.get('current_bet_in_round', 0) < highest_bet_in_round and player.get('total_chips', 0) > 0:
-                logger.debug(f"[_check_round_completion] Player {player.get('name', 'N/A')} has not matched highest bet and still has chips. Round not complete.")
-                all_settled = False
-                break
-
-        logger.debug(f"[_check_round_completion] All active players settled (acted and matched/all-in): {all_settled}")
-
-        if not all_settled:
-            return False # Not all players have completed their action for this bet level
-
-        # Now, consider the turn cycle
-        current_player_index = game_state['current_player_turn_index']
-        current_player_id = sorted_players[current_player_index]['discord_id'] if current_player_index != -1 and current_player_index < len(sorted_players) else None
-        last_aggressive_action_player_id = game_state['last_aggressive_action_player_id']
-
-        logger.debug(f"[_check_round_completion] Current player ID: {current_player_id}, Last aggressive action player ID: {last_aggressive_action_player_id}")
-
-        # Case 1: No aggressive action (all checks/calls up to the initial big blind)
-        if last_aggressive_action_player_id is None:
-            # If everyone has settled, and there was no raise, the round is complete.
-            # This covers scenarios where everyone checks or everyone calls the big blind.
-            logger.info(f"[_check_round_completion] Betting round complete: No aggressive action, all settled.")
-            return True
+            if not has_matched and not is_all_in:
+                logger.debug(f"[_check_round_completion] Player {player.get('name')} has not matched ({player.get('current_bet_in_round')}) highest bet ({highest_bet_in_round}) and is not all-in.")
+                return False
         
-        # Case 2: There was an aggressive action (bet or raise)
-        # The round is complete if all active players have settled, AND the action has returned
-        # to the player who made the last aggressive action (meaning everyone after them has responded).
-        if current_player_id == last_aggressive_action_player_id:
-            logger.info(f"[_check_round_completion] Betting round complete: Action returned to last aggressive player {current_player_id}.")
-            return True
-        
-        # Edge case: The last aggressive player folded after their action.
-        # If everyone else has settled, the round should also end.
-        last_aggressive_player_obj = next((p for p in game_state['players'] if p['discord_id'] == last_aggressive_action_player_id), None)
-        if last_aggressive_player_obj and last_aggressive_player_obj.get('folded', False):
-             logger.info(f"[_check_round_completion] Betting round complete: Last aggressive player {last_aggressive_action_player_id} folded.")
-             return True
-
-        return False
+        # If we get here, all conditions are met.
+        logger.info(f"[_check_round_completion] Betting round complete: All players have acted and matched the highest bet.")
+        return True
 
     async def _advance_game_phase(self, room_id: str, game_state: dict) -> dict:
         """Moves the game to the next phase (flop, turn, river, showdown) or handles win by default."""

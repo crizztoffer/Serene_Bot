@@ -4,6 +4,7 @@ import aiomysql
 import time # Import time for timestamps
 from discord.ext import commands
 from itertools import combinations
+import discord # Import discord to access API functionality
 
 # Import Card and Deck from the new game_models utility file
 from cogs.utils.game_models import Card, Deck
@@ -142,12 +143,37 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             cursorclass=aiomysql.cursors.DictCursor
         )
 
+    async def _fetch_discord_user_details(self, user_id, guild_id):
+        """Fetches a user's display name and avatar URL from the Discord API, prioritizing guild-specific data."""
+        try:
+            guild = self.bot.get_guild(int(guild_id))
+            if guild:
+                member = await guild.fetch_member(int(user_id))
+                if member:
+                    # Prefer nickname, then global_name, then username
+                    name = member.nick or member.global_name or member.name
+                    # Prefer guild avatar, then global avatar, then default
+                    avatar_url = member.guild_avatar.url if member.guild_avatar else member.display_avatar.url
+                    return {"name": name, "avatar_url": avatar_url}
+
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logger.warning(f"Failed to fetch guild member details for {user_id} in guild {guild_id}: {e}")
+            # Fallback to fetching user details globally
+            try:
+                user = await self.bot.fetch_user(int(user_id))
+                return {"name": user.global_name or user.name, "avatar_url": user.display_avatar.url}
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                logger.error(f"Failed to fetch global user details for {user_id}: {e}")
+                return {"name": "Unknown User", "avatar_url": "https://cdn.discordapp.com/embed/avatars/0.png"}
+        return {"name": "Unknown User", "avatar_url": "https://cdn.discordapp.com/embed/avatars/0.png"}
+
+
     async def _load_game_state(self, room_id: str, guild_id: str = None, channel_id: str = None) -> dict:
         """
         Loads the game state for a given room_id from the database.
         If not found, initializes a new state, using provided guild_id.
         Ensures guild_id is always present in the returned state.
-        Fetches kekchipz for each player from discord_users table.
+        Fetches kekchipz and Discord details for each player from the database or API.
         """
         conn = None
         try:
@@ -203,7 +229,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     }
     
                 # Ensure required fields are present for backward compatibility
-                # This is the primary fix to handle old/inconsistent data
                 game_state.setdefault('current_player_turn_index', -1)
                 game_state.setdefault('current_betting_round_pot', 0)
                 game_state.setdefault('current_round_min_bet', 0)
@@ -213,29 +238,40 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('small_blind_amount', 5)
                 game_state.setdefault('big_blind_amount', 10)
             
-                # Fetch kekchipz for each player using guild_id instead of channel_id
+                # Fetch kekchipz for each player from discord_users table and update player data with correct name and avatar
+                updated_players = []
                 for player in game_state.get('players', []):
-                    player_discord_id = player['discord_id']
-                    if game_state['guild_id'] and player_discord_id:
+                    player_discord_id = player.get('discord_id')
+                    if not player_discord_id:
+                        continue
+                    
+                    # Fetch kekchipz
+                    kekchipz_overall = 0
+                    if game_state['guild_id']:
                         await cursor.execute(
                             "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND guild_id = %s",
                             (player_discord_id, game_state['guild_id'])
                         )
                         kekchipz_result = await cursor.fetchone()
                         if kekchipz_result and 'kekchipz' in kekchipz_result:
-                            player['kekchipz_overall'] = kekchipz_result['kekchipz']
-                            logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
+                            kekchipz_overall = kekchipz_result['kekchipz']
+                            logger.debug(f"[_load_game_state] Fetched kekchipz {kekchipz_overall} for player {player_discord_id}.")
                         else:
-                            player['kekchipz_overall'] = 0
                             logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in guild {game_state['guild_id']}. Setting to 0.")
                     else:
-                        player['kekchipz_overall'] = 0
-                        logger.warning(f"[_load_game_state] Missing guild_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
-    
-                    player.setdefault('total_chips', 1000)
-                    player.setdefault('current_bet_in_round', 0)
-                    player.setdefault('has_acted_in_round', False)
-                    player.setdefault('folded', False)
+                        logger.warning(f"[_load_game_state] Missing guild_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
+                    
+                    player['kekchipz_overall'] = kekchipz_overall
+                    player.setdefault('total_chips', 1000) # Ensure total_chips is always set
+
+                    # Fetch user details from Discord API for name and avatar
+                    user_details = await self._fetch_discord_user_details(player_discord_id, game_state['guild_id'])
+                    player['name'] = user_details['name']
+                    player['avatar_url'] = user_details['avatar_url']
+                    
+                    updated_players.append(player)
+                
+                game_state['players'] = updated_players
     
             await conn.commit() # Commit after all read operations
             return game_state
@@ -1185,39 +1221,44 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[_add_player_to_game] Current players in game state: {players}")
         
         player_discord_id = player_data['discord_id']
-        player_name = player_data['name']
         seat_id = player_data.get('seat_id')
 
         if not seat_id:
-            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_name}.")
+            logger.warning(f"[_add_player_to_game] No seat_id provided for player {player_discord_id}.")
             return False, "Seat ID is required to add a player.", game_state
 
         existing_player = next((p for p in players if p['discord_id'] == player_discord_id), None)
         if existing_player:
-            logger.info(f"[_add_player_to_game] Player {player_name} ({player_discord_id}) already exists in game state.")
+            logger.info(f"[_add_player_to_game] Player {player_discord_id} already exists in game state.")
             if existing_player.get('seat_id') == seat_id:
-                logger.info(f"[_add_player_to_game] Player {player_name} already in seat {seat_id}.")
-                return False, f"Player {player_name} is already in seat {seat_id}.", game_state
+                logger.info(f"[_add_player_to_game] Player {player_discord_id} already in seat {seat_id}.")
+                return False, f"Player {player_discord_id} is already in seat {seat_id}.", game_state
             else:
                 if existing_player.get('seat_id'):
-                    logger.warning(f"[_add_player_to_game] Player {player_name} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id')}.")
-                    return False, f"Player {player_name} is already seated elsewhere. Please leave your current seat first.", game_state
+                    logger.warning(f"[_add_player_to_game] Player {player_discord_id} is trying to sit in seat {seat_id} but is already in seat {existing_player.get('seat_id')}.")
+                    return False, f"Player {player_discord_id} is already seated elsewhere. Please leave your current seat first.", game_state
                 else:
                     existing_player['seat_id'] = seat_id
-                    existing_player['name'] = player_name
-                    existing_player['avatar_url'] = player_data.get('avatar_url')
-                    logger.info(f"[_add_player_to_game] Player {player_name} updated with seat {seat_id}.")
+                    # Update name and avatar if they exist in player_data from the frontend, but we'll prioritize backend fetching
+                    if 'name' in player_data:
+                        existing_player['name'] = player_data['name']
+                    if 'avatar_url' in player_data:
+                        existing_player['avatar_url'] = player_data['avatar_url']
+                    logger.info(f"[_add_player_to_game] Player {player_discord_id} updated with seat {seat_id}.")
         else:
             if any(p.get('seat_id') == seat_id for p in players):
                 logger.warning(f"[_add_player_to_game] Seat {seat_id} is already occupied.")
                 return False, f"Seat {seat_id} is already occupied by another player.", game_state
+            
+            # Fetch user details from Discord API for name and avatar
+            user_details = await self._fetch_discord_user_details(player_discord_id, guild_id)
 
             new_player = {
                 'discord_id': player_discord_id,
-                'name': player_name,
+                'name': user_details['name'],
                 'hand': [],
                 'seat_id': seat_id,
-                'avatar_url': player_data.get('avatar_url'),
+                'avatar_url': user_details['avatar_url'],
                 'total_chips': 1000, # This will be updated with kekchipz from _load_game_state
                 'current_bet_in_round': 0,
                 'has_acted_in_round': False,
@@ -1225,11 +1266,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 'kekchipz_overall': 0 # Initialize, will be fetched in _load_game_state
             }
             players.append(new_player)
-            logger.info(f"[_add_player_to_game] New player {player_name} added to game state. Current players list: {players}")
+            logger.info(f"[_add_player_to_game] New player {new_player['name']} added to game state. Current players list: {players}")
 
         game_state['players'] = players
         
-        logger.info(f"[_add_player_to_game] Player {player_name} added/updated in seat {seat_id} in room {room_id}.")
+        logger.info(f"[_add_player_to_game] Player {player_discord_id} added/updated in seat {seat_id} in room {room_id}.")
         return True, "Player added successfully.", game_state
 
     async def _leave_player(self, room_id: str, discord_id: str, game_state: dict) -> tuple[bool, str, dict]:

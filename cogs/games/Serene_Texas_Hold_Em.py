@@ -141,10 +141,17 @@ class GameSetupView(View):
         
         async def callback(self, interaction: discord.Interaction):
             self.view.game_mode = self.values[0]
+            
+            # Find the selected option to update the placeholder
+            selected_option = discord.utils.get(self.options, value=self.values[0])
+            if selected_option:
+                self.placeholder = selected_option.label
+
             # Enable the create button
             for item in self.view.children:
                 if isinstance(item, Button) and item.label == "Create Game":
                     item.disabled = False
+
             await interaction.response.edit_message(view=self.view)
 
     class CreateGameButton(Button):

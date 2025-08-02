@@ -750,7 +750,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             small_blind_player['current_bet_in_round'] += small_blind_amount
             game_state['current_betting_round_pot'] += small_blind_amount
             logger.info(f"[_apply_blinds] Player {small_blind_player['name']} posts small blind: ${small_blind_amount}")
-            small_blind_player['has_acted_in_round'] = True # Mark as acted
+            # small_blind_player['has_acted_in_round'] = True # DO NOT SET HERE
 
         if big_blind_player:
             # Deduct big blind
@@ -759,7 +759,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             big_blind_player['current_bet_in_round'] += big_blind_amount
             game_state['current_betting_round_pot'] += big_blind_amount
             logger.info(f"[_apply_blinds] Player {big_blind_player['name']} posts big blind: ${big_blind_amount}")
-            big_blind_player['has_acted_in_round'] = True # Big blind has acted by posting
+            # big_blind_player['has_acted_in_round'] = True # DO NOT SET HERE
 
         # Set the minimum bet for this round to the big blind amount
         # If only one player, this might be 0 or a default.
@@ -855,33 +855,30 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         A round is complete if all active players have acted and have contributed the same amount to the pot (or are all-in).
         """
         active_players = [p for p in game_state['players'] if p.get('seat_id') and not p.get('folded', False)]
-        logger.debug(f"[_check_round_completion] Active players count: {len(active_players)}")
-
+        
         if len(active_players) <= 1:
-            logger.info("[_check_round_completion] Betting round complete: 1 or fewer active players remaining.")
+            logger.info("[_check_round_completion] Round complete: 1 or fewer active players.")
             return True
 
         # Check if everyone who is still in the hand has acted at least once in this round.
-        # This is crucial for the big blind having the option to raise.
         if not all(p.get('has_acted_in_round', False) for p in active_players):
-            logger.debug("[_check_round_completion] Not all active players have acted yet.")
+            logger.debug("[_check_round_completion] Round not complete: Not all players have acted yet.")
             return False
 
-        highest_bet_in_round = max([p.get('current_bet_in_round', 0) for p in active_players])
-        logger.debug(f"[_check_round_completion] Highest bet in round: {highest_bet_in_round}")
-
-        # Check if all active players have either matched the highest bet or are all-in.
-        for player in active_players:
-            is_all_in = player.get('total_chips', 0) == 0
-            has_matched = player.get('current_bet_in_round', 0) == highest_bet_in_round
-            
-            if not has_matched and not is_all_in:
-                logger.debug(f"[_check_round_completion] Player {player.get('name')} has not matched ({player.get('current_bet_in_round')}) highest bet ({highest_bet_in_round}) and is not all-in.")
-                return False
+        highest_bet_in_round = max(p.get('current_bet_in_round', 0) for p in active_players)
         
-        # If we get here, all conditions are met.
-        logger.info(f"[_check_round_completion] Betting round complete: All players have acted and matched the highest bet.")
-        return True
+        # Check if all active players have either matched the highest bet or are all-in.
+        bets_are_settled = all(
+            p.get('current_bet_in_round') == highest_bet_in_round or p.get('total_chips', 0) == 0
+            for p in active_players
+        )
+
+        if bets_are_settled:
+            logger.info(f"[_check_round_completion] Round complete: All players acted and bets are settled at ${highest_bet_in_round}.")
+            return True
+        
+        logger.debug("[_check_round_completion] Round not complete: Bets are not settled.")
+        return False
 
     async def _advance_game_phase(self, room_id: str, game_state: dict) -> dict:
         """Moves the game to the next phase (flop, turn, river, showdown) or handles win by default."""

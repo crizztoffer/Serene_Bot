@@ -1154,16 +1154,22 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.info(message)
         elif action_type == 'call':
             if player_in_state['total_chips'] < min_bet_to_call:
-                logger.warning(f"[_handle_player_action] Player {player_id} attempted to call ${min_bet_to_call} but only has ${player_in_state['total_chips']}.")
-                return False, f"Not enough chips to call ${min_bet_to_call}. You have ${player_in_state['total_chips']}.", game_state
-            
-            bet_amount = min_bet_to_call
-            player_in_state['total_chips'] -= bet_amount
-            player_in_state['current_bet_in_round'] += bet_amount
-            player_in_state['has_acted_in_round'] = True
-            message = f"{player_in_state['name']} called ${bet_amount}."
-            success = True
-            logger.info(message)
+                # Allow player to go all-in if they can't cover the full call amount
+                bet_amount = player_in_state['total_chips']
+                player_in_state['total_chips'] = 0
+                player_in_state['current_bet_in_round'] += bet_amount
+                player_in_state['has_acted_in_round'] = True
+                message = f"{player_in_state['name']} called and is All-In with ${bet_amount}."
+                success = True
+                logger.info(message)
+            else:
+                bet_amount = min_bet_to_call
+                player_in_state['total_chips'] -= bet_amount
+                player_in_state['current_bet_in_round'] += bet_amount
+                player_in_state['has_acted_in_round'] = True
+                message = f"{player_in_state['name']} called ${bet_amount}."
+                success = True
+                logger.info(message)
         elif action_type == 'bet' or action_type == 'raise':
             if amount <= min_bet_to_call:
                 logger.warning(f"[_handle_player_action] Player {player_id} attempted to {action_type} with amount ${amount} which is not greater than min_bet_to_call ${min_bet_to_call}.")

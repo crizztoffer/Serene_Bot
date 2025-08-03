@@ -212,7 +212,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('dealer_button_position', 0)
                 game_state.setdefault('small_blind_amount', 5)
                 game_state.setdefault('big_blind_amount', 10)
-            
+                
                 # Fetch kekchipz for each player using guild_id instead of channel_id
                 # And refresh their display name and avatar from Discord
                 guild = self.bot.get_guild(int(guild_id)) if guild_id else None
@@ -292,7 +292,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     raise ValueError(f"Game room '{room_id}' not found for update, or update failed.")
                 else:
                     logger.info(f"[_save_game_state] Successfully updated {cursor.rowcount} row(s) for room_id: '{room_id}'.")
-            
+                
             await conn.commit() # Explicitly commit the transaction
         except Exception as e:
             logger.error(f"Error saving game state for room '{room_id}': {e}", exc_info=True)
@@ -620,40 +620,51 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         game_state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
         return game_state
 
-    # --- Helper for getting sorted players ---
+    # --- Helper for getting sorted players (MODIFIED) ---
     def _get_sorted_players(self, game_state: dict) -> list:
-        """Returns a list of players sorted by their seat_id."""
+        """
+        Returns a list of ALL seated players sorted by their seat_id.
+        This list is stable throughout a round and includes folded players
+        to prevent index-related bugs when players fold.
+        """
         players = game_state.get('players', [])
-        active_players = [p for p in players if p.get('seat_id') and not p.get('folded', False)]
-        logger.debug(f"[_get_sorted_players] Found {len(active_players)} active players.")
-        return sorted(active_players, key=lambda p: int(p['seat_id'].replace('seat_', '')))
+        # MODIFICATION: Removed 'and not p.get('folded', False)' to create a stable list.
+        # The turn-advancement logic will now be responsible for skipping folded players.
+        seated_players = [p for p in players if p.get('seat_id')]
+        logger.debug(f"[_get_sorted_players] Found {len(seated_players)} seated players (including folded).")
+        return sorted(seated_players, key=lambda p: int(p['seat_id'].replace('seat_', '')))
 
-    # --- Helper for getting next active player turn ---
+    # --- Helper for getting next active player turn (MODIFIED) ---
     def _get_next_active_player_index(self, game_state: dict, current_index: int) -> int:
         """
-        Finds the index of the next active player in the sorted list,
-        skipping folded players. Returns -1 if no active players.
+        Finds the index of the next active player in the stable sorted list,
+        skipping any players who have folded or are all-in. 
+        Returns -1 if no active players can be found.
         """
+        # This list now includes everyone at the table, providing stable indices.
         sorted_players = self._get_sorted_players(game_state)
-        if not sorted_players:
+        num_players = len(sorted_players)
+
+        if num_players == 0:
             logger.debug("[_get_next_active_player_index] No sorted players found.")
             return -1
 
-        num_players = len(sorted_players)
-        
-        # Determine the starting point for finding the next player
+        # Start searching from the player AFTER the one who just acted.
         start_search_index = (current_index + 1) % num_players if current_index != -1 else 0
         logger.debug(f"[_get_next_active_player_index] Starting search from index {start_search_index} for {num_players} players.")
 
+        # Loop up to num_players times to check every player once.
         for i in range(num_players):
-            idx = (start_search_index + i) % num_players
-            player = sorted_players[idx]
-            # Player is active if not folded and has not yet acted (or needs to match a new bet)
-            # The 'has_acted_in_round' needs to be carefully managed. For now, focus on folded.
-            if not player.get('folded', False):
-                logger.debug(f"[_get_next_active_player_index] Next active player found at index {idx}: {player['name']}.")
-                return idx
-        logger.debug("[_get_next_active_action_player_id] No active players found after full iteration.")
+            next_idx = (start_search_index + i) % num_players
+            player = sorted_players[next_idx]
+
+            # This check is now the single source of truth for skipping a turn.
+            # A player is skipped if they have folded or have no chips left to act (all-in).
+            if not player.get('folded', False) and player.get('total_chips', 0) > 0:
+                logger.debug(f"[_get_next_active_player_index] Next active player found at index {next_idx}: {player['name']}.")
+                return next_idx # We found the next active player. Return their stable index.
+
+        logger.debug("[_get_next_active_player_index] No active players found after full iteration.")
         return -1 # No active players found
 
     # --- Helper to start a player's turn ---
@@ -686,7 +697,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # --- Helper to apply blinds ---
     async def _apply_blinds(self, game_state: dict):
-        """Applics small and big blinds to players."""
+        """Applies small and big blinds to players."""
         sorted_players = self._get_sorted_players(game_state)
         num_players = len(sorted_players)
 
@@ -783,10 +794,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         else: # Flop, Turn, River betting rounds: Action starts with the first active player after the dealer button
             dealer_pos = game_state['dealer_button_position']
-            first_player_index = (dealer_pos + 1) % num_players
-            # Find the next *active* player after the dealer button
-            first_player_index = self._get_next_active_player_index(game_state, first_player_index - 1) 
-            logger.debug(f"[_start_betting_round] Non-pre_game round: first_player_index determined as {first_player_index}.")
+            # Find the next *active* player starting from the position after the dealer button
+            first_player_index = self._get_next_active_player_index(game_state, dealer_pos) 
+            logger.debug(f"[_start_betting_round] Non-pre_flop round: first_player_index determined as {first_player_index}.")
 
 
         if first_player_index != -1:
@@ -828,8 +838,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         And the action has returned to the player who made the last aggressive action,
         or there was no aggressive action and everyone has acted once.
         """
-        sorted_players = self._get_sorted_players(game_state)
-        active_players = [p for p in sorted_players if not p.get('folded', False)]
+        active_players = [p for p in game_state['players'] if not p.get('folded', False)]
         logger.debug(f"[_check_round_completion] Active players count: {len(active_players)}")
 
         if len(active_players) <= 1:
@@ -860,35 +869,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not all_settled:
             return False # Not all players have completed their action for this bet level
 
-        # Now, consider the turn cycle
-        current_player_index = game_state['current_player_turn_index']
-        current_player_id = sorted_players[current_player_index]['discord_id'] if current_player_index != -1 and current_player_index < len(sorted_players) else None
-        last_aggressive_action_player_id = game_state['last_aggressive_action_player_id']
+        # If we reach here, it means all active players have acted and have matching bets (or are all-in).
+        # Therefore, the round is complete.
+        logger.info(f"[_check_round_completion] Betting round complete: All active players have settled their bets.")
+        return True
 
-        logger.debug(f"[_check_round_completion] Current player ID: {current_player_id}, Last aggressive action player ID: {last_aggressive_action_player_id}")
-
-        # Case 1: No aggressive action (all checks/calls up to the initial big blind)
-        if last_aggressive_action_player_id is None:
-            # If everyone has settled, and there was no raise, the round is complete.
-            # This covers scenarios where everyone checks or everyone calls the big blind.
-            logger.info(f"[_check_round_completion] Betting round complete: No aggressive action, all settled.")
-            return True
-        
-        # Case 2: There was an aggressive action (bet or raise)
-        # The round is complete if all active players have settled, AND the action has returned
-        # to the player who made the last aggressive action (meaning everyone after them has responded).
-        if current_player_id == last_aggressive_action_player_id:
-            logger.info(f"[_check_round_completion] Betting round complete: Action returned to last aggressive player {current_player_id}.")
-            return True
-        
-        # Edge case: The last aggressive player folded after their action.
-        # If everyone else has settled, the round should also end.
-        last_aggressive_player_obj = next((p for p in game_state['players'] if p['discord_id'] == last_aggressive_action_player_id), None)
-        if last_aggressive_player_obj and last_aggressive_player_obj.get('folded', False):
-             logger.info(f"[_check_round_completion] Betting round complete: Last aggressive player {last_aggressive_action_player_id} folded.")
-             return True
-
-        return False
 
     async def _advance_game_phase(self, room_id: str, game_state: dict) -> dict:
         """Moves the game to the next phase (flop, turn, river, showdown)."""
@@ -943,7 +928,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info(f"[handle_websocket_game_action] Processing WebSocket action: {request_data.get('action')}") # Added this line to confirm entry
         action = request_data.get('action')
         room_id = request_data.get('room_id')
-        guild_id = request_data.get('guild_id')    
+        guild_id = request_data.get('guild_id')  
         sender_id = request_data.get('sender_id') # Assuming sender_id is always present in WS requests
         channel_id = request_data.get('channel_id') # Now making channel_id an optional parameter
 

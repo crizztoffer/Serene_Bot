@@ -779,18 +779,20 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             return game_state
 
         if game_state['current_round'] == 'pre_flop':
-            # Pre-flop: Action starts after big blind (i.e., player after big blind)
+            # Pre-flop: Action starts after big blind.
+            await self._apply_blinds(game_state) # Apply blinds first
+        
             dealer_pos = game_state['dealer_button_position']
+            
+            # In a normal game, the big blind is 2 positions after the dealer.
+            # We find this player's index to know where to start searching for the *next* active player.
             big_blind_pos_idx = (dealer_pos + 2) % num_players
-            first_player_index = (big_blind_pos_idx + 1) % num_players
+        
+            # Use the robust helper function to find the first *active* player to act.
+            # We pass the big blind's index so the search starts from the player right after them.
+            first_player_index = self._get_next_active_player_index(game_state, big_blind_pos_idx)
             
-            # Apply blinds (logic updated to handle single player gracefully)
-            await self._apply_blinds(game_state)
-            
-            # If only one player, that player is effectively the only one who can act.
-            if num_players == 1:
-                first_player_index = 0 
-                logger.debug("[_start_betting_round] Single player game: first_player_index set to 0.")
+            logger.debug(f"[_start_betting_round] Pre-flop round: first_player_index determined as {first_player_index}.")
 
         else: # Flop, Turn, River betting rounds: Action starts with the first active player after the dealer button
             dealer_pos = game_state['dealer_button_position']

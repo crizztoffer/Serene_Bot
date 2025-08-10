@@ -553,6 +553,21 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 await conn.commit()
                 logger.info("[evaluate_hands] Kekchipz updates successfully committed to the database.")
 
+                # --- FIX: UPDATE THE IN-MEMORY GAME STATE HERE ---
+                # After committing to the DB, update the local game_state so the
+                # frontend reflects the change immediately.
+                for player in game_state.get('players', []):
+                    if player['discord_id'] in winning_players:
+                        # Add the winnings to the player's chip count for this session.
+                        player['total_chips'] += winnings_per_player
+                        
+                        # Also update the overall balance if it exists in the state.
+                        if 'kekchipz_overall' in player:
+                            player['kekchipz_overall'] += winnings_per_player
+                        
+                        logger.info(f"[evaluate_hands] Updated in-memory game_state for winner {player['discord_id']} with +${winnings_per_player}.")
+                # --- END OF FIX ---
+
             except Exception as e:
                 logger.error(f"[evaluate_hands] Failed to update kekchipz for winners: {e}", exc_info=True)
                 if conn:

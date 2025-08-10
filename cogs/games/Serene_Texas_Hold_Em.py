@@ -184,7 +184,8 @@ class GameSetupView(View):
                 await interaction.followup.send("Failed to create the game room. Please try again.", ephemeral=True)
                 return
 
-            play_button_view = View()
+            # Set timeout=None to make the view persistent, so the button never expires.
+            play_button_view = View(timeout=None)
             play_button_view.add_item(PlayGameButton(room_id=room_id))
 
             await interaction.followup.send(
@@ -194,6 +195,7 @@ class GameSetupView(View):
 
 class PlayGameButton(Button):
     def __init__(self, room_id: str):
+        # The custom_id is necessary for persistent views to work correctly.
         super().__init__(label="Play Texas Hold 'Em Online", style=discord.ButtonStyle.primary, custom_id=f"play_game_{room_id}")
         self.room_id = room_id
 
@@ -239,6 +241,9 @@ class SereneTexasHoldEm(commands.Cog):
     @commands.command(name="texasholdem")
     async def texas_hold_em_command(self, ctx: commands.Context):
         """Starts a new Texas Hold 'Em game session."""
+        # Using ctx.interaction requires the command to be a slash command.
+        # Assuming this is a hybrid command or you're adapting. For prefix commands, 
+        # you might need to handle this differently, but let's assume interaction context is available.
         await start(ctx.interaction, self.bot)
 
 async def setup(bot):

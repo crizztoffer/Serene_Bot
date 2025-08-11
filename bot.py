@@ -420,102 +420,6 @@ async def websocket_handler(request):
              logger.warning(f"Game WebSocket client disconnected, room_id was unset, but found in ws_rooms. Cleaned up.")
         return ws
 
-async def chat_websocket_handler(request):
-    """
-    Handles WebSocket connections for chat rooms.
-    It registers a client to a chat room and broadcasts messages to all clients in that room.
-    """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-
-    room_id = None
-    display_name = "Anonymous"
-    
-    try:
-        # First message from the client should be a JSON object with room_id and display_name
-        first_msg = await ws.receive_str()
-        initial_data = json.loads(first_msg)
-        room_id = initial_data.get('room_id')
-        display_name = initial_data.get('displayName', 'Anonymous')
-
-        if not room_id:
-            logger.error(f"Chat WebSocket initial message missing room_id: {initial_data}")
-            await ws.send_json({'type': 'error', 'message': 'room_id is required.'})
-            return
-
-        # Register the WebSocket to the chat room
-        if room_id not in bot.chat_ws_rooms:
-            bot.chat_ws_rooms[room_id] = set()
-        bot.chat_ws_rooms[room_id].add(ws)
-        logger.info(f"Chat client '{display_name}' connected to room {room_id}. Total chat connections: {len(bot.chat_ws_rooms[room_id])}")
-
-        # Broadcast join message to the room
-        join_message = {'type': 'user_joined', 'displayName': display_name, 'timestamp': int(time.time())}
-        for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-            try:
-                await client_ws.send_json(join_message)
-            except ConnectionResetError:
-                logger.warning(f"Could not send join message to a client in room {room_id}. Connection was reset.")
-
-        # Listen for subsequent messages
-        async for msg in ws:
-            if msg.type == web.WSMsgType.TEXT:
-                try:
-                    data = json.loads(msg.data)
-                    message_text = data.get('message')
-                    if message_text:
-                        logger.info(f"Chat message from '{display_name}' in room {room_id}: {message_text}")
-                        # Broadcast the new message to all clients in the room
-                        chat_message = {
-                            'type': 'new_message', 
-                            'displayName': display_name, 
-                            'message': message_text,
-                            'timestamp': int(time.time())
-                        }
-                        for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-                            try:
-                                await client_ws.send_json(chat_message)
-                            except ConnectionResetError:
-                                logger.warning(f"Could not send chat message to a client in room {room_id}. Connection was reset.")
-
-                except json.JSONDecodeError:
-                    logger.error(f"Received malformed JSON from chat client in room {room_id}: {msg.data}")
-                except Exception as e:
-                    logger.error(f"Error processing chat message in room {room_id}: {e}", exc_info=True)
-            
-            elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Chat WebSocket error in room {room_id}: {ws.exception()}")
-            elif msg.type == web.WSMsgType.CLOSE:
-                logger.info(f"Chat WebSocket client '{display_name}' closed connection from room {room_id}.")
-                break
-
-    except asyncio.CancelledError:
-        logger.info(f"Chat WebSocket connection for '{display_name}' in room {room_id} cancelled.")
-    except Exception as e:
-        logger.error(f"Error in chat_websocket_handler for room {room_id}: {e}", exc_info=True)
-    finally:
-        # Unregister and notify others
-        if room_id and room_id in bot.chat_ws_rooms:
-            if ws in bot.chat_ws_rooms[room_id]:
-                bot.chat_ws_rooms[room_id].remove(ws)
-            
-            logger.info(f"Chat client '{display_name}' disconnected from room {room_id}. Remaining connections: {len(bot.chat_ws_rooms.get(room_id, set()))}")
-            
-            # Broadcast leave message
-            leave_message = {'type': 'user_left', 'displayName': display_name, 'timestamp': int(time.time())}
-            for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-                try:
-                    await client_ws.send_json(leave_message)
-                except ConnectionResetError:
-                    logger.warning(f"Could not send leave message to a client in room {room_id}. Connection was reset.")
-
-            if not bot.chat_ws_rooms[room_id]:
-                del bot.chat_ws_rooms[room_id]
-                logger.info(f"Chat room {room_id} is now empty and has been closed.")
-        
-        return ws
-
-
 async def start_web_server():
     """Starts the aiohttp web server, including WebSocket."""
     app = web.Application()
@@ -525,7 +429,15 @@ async def start_web_server():
 
     # --- Add WebSocket routes ---
     app.router.add_get('/ws', websocket_handler) # For game state
-    app.router.add_get('/chat_ws', chat_websocket_handler) # For chat
+    
+    # Get the communication cog and add its handler
+    communication_cog = bot.get_cog('CommunicationMain')
+    if communication_cog:
+        app.router.add_get('/chat_ws', communication_cog.handle_chat_websocket)
+        logger.info("Chat WebSocket route established.")
+    else:
+        logger.error("CommunicationMain cog not found. Chat WebSocket will not be available.")
+
 
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(app)
@@ -671,8 +583,7 @@ async def load_cogs():
         os.makedirs("cogs")
 
     # List of cogs to load in a specific order (dependencies first)
-    # This assumes mechanics_main.py is directly in the cogs/ directory
-    ordered_cogs = ["mechanics_main"]
+    ordered_cogs = ["mechanics_main", "communication_main"]
     loaded_cogs_set = set()
 
     # First, load explicitly ordered cogs
@@ -696,7 +607,7 @@ async def load_cogs():
     # Then, load remaining cogs (including those in subdirectories)
     for root, dirs, files in os.walk("cogs"):
         for filename in files:
-            if filename.endswith(".py") and filename != "__init__.py__":
+            if filename.endswith(".py") and filename != "__init__.py":
                 # Calculate the full module path
                 relative_path = os.path.relpath(os.path.join(root, filename), start="cogs")
                 full_module_name = f"cogs.{relative_path[:-3].replace(os.sep, '.')}"

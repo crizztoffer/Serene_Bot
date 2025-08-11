@@ -35,6 +35,10 @@ intents.members = True
 intents.presences = True
 
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
+# Create the web application instance and attach it to the bot instance.
+# This allows cogs to access it and add their own routes.
+bot.web_app = web.Application()
+
 
 # Add /serene group BEFORE cog loading
 serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
@@ -421,28 +425,17 @@ async def websocket_handler(request):
         return ws
 
 async def start_web_server():
-    """Starts the aiohttp web server, including WebSocket."""
-    app = web.Application()
-    # Add OPTIONS handler for CORS preflight
-    app.router.add_options('/settings_saved', cors_preflight_handler)
-    app.router.add_post('/settings_saved', settings_saved_handler)
-
-    # --- Add WebSocket routes ---
-    app.router.add_get('/ws', websocket_handler) # For game state
-    
-    # Get the communication cog and add its handler
-    communication_cog = bot.get_cog('CommunicationMain')
-    if communication_cog:
-        app.router.add_get('/chat_ws', communication_cog.handle_chat_websocket)
-        logger.info("Chat WebSocket route established.")
-    else:
-        logger.error("CommunicationMain cog not found. Chat WebSocket will not be available.")
-
+    """Starts the aiohttp web server."""
+    # Add routes defined in the main script to the bot's web_app instance.
+    # Cog-specific routes (like /chat_ws) are now added when the cogs are initialized.
+    bot.web_app.router.add_options('/settings_saved', cors_preflight_handler)
+    bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
+    bot.web_app.router.add_get('/ws', websocket_handler) # For game state
 
     port = int(os.getenv("PORT", 8080))
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(bot.web_app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', port) # Listen on all interfaces
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     logger.info(f"Web server started on http://0.0.0.0:{port}")
 

@@ -12,6 +12,14 @@ logger = logging.getLogger(__name__)
 class ChatMain(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # Add the WebSocket route directly to the bot's web app instance when the cog is initialized.
+        # This is more reliable than trying to add it from the main script.
+        if hasattr(self.bot, 'web_app'):
+            self.bot.web_app.router.add_get('/chat_ws', self.handle_chat_websocket)
+            logger.info("Chat WebSocket route '/chat_ws' established by ChatMain cog.")
+        else:
+            logger.error("Bot has no 'web_app' attribute. Cannot add chat WebSocket route.")
+
 
     async def handle_chat_websocket(self, request):
         """

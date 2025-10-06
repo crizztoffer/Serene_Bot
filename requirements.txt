@@ -1,8 +1,8 @@
 discord.py
 aiohttp
 aiomysql
-Pillow 
-requests 
-svglib 
+Pillow
+requests
+svglib<1.6
 reportlab
 python-dotenv

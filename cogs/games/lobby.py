@@ -5,6 +5,7 @@ from discord.ext import commands
 import os
 import logging
 import uuid
+import urllib.parse
 
 from discord.ui import View, Button
 
@@ -15,11 +16,19 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 
-def _get_lobby_link() -> str:
+def _get_lobby_link_with_params(interaction: discord.Interaction) -> str:
     """
-    Returns the main Serene Keks Games Lobby URL.
+    Build the lobby URL with the params required by the PHP page:
+    guild_id, channel_id, joiner_id, joiner_display_name.
     """
-    return os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
+    base_url = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
+    params = {
+        "guild_id": str(interaction.guild_id) if interaction.guild_id is not None else "",
+        "channel_id": str(interaction.channel_id) if interaction.channel_id is not None else "",
+        "joiner_id": str(interaction.user.id),
+        "joiner_display_name": interaction.user.display_name or "",
+    }
+    return f"{base_url}?{urllib.parse.urlencode(params)}"
 
 class PlayGameButton(Button):
     def __init__(self):
@@ -32,9 +41,9 @@ class PlayGameButton(Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        game_url = _get_lobby_link()
+        game_url = _get_lobby_link_with_params(interaction)
 
-        # Ephemeral view with link button only
+        # Ephemeral view with link button only (no description text)
         ephemeral_link_view = View()
         ephemeral_link_button = Button(
             label="Join Now",
@@ -43,19 +52,19 @@ class PlayGameButton(Button):
         )
         ephemeral_link_view.add_item(ephemeral_link_button)
 
-        # Send ephemeral link only — no extra text
         await interaction.followup.send(view=ephemeral_link_view, ephemeral=True)
 
 async def start(interaction: discord.Interaction, bot):
     """
-    Posts a single non-ephemeral button linking users to the lobby.
+    Posts a single non-ephemeral button in the channel.
+    Clicking it sends the user an ephemeral link button to the lobby (with required params).
     """
     await interaction.response.defer()
 
     play_button_view = View(timeout=None)
     play_button_view.add_item(PlayGameButton())
 
-    # Send button only — no text
+    # Send button only — no text/description
     await interaction.followup.send(view=play_button_view)
 
 class SereneTexasHoldEm(commands.Cog):
@@ -64,7 +73,7 @@ class SereneTexasHoldEm(commands.Cog):
 
     @commands.command(name="texasholdem")
     async def texas_hold_em_command(self, ctx: commands.Context):
-        """Posts a button that links to the Serene Keks Games Lobby."""
+        """Posts a button that links to the Serene Keks Games Lobby (with required params on click)."""
         if getattr(ctx, "interaction", None):
             await start(ctx.interaction, self.bot)
         else:

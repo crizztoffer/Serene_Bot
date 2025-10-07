@@ -1,4 +1,4 @@
-# cogs/games/Serene_Texas_Hold_Em.py
+# cogs/games/lobby.py
 
 import discord
 from discord.ext import commands

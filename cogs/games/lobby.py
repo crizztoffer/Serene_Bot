@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 
-from discord.ui import View, Button, Select
+from discord.ui import View, Button
 
 # Import the Deck class from mechanics_main.py
 from cogs.mechanics_main import Deck
@@ -28,9 +28,10 @@ handler.setFormatter(formatter)
 logger.addHandler(handler)
 
 
-async def _create_game_room(guild_id: str, channel_id: str, room_id: str, initiator_id: str, game_mode: str) -> tuple[str, str]:
+async def _create_game_room(guild_id: str, channel_id: str, room_id: str, initiator_id: str, game_mode: str | None = None) -> tuple[str | None, str | None]:
     """
     Creates a new game room entry in the database with the specified settings.
+    Note: game_mode remains as a nullable field for DB compatibility, but is no longer used.
     """
     DB_USER = os.getenv("DB_USER")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -60,6 +61,7 @@ async def _create_game_room(guild_id: str, channel_id: str, room_id: str, initia
             }
             initial_game_state_json = json.dumps(initial_game_state)
 
+            # Keep the game_mode column if it exists in your schema; pass None since stakes are no longer used.
             await cur.execute(
                 """
                 INSERT INTO bot_game_rooms 
@@ -78,9 +80,10 @@ async def _create_game_room(guild_id: str, channel_id: str, room_id: str, initia
         if conn:
             conn.close()
 
-async def _get_game_room_link(room_id: str, guild: discord.Guild, joiner_id: str, joiner_display_name: str) -> str:
+async def _get_game_room_link(room_id: str) -> str:
     """
-    Fetches room details and constructs a personalized game link for a joiner.
+    Returns the lobby URL for the given room_id.
+    Only passes room_id to the lobby (stakes and other settings are no longer sent).
     """
     DB_USER = os.getenv("DB_USER")
     DB_PASSWORD = os.getenv("DB_PASSWORD")
@@ -89,37 +92,22 @@ async def _get_game_room_link(room_id: str, guild: discord.Guild, joiner_id: str
 
     conn = None
     try:
+        # Optional: validate the room exists
         conn = await aiomysql.connect(
             host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
             db="serene_users", charset='utf8mb4', autocommit=True
         )
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT room_name, guild_id, channel_id, game_mode, initiator FROM bot_game_rooms WHERE room_id = %s", (room_id,))
+            await cur.execute(
+                "SELECT room_id FROM bot_game_rooms WHERE room_id = %s",
+                (room_id,)
+            )
             result = await cur.fetchone()
-
             if not result:
                 return "Error: Game room not found."
 
-            initiator_id = result['initiator']
-            initiator_display_name = "Unknown"
-            try:
-                initiator_member = await guild.fetch_member(int(initiator_id))
-                initiator_display_name = initiator_member.display_name
-            except Exception as e:
-                logger.warning(f"Could not fetch initiator member {initiator_id} from guild {guild.id}: {e}")
-
-            query_params = {
-                'room_id': room_id,
-                'room_name': result['room_name'],
-                'guild_id': result['guild_id'],
-                'channel_id': result['channel_id'],
-                'initiator_id': result['initiator'],
-                'initiator_display_name': initiator_display_name,
-                'joiner_id': str(joiner_id),
-                'joiner_display_name': joiner_display_name,
-                'game_mode': result['game_mode']
-            }
-            return f"{GAME_WEB_URL}?{urllib.parse.urlencode(query_params)}"
+        query_params = {'room_id': room_id}
+        return f"{GAME_WEB_URL}?{urllib.parse.urlencode(query_params)}"
 
     except Exception as e:
         logger.error(f"Database error in _get_game_room_link: {e}", exc_info=True)
@@ -128,70 +116,6 @@ async def _get_game_room_link(room_id: str, guild: discord.Guild, joiner_id: str
         if conn:
             conn.close()
 
-
-class GameSetupView(View):
-    def __init__(self, interaction: discord.Interaction):
-        super().__init__(timeout=180)
-        self.interaction = interaction
-        self.game_mode = None
-        
-        stakes_options = [
-            discord.SelectOption(label="Low Stakes ($5, $10, $25 chips)", value="1"),
-            discord.SelectOption(label="Medium Stakes ($10, $25, $100 chips)", value="2"),
-            discord.SelectOption(label="High Stakes ($25, $100, $250 chips)", value="3"),
-            discord.SelectOption(label="Nose-Bleed Stakes ($50, $250, $500 chips)", value="4"),
-        ]
-        self.add_item(self.StakesSelect(stakes_options))
-        self.add_item(self.CreateGameButton())
-
-    class StakesSelect(Select):
-        def __init__(self, options):
-            super().__init__(placeholder="Choose the stakes for the game...", min_values=1, max_values=1, options=options)
-        
-        async def callback(self, interaction: discord.Interaction):
-            self.view.game_mode = self.values[0]
-            
-            selected_option = discord.utils.get(self.options, value=self.values[0])
-            if selected_option:
-                self.placeholder = selected_option.label
-
-            for item in self.view.children:
-                if isinstance(item, Button) and item.label == "Create Game":
-                    item.disabled = False
-
-            await interaction.response.edit_message(view=self.view)
-
-    class CreateGameButton(Button):
-        def __init__(self):
-            super().__init__(label="Create Game", style=discord.ButtonStyle.success, disabled=True)
-
-        async def callback(self, interaction: discord.Interaction):
-            await interaction.response.defer()
-            
-            await self.view.interaction.delete_original_response()
-
-            game_session_room_id = str(uuid.uuid4())
-            
-            room_name, room_id = await _create_game_room(
-                guild_id=interaction.guild_id,
-                channel_id=interaction.channel_id,
-                room_id=game_session_room_id,
-                initiator_id=str(interaction.user.id),
-                game_mode=self.view.game_mode
-            )
-
-            if not room_name:
-                await interaction.followup.send("Failed to create the game room. Please try again.", ephemeral=True)
-                return
-
-            # Set timeout=None to make the view persistent, so the button never expires.
-            play_button_view = View(timeout=None)
-            play_button_view.add_item(PlayGameButton(room_id=room_id))
-
-            await interaction.followup.send(
-                f"A Texas Hold 'Em game session for '{room_name}' is ready! Click the button below to get your personalized game link.",
-                view=play_button_view
-            )
 
 class PlayGameButton(Button):
     def __init__(self, room_id: str):
@@ -202,12 +126,7 @@ class PlayGameButton(Button):
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
-        game_url = await _get_game_room_link(
-            room_id=self.room_id,
-            guild=interaction.guild,
-            joiner_id=interaction.user.id,
-            joiner_display_name=interaction.user.display_name
-        )
+        game_url = await _get_game_room_link(room_id=self.room_id)
 
         if "Error" in game_url:
             await interaction.followup.send(game_url, ephemeral=True)
@@ -225,13 +144,32 @@ class PlayGameButton(Button):
 
 async def start(interaction: discord.Interaction, bot):
     """
-    Sends an ephemeral message to the user to set up the game settings.
+    Immediately creates a game room and posts a normal (non-ephemeral) Play button in the channel.
+    Clicking that button sends the user an ephemeral link to the lobby.
     """
-    setup_view = GameSetupView(interaction)
-    await interaction.response.send_message(
-        "Please select the stakes for your Texas Hold 'Em game:",
-        view=setup_view,
-        ephemeral=True
+    await interaction.response.defer()  # in case setup takes a moment
+
+    game_session_room_id = str(uuid.uuid4())
+
+    room_name, room_id = await _create_game_room(
+        guild_id=interaction.guild_id,
+        channel_id=interaction.channel_id,
+        room_id=game_session_room_id,
+        initiator_id=str(interaction.user.id),
+        game_mode=None  # stakes removed
+    )
+
+    if not room_name:
+        await interaction.followup.send("Failed to create the game room. Please try again.", ephemeral=True)
+        return
+
+    # Persistent view so the button doesn't expire
+    play_button_view = View(timeout=None)
+    play_button_view.add_item(PlayGameButton(room_id=room_id))
+
+    await interaction.followup.send(
+        f"A Texas Hold 'Em game session for '{room_name}' is ready! Click the button below to get your personalized lobby link.",
+        view=play_button_view
     )
 
 class SereneTexasHoldEm(commands.Cog):
@@ -241,9 +179,8 @@ class SereneTexasHoldEm(commands.Cog):
     @commands.command(name="texasholdem")
     async def texas_hold_em_command(self, ctx: commands.Context):
         """Starts a new Texas Hold 'Em game session."""
-        # Using ctx.interaction requires the command to be a slash command.
-        # Assuming this is a hybrid command or you're adapting. For prefix commands, 
-        # you might need to handle this differently, but let's assume interaction context is available.
+        # If this command is not a slash/hybrid command, ctx.interaction may be None.
+        # Adjust as needed for your bot; this assumes an interaction context is available.
         await start(ctx.interaction, self.bot)
 
 async def setup(bot):

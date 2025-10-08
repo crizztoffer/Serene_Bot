@@ -7,14 +7,51 @@ import aiomysql
 
 logger = logging.getLogger(__name__)
 
+# ---------- Helpers: fetch latest reasons on demand ----------
+
+async def fetch_flag_reasons(db_user: str, db_password: str, db_host: str, guild_id: int | str = None) -> list[str]:
+    """
+    Always fetch the latest reasons from DB right before building the view.
+    If you later scope reasons per guild, add a WHERE clause with guild_id.
+    """
+    if not all([db_user, db_password, db_host]):
+        logger.error("Missing DB credentials; cannot fetch flag reasons.")
+        return []
+
+    reasons: list[str] = []
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            # If reasons are per guild, use:
+            # await cursor.execute("SELECT reason FROM rule_flagging WHERE guild_id = %s", (str(guild_id),))
+            await cursor.execute("SELECT reason FROM rule_flagging")
+            rows = await cursor.fetchall()
+            reasons = [row[0] for row in rows]
+    except Exception as e:
+        logger.error(f"Failed to fetch reasons: {e}", exc_info=True)
+    finally:
+        if conn:
+            conn.close()
+    return reasons
+
+# ---------- Components ----------
+
 class FlagReasonSelect(Select):
     def __init__(self, reasons: list[str], current_selection: str = None):
-        self.all_reasons = reasons # Store all reasons to re-create options if needed
+        self.all_reasons = reasons  # Store all reasons to re-create options if needed
         options = []
         for reason in reasons:
             option = discord.SelectOption(label=reason, value=reason)
             if reason == current_selection:
-                option.default = True # Mark this option as selected
+                option.default = True  # Mark this option as selected
             options.append(option)
 
         super().__init__(
@@ -30,49 +67,31 @@ class FlagReasonSelect(Select):
         # Re-create the select with the new default
         self.view.reason_select = FlagReasonSelect(self.all_reasons, self.view.selected_reason)
         # Remove and re-add the item to update its position in the view
-        self.view.remove_item(self) # Remove the old instance
-        self.view.add_item(self.view.reason_select) # Add the new instance at the same logical position
-
+        self.view.remove_item(self)
+        self.view.add_item(self.view.reason_select)
         # Enable confirm button if both reason and users are selected
         self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
         await interaction.response.edit_message(view=self.view)
 
-
 class FlagUserSelect(UserSelect):
     def __init__(self, current_selections: list[discord.User] = None):
-        # UserSelect handles defaults differently, you can't set `default=True` on options like Select
-        # The selected users are automatically managed by Discord if the view isn't recreated.
-        # However, since we are re-editing the message, we need to consider how to visually represent this.
-        # For UserSelect, the default behavior is often good enough if you're managing `selected_users`
-        # on the view. The issue is more pronounced with standard Select options.
         super().__init__(
             placeholder="Select user(s) to flag",
             min_values=1,
             max_values=5,
             custom_id="flag_users"
         )
-        # Store current selections if needed, though UserSelect often handles this visually on re-render
-        # if the interaction is with itself. The problem arises when a *different* component causes the re-render.
         self.current_selected_users = current_selections if current_selections is not None else []
-
 
     async def callback(self, interaction: discord.Interaction):
         self.view.selected_users = self.values
-        # For UserSelect, Discord typically handles the display of selected users internally
-        # when the message is edited with the same view instance.
-        # However, if you need to "force" the re-selection visual when *another* component
-        # triggers the edit, you'd need to recreate the UserSelect instance similarly to FlagReasonSelect
-        # For simplicity, let's just make sure the confirm button is updated.
-
-        # Re-create the select with the new default users (this is more for visual consistency)
+        # Re-create the select to keep visual consistency
         self.view.user_select = FlagUserSelect(self.view.selected_users)
         self.view.remove_item(self)
         self.view.add_item(self.view.user_select)
-
         # Enable confirm button if both reason and users are selected
         self.view.confirm_button.disabled = not (self.view.selected_reason and self.view.selected_users)
         await interaction.response.edit_message(view=self.view)
-
 
 class FlagConfirmButton(Button):
     def __init__(self):
@@ -209,16 +228,14 @@ class FlagCancelButton(Button):
             embed=None
         )
 
-
 class FlagView(View):
     def __init__(self, reasons: list[str]):
         super().__init__(timeout=300)
         self.selected_reason = None
         self.selected_users = None
 
-        # Pass initial selected_reason and selected_users to the select constructors
         self.reason_select = FlagReasonSelect(reasons, self.selected_reason)
-        self.user_select = FlagUserSelect(self.selected_users) # Pass initial empty list for users
+        self.user_select = FlagUserSelect(self.selected_users)  # Pass initial empty list for users
 
         self.confirm_button = FlagConfirmButton()
         self.cancel_button = FlagCancelButton()
@@ -228,16 +245,31 @@ class FlagView(View):
         self.add_item(self.confirm_button)
         self.add_item(self.cancel_button)
 
+# ---------- Entry point that builds the view with fresh reasons ----------
 
 async def start(serene_group, bot, interaction: discord.Interaction):
-    reasons = getattr(bot, "flag_reasons", [])
+    """
+    Called when the admin opens the flag UI.
+    We fetch the latest reasons at this moment so dropdowns are never stale.
+    """
+    db_user = getattr(bot, "db_user", None)
+    db_password = getattr(bot, "db_password", None)
+    db_host = getattr(bot, "db_host", None)
+
+    reasons = await fetch_flag_reasons(db_user, db_password, db_host, interaction.guild_id)
     if not reasons:
         await interaction.response.send_message("❌ No flag reasons configured.", ephemeral=True)
         return
 
     embed = discord.Embed(
         title="🚩 Flag Users",
-        description="Serene Bot will handle the hassle of administering disciplinary actions towards a user or group of users. It does this **__by checking each discord user's flag status for the given reason__** you specify below, and **__if a flag for it already exists, Serene Bot automatically administers the first strike__**. If a strike or strikes have already been administered, **__Serene Bot will automatically increase the number of strikes__** until the third. **__After the third strike, the user(s) will be banned from the server__**.",
+        description=(
+            "Serene Bot will handle the hassle of administering disciplinary actions towards a user or group of users. "
+            "It does this **__by checking each discord user's flag status for the given reason__** you specify below, "
+            "and **__if a flag for it already exists, Serene Bot automatically administers the first strike__**. "
+            "If a strike or strikes have already been administered, **__Serene Bot will automatically increase the number of strikes__** "
+            "until the third. **__After the third strike, the user(s) will be banned from the server__**."
+        ),
         color=discord.Color.orange()
     )
     embed.set_footer(text="Admins only — all actions are logged.")

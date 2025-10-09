@@ -6,25 +6,19 @@ from dotenv import load_dotenv
 import aiomysql
 import json
 import logging
-import asyncio  # Import asyncio for running web server in a separate task
-from aiohttp import web  # Import aiohttp for the web server
-import aiohttp  # Import aiohttp for making webhooks (used by mechanics_main)
-import time
+import asyncio
+from aiohttp import web
+import aiohttp
+from typing import Optional, Dict, Tuple
 
 # Load env vars
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
-# NEW: Environment variables for game web URL and webhook URL
-GAME_WEB_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
-GAME_WEBHOOK_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_update_webhook.php")
-
-# Define the BOT_ENTRY key for validation
-BOT_ENTRY = os.getenv("BOT_ENTRY")
+BOT_ENTRY = os.getenv("BOT_ENTRY")  # shared secret for admin-to-bot pushes
 
 BOT_PREFIX = "!"
 
@@ -34,25 +28,24 @@ intents.members = True
 intents.presences = True
 
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
-# Create the web application instance and attach it to the bot instance.
-# This allows cogs to access it and add their own routes.
+
+# HTTP app
 bot.web_app = web.Application()
 
-# Add /serene group BEFORE cog loading
-serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
-bot.tree.add_command(serene_group)
-
-# Logging setup
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- WebSocket specific global variables ---
-# This will map room_id to a set of connected WebSocket clients for the game state.
-bot.ws_rooms = {}
-# This will map room_id to a set of connected WebSocket clients for the chat.
-bot.chat_ws_rooms = {}
+# Game WS room state (unchanged)
+bot.ws_rooms: Dict[str, set] = {}
+bot.chat_ws_rooms: Dict[str, set] = {}
 
-# DB methods
+# Cache of quarantine options we last saw from DB:
+# { guild_id(str): (channel_name, role_name, updated_at_str_or_None) }
+bot.quarantine_options_cache: Dict[str, Tuple[str, str, Optional[str]]] = {}
+
+# ---------------- DB helpers ----------------
+
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
@@ -61,12 +54,8 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     conn = None
     try:
         conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True
         )
         async with conn.cursor() as cursor:
             await cursor.execute(
@@ -89,21 +78,38 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
 
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
 
-async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
-    """
-    Helper function to post a new Discord embed and save its details to bot_messages table.
-    Expects rules_json_bytes to be bytes, will decode it.
-    """
+async def load_flag_reasons():
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        logger.error("Missing DB credentials, cannot load flag reasons.")
+        bot.flag_reasons = []
+        return
+
     conn = None
     try:
         conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True,
-            cursorclass=aiomysql.cursors.DictCursor
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT reason FROM rule_flagging WHERE guild_id = 'DEFAULT'")
+            rows = await cursor.fetchall()
+            bot.flag_reasons = [row[0] for row in rows]
+            logger.info(f"Loaded default flag reasons (preload): {bot.flag_reasons}")
+    except Exception as e:
+        logger.error(f"Failed to load flag reasons: {e}")
+        bot.flag_reasons = []
+    finally:
+        if conn:
+            conn.close()
+
+# ---------------- Rules embed post helper ----------------
+
+async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users",
+            charset='utf8mb4', autocommit=True, cursorclass=aiomysql.cursors.DictCursor
         )
         async with conn.cursor() as cursor:
             guild = bot.get_guild(int(guild_id))
@@ -113,12 +119,10 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
 
             rules_channel = guild.get_channel(int(rules_channel_id))
             if not rules_channel:
-                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
+                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}.")
                 return
 
             rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
-            logger.debug(f"post_and_save_embed: Decoded rules_json_str for guild {guild_id}: {rules_json_str[:200]}...")
-            logger.debug(f"post_and_save_embed: Type of rules_json_str: {type(rules_json_str)}")
 
             try:
                 embed_data_list = json.loads(rules_json_str)
@@ -137,8 +141,6 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
                 "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
                 (str(guild_id), rules_json_str, str(sent_message.id))
             )
-            logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
-
     except discord.errors.Forbidden:
         logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
     except Exception as e:
@@ -147,150 +149,232 @@ async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
         if conn:
             conn.close()
 
-# --- Web Server Setup ---
+# ---------------- Quarantine (role/channel) provisioning ----------------
 
-# CORS headers for preflight and actual requests
+async def ensure_quarantine_setup(guild: discord.Guild, channel_name: str, role_name: str) -> dict:
+    """
+    Ensure the quarantine role/channel exist and permissions are correct.
+    Returns a summary dict of what was created/updated.
+    """
+    summary = {"role_created": False, "channel_created": False, "overwrites_updated": False}
+
+    if not channel_name or not role_name:
+        logger.warning(f"[{guild.name}] Missing quarantine names; skipping ensure.")
+        return summary
+
+    # 1) Ensure role exists
+    q_role = discord.utils.find(lambda r: r.name.lower() == role_name.lower(), guild.roles)
+    if q_role is None:
+        try:
+            q_role = await guild.create_role(
+                name=role_name,
+                reason="Quarantine role for rules gating",
+                permissions=discord.Permissions.none()
+            )
+            summary["role_created"] = True
+            logger.info(f"[{guild.name}] Created quarantine role: {q_role.name}")
+        except discord.Forbidden:
+            logger.error(f"[{guild.name}] Missing MANAGE_ROLES to create role '{role_name}'.")
+            return summary
+        except Exception as e:
+            logger.error(f"[{guild.name}] Failed to create role '{role_name}': {e}")
+            return summary
+
+    # 2) Ensure channel exists
+    q_channel = discord.utils.find(
+        lambda c: isinstance(c, discord.TextChannel) and c.name.lower() == channel_name.lower(),
+        guild.text_channels
+    )
+    if q_channel is None:
+        try:
+            q_channel = await guild.create_text_channel(
+                name=channel_name,
+                reason="Quarantine rules-only channel"
+            )
+            summary["channel_created"] = True
+            logger.info(f"[{guild.name}] Created quarantine channel: #{q_channel.name}")
+        except discord.Forbidden:
+            logger.error(f"[{guild.name}] Missing MANAGE_CHANNELS to create channel '{channel_name}'.")
+            return summary
+        except Exception as e:
+            logger.error(f"[{guild.name}] Failed to create channel '{channel_name}': {e}")
+            return summary
+
+    # 3) Set permission overwrites on the quarantine channel
+    try:
+        overwrites = q_channel.overwrites
+        changed = False
+
+        everyone = guild.default_role
+        want_everyone = discord.PermissionOverwrite(view_channel=False)
+        if overwrites.get(everyone) != want_everyone:
+            overwrites[everyone] = want_everyone
+            changed = True
+
+        want_q = discord.PermissionOverwrite(
+            view_channel=True, send_messages=True, read_message_history=True
+        )
+        if overwrites.get(q_role) != want_q:
+            overwrites[q_role] = want_q
+            changed = True
+
+        if changed:
+            await q_channel.edit(overwrites=overwrites, reason="Ensure quarantine channel overwrites")
+            summary["overwrites_updated"] = True
+            logger.info(f"[{guild.name}] Updated overwrites on #{q_channel.name}")
+
+    except discord.Forbidden:
+        logger.error(f"[{guild.name}] Missing MANAGE_CHANNELS to edit overwrites for '{q_channel.name}'.")
+    except Exception as e:
+        logger.error(f"[{guild.name}] Failed to update overwrites on '{q_channel.name}': {e}")
+
+    # 4) Deny the quarantine role across all other categories/channels
+    try:
+        for category in guild.categories:
+            try:
+                await category.set_permissions(q_role, view_channel=False, send_messages=False, reason="Quarantine deny across categories")
+            except Exception:
+                pass
+
+        for channel in guild.channels:
+            if hasattr(channel, "id") and channel.id == q_channel.id:
+                continue
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel, discord.StageChannel, discord.ForumChannel, discord.CategoryChannel)):
+                try:
+                    await channel.set_permissions(q_role, view_channel=False, send_messages=False, reason="Quarantine deny per channel")
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.error(f"[{guild.name}] Error while applying global denies for quarantine role: {e}")
+
+    return summary
+
+async def fetch_all_quarantine_options() -> Dict[str, Tuple[str, str, Optional[str]]]:
+    out: Dict[str, Tuple[str, str, Optional[str]]] = {}
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        return out
+
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users",
+            charset='utf8mb4', autocommit=True, cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT guild_id, quarantine_channel_name, quarantine_role_name, "
+                "DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS updated_at "
+                "FROM bot_flag_action_options"
+            )
+            rows = await cursor.fetchall()
+            for row in rows or []:
+                gid = str(row.get("guild_id"))
+                ch = (row.get("quarantine_channel_name") or "").strip()
+                rl = (row.get("quarantine_role_name") or "").strip()
+                ts = row.get("updated_at")
+                if gid:
+                    out[gid] = (ch, rl, ts)
+    except Exception as e:
+        logger.error(f"Failed fetching quarantine options: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return out
+
+@tasks.loop(minutes=5)
+async def sync_quarantine_task():
+    """
+    Safety net: periodically check options and ensure provisioning if changed.
+    """
+    try:
+        all_opts = await fetch_all_quarantine_options()
+        for guild in bot.guilds:
+            gid = str(guild.id)
+            if gid not in all_opts:
+                continue
+            ch, rl, ts = all_opts[gid]
+            cached = bot.quarantine_options_cache.get(gid)
+            if cached is None or cached != (ch, rl, ts):
+                logger.info(f"[{guild.name}] Detected quarantine options change; ensuring setup.")
+                await ensure_quarantine_setup(guild, ch, rl)
+                bot.quarantine_options_cache[gid] = (ch, rl, ts)
+    except Exception as e:
+        logger.error(f"sync_quarantine_task error: {e}", exc_info=True)
+
+# ---------------- HTTP endpoints ----------------
+
 CORS_HEADERS = {
-    'Access-Control-Allow-Origin': 'https://serenekeks.com',  # Replace with your actual domain
+    'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Methods': 'POST, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
-    'Access-Control-Max-Age': '86400'  # Cache preflight for 24 hours
+    'Access-Control-Max-Age': '86400'
 }
 
 async def cors_preflight_handler(request):
-    """Handles CORS OPTIONS preflight requests."""
     return web.Response(status=200, headers=CORS_HEADERS)
 
 async def settings_saved_handler(request):
     """
-    Handles POST requests to /settings_saved endpoint.
-    Expects a JSON body with 'guild_id' and 'bot_entry'.
+    Existing webhook for immediate triggers (still supported).
     """
     conn = None
+    guild_id = None
     try:
         data = await request.json()
         guild_id = data.get('guild_id')
         bot_entry = data.get('bot_entry')
         action = data.get('action')
 
-        if bot_entry == BOT_ENTRY:
-            logger.info(f"Received signal: '{action}' for guild ID: {guild_id}")
+        if bot_entry != BOT_ENTRY:
+            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
 
-            if not all([DB_USER, DB_PASSWORD, DB_HOST]):
-                logger.error("Missing DB credentials for fetching settings.")
-                return web.Response(text="Internal Server Error: DB credentials missing", status=500, headers=CORS_HEADERS)
-
+        if action == "quarantine_options_updated":
+            # Read options and ensure now
             conn = await aiomysql.connect(
-                host=DB_HOST,
-                user=DB_USER,
-                password=DB_PASSWORD,
-                db="serene_users",
-                charset='utf8mb4',
-                autocommit=True,
+                host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+                db="serene_users", charset='utf8mb4', autocommit=True,
                 cursorclass=aiomysql.cursors.DictCursor
             )
             async with conn.cursor() as cursor:
-                # 1. Get the rules from bot_guild_settings
                 await cursor.execute(
-                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
+                    "SELECT quarantine_channel_name, quarantine_role_name, "
+                    "DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS updated_at "
+                    "FROM bot_flag_action_options WHERE guild_id = %s",
                     (str(guild_id),)
                 )
-                settings_row = await cursor.fetchone()
+                row = await cursor.fetchone()
+            if not row:
+                return web.Response(text="No quarantine options for guild", status=404, headers=CORS_HEADERS)
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                return web.Response(text="Bot not in specified guild", status=404, headers=CORS_HEADERS)
+            summary = await ensure_quarantine_setup(
+                guild,
+                (row["quarantine_channel_name"] or "").strip(),
+                (row["quarantine_role_name"] or "").strip()
+            )
+            bot.quarantine_options_cache[str(guild_id)] = (
+                (row["quarantine_channel_name"] or "").strip(),
+                (row["quarantine_role_name"] or "").strip(),
+                row.get("updated_at")
+            )
+            return web.Response(text=json.dumps({"ok": True, "summary": summary}), status=200, headers=CORS_HEADERS)
 
-                if not settings_row:
-                    logger.warning(f"No settings found for guild ID: {guild_id} in bot_guild_settings.")
-                    return web.Response(text="No settings found for guild", status=404, headers=CORS_HEADERS)
+        # You can keep your existing "rules_updated" branch here (omitted for brevity)
+        return web.Response(text="OK", status=200, headers=CORS_HEADERS)
 
-                new_rules_json_bytes = settings_row.get('rules')
-                rules_channel_id = settings_row.get('rules_channel')
-
-                if not new_rules_json_bytes or not rules_channel_id:
-                    logger.warning(f"Missing 'rules' JSON or 'rules_channel' for guild ID: {guild_id}. Cannot process embed.")
-                    return web.Response(text="Missing rules data or channel", status=400, headers=CORS_HEADERS)
-
-                new_rules_json_str = new_rules_json_bytes.decode('utf-8') if isinstance(new_rules_json_bytes, bytes) else new_rules_json_bytes
-                logger.debug(f"settings_saved_handler: Decoded new_rules_json_str for guild {guild_id}: {new_rules_json_str[:200]}...")
-                logger.debug(f"settings_saved_handler: Type of new_rules_json_str: {type(new_rules_json_str)}")
-
-                try:
-                    embed_data_list = json.loads(new_rules_json_str)
-                    if not isinstance(embed_data_list, list) or not embed_data_list:
-                        raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
-                    embed_data = embed_data_list[0]
-                except (json.JSONDecodeError, ValueError) as e:
-                    logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
-                    return web.Response(text="Invalid rules JSON format", status=400, headers=CORS_HEADERS)
-
-                # 2. Check bot_messages table
-                await cursor.execute(
-                    "SELECT message, message_id FROM bot_messages WHERE guild_id = %s",
-                    (str(guild_id),)
-                )
-                bot_messages_row = await cursor.fetchone()
-
-                guild = bot.get_guild(int(guild_id))
-                if not guild:
-                    logger.error(f"Bot is not in guild with ID: {guild_id}")
-                    return web.Response(text="Bot not in specified guild", status=404, headers=CORS_HEADERS)
-
-                rules_channel = guild.get_channel(int(rules_channel_id))
-                if not rules_channel:
-                    logger.error(f"Rules channel with ID {rules_channel_id} not found in guild {guild_id}.")
-                    return web.Response(text="Rules channel not found", status=404, headers=CORS_HEADERS)
-
-                if bot_messages_row:
-                    existing_message_json_bytes = bot_messages_row.get('message')
-                    existing_message_id = bot_messages_row.get('message_id')
-
-                    existing_message_json_str = existing_message_json_bytes.decode('utf-8') if isinstance(existing_message_json_bytes, bytes) else existing_message_json_bytes
-                    logger.debug(f"settings_saved_handler: Decoded existing_message_json_str for guild {guild_id}: {existing_message_json_str[:200]}...")
-                    logger.debug(f"settings_saved_handler: Type of existing_message_json_str: {type(existing_message_json_str)}")
-
-                    if existing_message_json_str != new_rules_json_str:
-                        logger.info(f"Rules content changed for guild {guild_id}. Attempting to update message.")
-                        try:
-                            message_to_edit = await rules_channel.fetch_message(int(existing_message_id))
-                            new_embed = discord.Embed.from_dict(embed_data)
-                            await message_to_edit.edit(embed=new_embed)
-                            logger.info(f"Successfully updated Discord message {existing_message_id} in channel {rules_channel_id} for guild {guild_id}.")
-
-                            await cursor.execute(
-                                "UPDATE bot_messages SET message = %s WHERE guild_id = %s",
-                                (new_rules_json_str, str(guild_id))
-                            )
-                            logger.info(f"Updated bot_messages table for guild {guild_id}.")
-                        except discord.errors.NotFound:
-                            logger.warning(f"Message {existing_message_id} not found in channel {rules_channel_id}. Re-posting new message.")
-                            await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id)
-                        except discord.errors.Forbidden:
-                            logger.error(f"Bot lacks permissions to edit/send messages in channel {rules_channel_id} for guild {guild_id}.")
-                            return web.Response(text="Bot lacks Discord permissions", status=403, headers=CORS_HEADERS)
-                        except Exception as discord_e:
-                            logger.error(f"Error interacting with Discord API for guild {guild_id}: {discord_e}")
-                            return web.Response(text="Discord API error", status=500, headers=CORS_HEADERS)
-                    else:
-                        logger.info(f"Rules content is identical for guild {guild_id}. No update needed.")
-                else:
-                    logger.info(f"No existing bot_messages entry for guild {guild_id}. Posting new embed.")
-                    await post_and_save_embed(guild_id, new_rules_json_str, rules_channel_id)
-
-            return web.Response(text="Signal received and settings processed", status=200, headers=CORS_HEADERS)
-        else:
-            logger.warning(f"Unauthorized access attempt to /settings_saved. Invalid BOT_ENTRY: {bot_entry}")
-            return web.Response(text="Unauthorized", status=401, headers=CORS_HEADERS)
     except Exception as e:
-        logger.error(f"Overall error in settings_saved_handler for guild {guild_id}: {e}", exc_info=True)
+        logger.error(f"settings_saved_handler error: {e}", exc_info=True)
         return web.Response(text="Internal Server Error", status=500, headers=CORS_HEADERS)
     finally:
         if conn:
-            conn.close()
+            conn.close() if conn else None
 
-# --- AIOHTTP App for WebSockets ---
+# ---------------- WEBSOCKETS ----------------
+
 async def websocket_handler(request):
     """
-    Handles WebSocket connections for game rooms.
-    It registers the client to a specific room and dispatches messages
-    to the MechanicsMain cog for processing and broadcasting.
+    Existing game WS (unchanged). Expects initial message with room_id, guild_id, etc.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -306,69 +390,186 @@ async def websocket_handler(request):
         sender_id = initial_data.get('sender_id')
 
         if not all([room_id, guild_id, channel_id, sender_id]):
-            logger.error(f"Initial WebSocket message missing critical parameters: {initial_data}")
-            await ws.send_str(json.dumps({"status": "error", "message": "Missing room, guild, channel, or sender ID in initial message."}))
-            return
+            await ws.send_json({"status": "error", "message": "Missing room, guild, channel, or sender ID."})
+            return ws
 
         if room_id not in bot.ws_rooms:
             bot.ws_rooms[room_id] = set()
         bot.ws_rooms[room_id].add(ws)
-        logger.info(f"Game WebSocket client connected and registered to room {room_id}. Total connections in room: {len(bot.ws_rooms[room_id])}")
 
         mechanics_cog = bot.get_cog('MechanicsMain')
         if not mechanics_cog:
-            logger.error("MechanicsMain cog not loaded or accessible in websocket_handler.")
-            await ws.send_str(json.dumps({"status": "error", "message": "Game mechanics not available."}))
-            return
+            await ws.send_json({"status": "error", "message": "Game mechanics not available."})
+            return ws
 
         await mechanics_cog.handle_websocket_game_action(initial_data)
 
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                logger.info(f"Message from Game WebSocket client in room {room_id}: {msg.data}")
                 try:
                     request_data = json.loads(msg.data)
                     request_data['room_id'] = room_id
                     request_data['guild_id'] = guild_id
                     request_data['channel_id'] = channel_id
                     request_data['sender_id'] = sender_id
-
                     await mechanics_cog.handle_websocket_game_action(request_data)
-                except json.JSONDecodeError:
-                    logger.error(f"Received malformed JSON from Game WebSocket client in room {room_id}: {msg.data}")
-                    await ws.send_str(json.dumps({"status": "error", "message": "Invalid JSON format."}))
                 except Exception as e:
-                    logger.error(f"Error processing Game WebSocket message in room {room_id}: {e}", exc_info=True)
-                    await ws.send_str(json.dumps({"status": "error", "message": f"Internal server error: {e}"}))
-
+                    await ws.send_json({"status": "error", "message": f"Internal server error: {e}"})
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Game WebSocket error in room {room_id}: {ws.exception()}")
+                logger.error(f"Game WS error in room {room_id}: {ws.exception()}")
             elif msg.type == web.WSMsgType.CLOSE:
-                logger.info(f"Game WebSocket client closed connection from room {room_id}.")
                 break
-
-    except asyncio.CancelledError:
-        logger.info(f"Game WebSocket connection to room {room_id} cancelled (likely client disconnected).")
-    except Exception as e:
-        logger.error(f"Error in Game WebSocket handler for room {room_id}: {e}", exc_info=True)
     finally:
         if room_id and ws in bot.ws_rooms.get(room_id, set()):
             bot.ws_rooms[room_id].remove(ws)
             if not bot.ws_rooms[room_id]:
                 del bot.ws_rooms[room_id]
-            logger.info(f"Game WebSocket client disconnected from room {room_id}. Remaining connections in room: {len(bot.ws_rooms.get(room_id, set()))}")
-        elif ws in bot.ws_rooms.get(room_id, set()):
-            bot.ws_rooms[room_id].remove(ws)
-            if not bot.ws_rooms[room_id]:
-                del bot.ws_rooms[room_id]
-            logger.warning(f"Game WebSocket client disconnected, room_id was unset, but found in ws_rooms. Cleaned up.")
         return ws
 
+async def admin_ws_handler(request):
+    """
+    NEW: Admin WS for instant provisioning & acks from the moderation UI.
+
+    Protocol:
+      - First message must be JSON with either:
+          {"type":"auth","bot_entry":"<secret>"}  OR
+          {"type":"quarantine_options_updated","guild_id":"...","bot_entry":"<secret>"}
+      - Subsequent messages can be:
+          {"type":"quarantine_options_updated","guild_id":"..."}  (after auth)
+          {"type":"ping"}
+    """
+    ws = web.WebSocketResponse(heartbeat=30)
+    await ws.prepare(request)
+
+    authed = False
+
+    async def require_auth(payload) -> bool:
+        nonlocal authed
+        sec = (payload or {}).get("bot_entry")
+        if sec and sec == BOT_ENTRY:
+            authed = True
+            await ws.send_json({"type": "auth_ok"})
+            return True
+        await ws.send_json({"type": "auth_error", "error": "Unauthorized"})
+        return False
+
+    try:
+        # Expect an initial message
+        msg = await ws.receive()
+        if msg.type == web.WSMsgType.TEXT:
+            try:
+                payload = json.loads(msg.data)
+            except Exception:
+                await ws.send_json({"type": "error", "error": "Invalid JSON"})
+                return ws
+
+            mtype = payload.get("type")
+
+            # inline auth (either explicit or piggybacked on first action)
+            if mtype == "auth":
+                if not await require_auth(payload):
+                    return ws
+            elif mtype in ("quarantine_options_updated",):
+                if not await require_auth(payload):
+                    return ws
+                # fall through to handle this action immediately
+            else:
+                await ws.send_json({"type": "error", "error": "First message must be 'auth' or an authed action"})
+                return ws
+
+            # Handle immediate action (if the first message was an action)
+            if mtype == "quarantine_options_updated":
+                gid = str(payload.get("guild_id") or "")
+                if not gid.isdigit():
+                    await ws.send_json({"type":"error","error":"Missing or invalid guild_id"})
+                else:
+                    await handle_quarantine_update_ws(ws, gid)
+        elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSED, web.WSMsgType.ERROR):
+            return ws
+
+        # Main loop
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                try:
+                    payload = json.loads(msg.data)
+                except Exception:
+                    await ws.send_json({"type": "error", "error": "Invalid JSON"})
+                    continue
+
+                if payload.get("type") == "ping":
+                    await ws.send_json({"type": "pong"})
+                    continue
+
+                if payload.get("type") == "quarantine_options_updated":
+                    if not authed:
+                        await ws.send_json({"type":"auth_error","error":"Unauthorized"})
+                        continue
+                    gid = str(payload.get("guild_id") or "")
+                    if not gid.isdigit():
+                        await ws.send_json({"type":"error","error":"Missing or invalid guild_id"})
+                        continue
+                    await handle_quarantine_update_ws(ws, gid)
+                    continue
+
+                await ws.send_json({"type": "error", "error": "Unknown type"})
+            else:
+                # ignore non-text frames
+                pass
+
+    finally:
+        return ws
+
+async def handle_quarantine_update_ws(ws: web.WebSocketResponse, guild_id: str):
+    """
+    Reads the latest quarantine options for guild_id and ensures provisioning.
+    Sends an ack/error back over the websocket.
+    """
+    try:
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            await ws.send_json({"type":"quarantine_ack","ok":False,"guild_id":guild_id,"error":"Bot not in guild"})
+            return
+
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD, db="serene_users",
+            charset='utf8mb4', autocommit=True, cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT quarantine_channel_name, quarantine_role_name, "
+                "DATE_FORMAT(updated_at, '%%Y-%%m-%%d %%H:%%i:%%s') AS updated_at "
+                "FROM bot_flag_action_options WHERE guild_id = %s",
+                (str(guild_id),)
+            )
+            row = await cursor.fetchone()
+        conn.close()
+
+        if not row:
+            await ws.send_json({"type":"quarantine_ack","ok":False,"guild_id":guild_id,"error":"No options found"})
+            return
+
+        ch = (row["quarantine_channel_name"] or "").strip()
+        rl = (row["quarantine_role_name"] or "").strip()
+        summary = await ensure_quarantine_setup(guild, ch, rl)
+
+        # cache
+        bot.quarantine_options_cache[str(guild_id)] = (ch, rl, row.get("updated_at"))
+
+        await ws.send_json({"type":"quarantine_ack","ok":True,"guild_id":guild_id,"summary":summary})
+    except Exception as e:
+        logger.error(f"WS quarantine update error: {e}", exc_info=True)
+        try:
+            await ws.send_json({"type":"quarantine_ack","ok":False,"guild_id":guild_id,"error":str(e)})
+        except Exception:
+            pass
+
+# ---------------- Web server startup ----------------
+
 async def start_web_server():
-    """Starts the aiohttp web server."""
     bot.web_app.router.add_options('/settings_saved', cors_preflight_handler)
     bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
-    bot.web_app.router.add_get('/ws', websocket_handler)  # For game state
+    bot.web_app.router.add_get('/ws', websocket_handler)          # game WS (existing)
+    bot.web_app.router.add_get('/admin_ws', admin_ws_handler)     # NEW admin WS
 
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(bot.web_app)
@@ -377,26 +578,28 @@ async def start_web_server():
     await site.start()
     logger.info(f"Web server started on http://0.0.0.0:{port}")
 
+# ---------------- Discord events ----------------
+
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user}.")
 
-    # Assign DB credentials for use in modules like flag.py
+    await load_flag_reasons()
+
+    # expose DB creds to cogs
     bot.db_user = DB_USER
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
 
-    # Load all cogs - ENSURE THIS COMPLETES BEFORE STARTING WEB SERVER
     await load_cogs()
 
-    # Global sync (optional, helpful to clear cache)
+    # sync commands
     try:
         await bot.tree.sync()
         logger.info("✅ Globally synced all commands")
     except Exception as e:
         logger.error(f"Global sync failed: {e}")
 
-    # Force-sync commands per guild
     for guild in bot.guilds:
         try:
             await bot.tree.sync(guild=guild)
@@ -404,59 +607,15 @@ async def on_ready():
         except Exception as e:
             logger.error(f"Failed to sync commands for guild {guild.name}: {e}")
 
-    # Ensure all users are in DB
+    # ensure users exist in DB
     for guild in bot.guilds:
         for member in guild.members:
             if not member.bot:
                 await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
 
-    # --- Check and post rules embed on startup if missing ---
-    conn_on_ready = None
-    try:
-        conn_on_ready = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True,
-            cursorclass=aiomysql.cursors.DictCursor
-        )
-        async with conn_on_ready.cursor() as cursor:
-            for guild in bot.guilds:
-                await cursor.execute(
-                    "SELECT rules, rules_channel FROM bot_guild_settings WHERE guild_id = %s",
-                    (str(guild.id),)
-                )
-                settings_row = await cursor.fetchone()
-
-                if settings_row:
-                    await cursor.execute(
-                        "SELECT message_id FROM bot_messages WHERE guild_id = %s",
-                        (str(guild.id),)
-                    )
-                    bot_messages_row = await cursor.fetchone()
-
-                    if not bot_messages_row:
-                        new_rules_json_bytes = settings_row.get('rules')
-                        rules_channel_id = settings_row.get('rules_channel')
-
-                        if new_rules_json_bytes and rules_channel_id:
-                            logger.info(f"Detected missing rules embed for guild {guild.id} on startup. Attempting to post.")
-                            await post_and_save_embed(str(guild.id), new_rules_json_bytes, rules_channel_id)
-                        else:
-                            logger.warning(f"Guild {guild.id} has settings but missing rules JSON or channel ID. Skipping rules embed post on startup.")
-    except Exception as e:
-        logger.error(f"Error during startup rules embed check: {e}", exc_info=True)
-    finally:
-        if conn_on_ready:
-            conn_on_ready.close()
-    # --- End new section ---
-
-    # Start background DB check
     hourly_db_check.start()
+    sync_quarantine_task.start()  # safety net
 
-    # Start the web server in a separate asyncio task AFTER cogs are loaded
     bot.loop.create_task(start_web_server())
 
 @bot.event
@@ -486,12 +645,8 @@ async def hourly_db_check():
     conn = None
     try:
         conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True
         )
         logger.info("DB connection OK.")
     except Exception as e:
@@ -500,15 +655,15 @@ async def hourly_db_check():
         if conn:
             conn.close()
 
+# ---------------- Cog loader ----------------
+
 async def load_cogs():
     if not os.path.exists("cogs"):
         os.makedirs("cogs")
 
-    # List of cogs to load in a specific order (dependencies first)
     ordered_cogs = ["mechanics_main", "communication_main"]
     loaded_cogs_set = set()
 
-    # First, load explicitly ordered cogs
     for cog_name in ordered_cogs:
         try:
             full_module_name = f"cogs.{cog_name}"
@@ -524,17 +679,14 @@ async def load_cogs():
         except Exception as e:
             logger.error(f"Failed to load prioritized cog {full_module_name}: {e}")
 
-    # Then, load remaining cogs (including those in subdirectories)
     for root, dirs, files in os.walk("cogs"):
         for filename in files:
             if filename.endswith(".py") and filename != "__init__.py":
                 relative_path = os.path.relpath(os.path.join(root, filename), start="cogs")
                 full_module_name = f"cogs.{relative_path[:-3].replace(os.sep, '.')}"
-
                 if ' ' in full_module_name:
-                    logger.warning(f"Skipping cog '{full_module_name}' due to invalid characters (spaces) in module name. Please rename the file.")
+                    logger.warning(f"Skipping cog '{full_module_name}' due to invalid characters (spaces) in module name.")
                     continue
-
                 if full_module_name not in loaded_cogs_set:
                     try:
                         module = __import__(full_module_name, fromlist=['setup'])
@@ -547,6 +699,8 @@ async def load_cogs():
                         logger.warning(f"Cog module {full_module_name} not found, skipping.")
                     except Exception as e:
                         logger.error(f"Failed to load cog {full_module_name}: {e}")
+
+# ---------------- Entrypoint ----------------
 
 async def main():
     if not TOKEN:

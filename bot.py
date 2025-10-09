@@ -56,6 +56,10 @@ bot.chat_ws_rooms = {}
 # ---------------- DB helper methods ----------------
 
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
+    """
+    Ensure a user exists in discord_users. On first insert, also capture their current roles
+    and store them in role_data as JSON: {"roles": ["<role_id>", ...]} (excluding @everyone).
+    """
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
         return
@@ -77,12 +81,35 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             )
             (count,) = await cursor.fetchone()
             if count == 0:
+                # Build initial json_data
                 initial_json_data = json.dumps({"warnings": {}})
+
+                # Try to capture roles (IDs) for role_data, exclude @everyone
+                role_ids = []
+                try:
+                    guild = bot.get_guild(int(guild_id))
+                    member = None
+                    if guild:
+                        member = guild.get_member(int(discord_id))
+                        if member is None:
+                            # Fallback to API fetch if not cached
+                            try:
+                                member = await guild.fetch_member(int(discord_id))
+                            except Exception:
+                                member = None
+                    if member:
+                        role_ids = [str(r.id) for r in getattr(member, "roles", []) if not r.is_default()]
+                except Exception as e:
+                    logger.warning(f"Could not capture roles for new user {discord_id} in guild {guild_id}: {e}")
+
+                role_data_json = json.dumps({"roles": role_ids})
+
                 await cursor.execute(
-                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data) VALUES (%s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data)
+                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json)
                 )
-                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz.")
+                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz and role_data={role_data_json}.")
     except Exception as e:
         logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
     finally:

@@ -4,21 +4,26 @@ from discord.ui import View, Select, UserSelect, Button
 import logging
 import json
 import aiomysql
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------- Helpers: fetch latest reasons on demand ----------
 
-async def fetch_flag_reasons(db_user: str, db_password: str, db_host: str, guild_id: int | str = None) -> list[str]:
+async def fetch_flag_reasons(db_user: str, db_password: str, db_host: str, guild_id: int | str) -> List[str]:
     """
-    Always fetch the latest reasons from DB right before building the view.
-    If you later scope reasons per guild, add a WHERE clause with guild_id.
+    Fetch the latest reasons right before building the view.
+
+    Logic:
+      1) Look up bot_use_custom.use_custom for this guild_id.
+      2) If use_custom = 1 -> SELECT reason FROM rule_flagging WHERE guild_id = %s
+      3) Else -> SELECT reason FROM rule_flagging WHERE guild_id = 'DEFAULT'
     """
     if not all([db_user, db_password, db_host]):
         logger.error("Missing DB credentials; cannot fetch flag reasons.")
         return []
 
-    reasons: list[str] = []
+    reasons: List[str] = []
     conn = None
     try:
         conn = await aiomysql.connect(
@@ -30,11 +35,43 @@ async def fetch_flag_reasons(db_user: str, db_password: str, db_host: str, guild
             autocommit=True
         )
         async with conn.cursor() as cursor:
-            # If reasons are per guild, use:
-            # await cursor.execute("SELECT reason FROM rule_flagging WHERE guild_id = %s", (str(guild_id),))
-            await cursor.execute("SELECT reason FROM rule_flagging")
+            # 1) Check if this guild uses custom flags
+            use_custom = 0
+            try:
+                await cursor.execute(
+                    "SELECT use_custom FROM bot_use_custom WHERE guild_id = %s",
+                    (str(guild_id),)
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    # row may be a tuple like (1,)
+                    use_custom = int(row[0]) if row[0] is not None else 0
+            except Exception as e:
+                logger.error(f"Failed to read bot_use_custom for guild {guild_id}: {e}", exc_info=True)
+                use_custom = 0  # fallback to default
+
+            # 2) Load reasons based on flag mode
+            if use_custom == 1:
+                # Custom flags for this guild
+                await cursor.execute(
+                    "SELECT reason FROM rule_flagging WHERE guild_id = %s ORDER BY rule_class ASC, id ASC",
+                    (str(guild_id),)
+                )
+            else:
+                # Default flags
+                await cursor.execute(
+                    "SELECT reason FROM rule_flagging WHERE guild_id = 'DEFAULT' ORDER BY rule_class ASC, id ASC"
+                )
+
             rows = await cursor.fetchall()
-            reasons = [row[0] for row in rows]
+            # Deduplicate while preserving order
+            seen = set()
+            for r in rows or []:
+                reason = r[0]
+                if reason and reason not in seen:
+                    seen.add(reason)
+                    reasons.append(reason)
+
     except Exception as e:
         logger.error(f"Failed to fetch reasons: {e}", exc_info=True)
     finally:
@@ -45,7 +82,7 @@ async def fetch_flag_reasons(db_user: str, db_password: str, db_host: str, guild
 # ---------- Components ----------
 
 class FlagReasonSelect(Select):
-    def __init__(self, reasons: list[str], current_selection: str = None):
+    def __init__(self, reasons: List[str], current_selection: Optional[str] = None):
         self.all_reasons = reasons  # Store all reasons to re-create options if needed
         options = []
         for reason in reasons:
@@ -74,7 +111,7 @@ class FlagReasonSelect(Select):
         await interaction.response.edit_message(view=self.view)
 
 class FlagUserSelect(UserSelect):
-    def __init__(self, current_selections: list[discord.User] = None):
+    def __init__(self, current_selections: Optional[List[discord.User]] = None):
         super().__init__(
             placeholder="Select user(s) to flag",
             min_values=1,
@@ -103,7 +140,7 @@ class FlagConfirmButton(Button):
         )
 
     async def callback(self, interaction: discord.Interaction):
-        view: FlagView = self.view
+        view: "FlagView" = self.view
 
         if not view.selected_reason or not view.selected_users:
             await interaction.response.send_message(
@@ -229,10 +266,10 @@ class FlagCancelButton(Button):
         )
 
 class FlagView(View):
-    def __init__(self, reasons: list[str]):
+    def __init__(self, reasons: List[str]):
         super().__init__(timeout=300)
-        self.selected_reason = None
-        self.selected_users = None
+        self.selected_reason: Optional[str] = None
+        self.selected_users: Optional[List[discord.User]] = None
 
         self.reason_select = FlagReasonSelect(reasons, self.selected_reason)
         self.user_select = FlagUserSelect(self.selected_users)  # Pass initial empty list for users

@@ -10,6 +10,8 @@ import asyncio
 from aiohttp import web
 import aiohttp
 import time
+import re
+from typing import List, Optional, Tuple
 
 # Load env vars
 load_dotenv()
@@ -52,6 +54,331 @@ logger = logging.getLogger(__name__)
 # --- WebSocket room registries (game state & chat) ---
 bot.ws_rooms = {}
 bot.chat_ws_rooms = {}
+
+# ---------------- Utility helpers ----------------
+
+def _slugify_channel_name(name: str) -> str:
+    """
+    Discord sanitizes channel names: lowercase, spaces -> '-', only [a-z0-9-_].
+    """
+    if not name:
+        return ""
+    s = name.lower()
+    s = s.replace(" ", "-")
+    s = re.sub(r"[^a-z0-9\-_]", "", s)
+    s = re.sub(r"-{2,}", "-", s)
+    return s.strip("-_")
+
+def _normalize_role_name_variants(name: str) -> List[str]:
+    """
+    Build several variants to help fuzzy match a role by name.
+    Roles in Discord CAN contain spaces, but we'll be robust in case a slug
+    or spacing variant is saved in DB.
+    """
+    if not name:
+        return []
+    base = name.strip()
+    alts = {base, base.lower()}
+    # swap spaces <-> hyphens
+    alts.add(base.replace("-", " "))
+    alts.add(base.replace(" ", "-"))
+    alts.add(base.lower().replace("-", " "))
+    alts.add(base.lower().replace(" ", "-"))
+    # collapse multiple spaces
+    alts.add(re.sub(r"\s{2,}", " ", base))
+    return list(alts)
+
+def _find_role_fuzzy(guild: discord.Guild, role_name: str) -> Optional[discord.Role]:
+    """
+    Try to resolve a role by exact, case-insensitive, and spacing/slug variants.
+    """
+    if not role_name or not guild:
+        return None
+
+    # 1) exact
+    role = discord.utils.get(guild.roles, name=role_name)
+    if role:
+        return role
+
+    # 2) case-insensitive
+    lowered = role_name.lower()
+    for r in guild.roles:
+        if r.name.lower() == lowered:
+            return r
+
+    # 3) spacing / hyphen variants
+    for variant in _normalize_role_name_variants(role_name):
+        role = discord.utils.get(guild.roles, name=variant)
+        if role:
+            return role
+
+    # 4) fallback: containment / startswith (least strict)
+    for r in guild.roles:
+        if r.name.lower().replace(" ", "-") == lowered.replace(" ", "-"):
+            return r
+
+    return None
+
+def _find_text_channel_fuzzy(guild: discord.Guild, channel_name: str) -> Optional[discord.TextChannel]:
+    """
+    Try to resolve a text channel by exact and slugified variants.
+    """
+    if not channel_name or not guild:
+        return None
+
+    # exact name match
+    ch = discord.utils.get(guild.text_channels, name=channel_name)
+    if ch:
+        return ch
+
+    # slugified (what Discord would do to a requested name)
+    slug = _slugify_channel_name(channel_name)
+    if slug:
+        ch = discord.utils.get(guild.text_channels, name=slug)
+        if ch:
+            return ch
+
+    # case-insensitive attempt
+    lowered = channel_name.lower()
+    for c in guild.text_channels:
+        if c.name.lower() == lowered or c.name == _slugify_channel_name(lowered):
+            return c
+
+    return None
+
+async def _db_connect_dict():
+    return await aiomysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        db="serene_users",
+        charset='utf8mb4',
+        autocommit=True,
+        cursorclass=aiomysql.cursors.DictCursor
+    )
+
+async def _fetch_quarantine_options(guild_id: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (role_name, channel_name) from bot_flag_action_options, or (None, None)
+    """
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        return (None, None)
+    conn = None
+    try:
+        conn = await _db_connect_dict()
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT quarantine_channel_name, quarantine_role_name "
+                "FROM bot_flag_action_options WHERE guild_id = %s",
+                (str(guild_id),)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return (None, None)
+            return (row.get("quarantine_role_name"), row.get("quarantine_channel_name"))
+    except Exception as e:
+        logger.error(f"_fetch_quarantine_options error for guild {guild_id}: {e}")
+        return (None, None)
+    finally:
+        if conn:
+            conn.close()
+
+async def _fetch_rules_embed_for_guild(guild_id: str) -> Optional[discord.Embed]:
+    """
+    Load the saved embed JSON from bot_messages.message and return a discord.Embed.
+    Uses the first embed if an array is stored.
+    """
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        return None
+    conn = None
+    try:
+        conn = await _db_connect_dict()
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT message FROM bot_messages WHERE guild_id = %s",
+                (str(guild_id),)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return None
+
+            raw = row.get("message")
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="ignore")
+
+            if not raw:
+                return None
+
+            try:
+                data = json.loads(raw)
+                # Accept either a single embed dict or a list[dict]
+                if isinstance(data, list) and data:
+                    embed_dict = data[0]
+                elif isinstance(data, dict):
+                    embed_dict = data
+                else:
+                    return None
+                return discord.Embed.from_dict(embed_dict)
+            except Exception as e:
+                logger.error(f"Failed to parse saved embed JSON for guild {guild_id}: {e}")
+                return None
+    except Exception as e:
+        logger.error(f"_fetch_rules_embed_for_guild DB error for guild {guild_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
+
+async def _fetch_member_saved_roles(guild_id: str, discord_id: str) -> List[int]:
+    """
+    Returns list of role IDs (ints) stored in discord_users.role_data, excluding @everyone and quarantine.
+    """
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        return []
+    conn = None
+    roles: List[int] = []
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT role_data FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return []
+            raw = row[0]
+            if isinstance(raw, (bytes, bytearray)):
+                raw = raw.decode("utf-8", errors="ignore")
+            try:
+                jd = json.loads(raw) if isinstance(raw, str) else (raw or {})
+                arr = jd.get("roles", []) if isinstance(jd, dict) else []
+                for rid in arr:
+                    try:
+                        roles.append(int(rid))
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.warning(f"Failed to parse role_data for user {discord_id} in {guild_id}: {e}")
+                return []
+    except Exception as e:
+        logger.error(f"_fetch_member_saved_roles DB error: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return roles
+
+async def _restore_member_roles(member: discord.Member, quarantine_role: Optional[discord.Role]):
+    """
+    Remove the quarantine role (if present) and restore roles from DB role_data.
+    """
+    guild = member.guild
+    if not guild:
+        return
+
+    # Remove quarantine role first
+    try:
+        if quarantine_role and quarantine_role in member.roles:
+            await member.remove_roles(quarantine_role, reason="Accepted rules")
+    except discord.Forbidden:
+        logger.error(f"Missing permissions to remove quarantine role from {member}.")
+    except Exception as e:
+        logger.error(f"Error removing quarantine role from {member}: {e}")
+
+    # Fetch saved role IDs
+    saved_ids = await _fetch_member_saved_roles(str(guild.id), str(member.id))
+    if not saved_ids:
+        return
+
+    # Map to Role objects, filter out quarantine role & unmanaged / above bot
+    me = guild.me
+    roles_to_add: List[discord.Role] = []
+    for rid in saved_ids:
+        r = guild.get_role(rid)
+        if not r:
+            continue
+        if quarantine_role and r.id == quarantine_role.id:
+            continue
+        # Only add roles we can manage
+        if r.managed:
+            continue
+        if me and r >= me.top_role:
+            continue
+        roles_to_add.append(r)
+
+    if not roles_to_add:
+        return
+
+    try:
+        await member.add_roles(*roles_to_add, reason="Restore roles after accepting rules")
+    except discord.Forbidden:
+        logger.error(f"Missing permissions to add roles to {member}.")
+    except Exception as e:
+        logger.error(f"Error adding roles to {member}: {e}")
+
+# ---------------- Views (Buttons) ----------------
+
+class AcceptRulesView(discord.ui.View):
+    """
+    Persistent view for the "I Accept" button in the quarantine channel.
+    Clicking it removes the quarantine role and restores saved roles.
+    """
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="I Accept", style=discord.ButtonStyle.success, custom_id="serene:accept_rules")
+    async def accept_rules(self, interaction: discord.Interaction, button: discord.ui.Button):
+        try:
+            guild = interaction.guild
+            if not guild or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("Something went wrong (no guild or member).", ephemeral=True)
+                return
+
+            # Resolve quarantine role by reading the configured name and fuzzy matching
+            qrole_name, _ = await _fetch_quarantine_options(str(guild.id))
+            quarantine_role = _find_role_fuzzy(guild, qrole_name or "")
+
+            await _restore_member_roles(interaction.user, quarantine_role)
+
+            # Acknowledge
+            await interaction.response.send_message("✅ You're all set! Welcome back to the server.", ephemeral=True)
+        except Exception as e:
+            logger.error(f"accept_rules error: {e}", exc_info=True)
+            # Try to at least notify the user
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message("Sorry, something went wrong restoring your roles.", ephemeral=True)
+            except Exception:
+                pass
+
+async def _seed_quarantine_readme_message(guild: discord.Guild, channel: discord.TextChannel):
+    """
+    Posts the saved rules embed into the quarantine channel with an 'I Accept' button.
+    Called when we just created the quarantine channel.
+    """
+    try:
+        embed = await _fetch_rules_embed_for_guild(str(guild.id))
+        if not embed:
+            # Minimal fallback if nothing saved
+            embed = discord.Embed(
+                title="Read Me",
+                description="Please review the server rules below and click **I Accept** to continue.",
+                color=discord.Color.blurple()
+            )
+        view = AcceptRulesView()
+        await channel.send(content="**Read Me**", embed=embed, view=view)
+        logger.info(f"Seeded quarantine 'Read Me' message in #{channel} for guild {guild.id}")
+    except discord.Forbidden:
+        logger.error("Missing permission to send the 'Read Me' message in quarantine channel.")
+    except Exception as e:
+        logger.error(f"Failed to seed 'Read Me' message: {e}", exc_info=True)
 
 # ---------------- DB helper methods ----------------
 
@@ -376,15 +703,16 @@ async def websocket_handler(request):
 # ---------------------- ADMIN WS: /admin_ws ----------------------
 
 async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name: str) -> bool:
-    """Create or update the quarantine role & channel for the guild."""
+    """Create or update the quarantine role & channel for the guild.
+       When a new channel is created, seed it with the saved rules embed + Accept button."""
     try:
         guild = bot.get_guild(int(guild_id))
         if not guild:
             logger.error(f"ensure_quarantine_objects: Bot not in guild {guild_id}")
             return False
 
-        # Role: create if missing
-        role = discord.utils.get(guild.roles, name=role_name)
+        # Role: create if missing (be robust about lookups)
+        role = _find_role_fuzzy(guild, role_name)
         if not role:
             role = await guild.create_role(
                 name=role_name,
@@ -404,17 +732,27 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             )
         }
 
-        channel = discord.utils.get(guild.text_channels, name=channel_name)
+        # Try fuzzy find channel (Discord may slugify)
+        channel = _find_text_channel_fuzzy(guild, channel_name)
+
+        created = False
         if not channel:
+            # Create with slug-like name for consistency
+            desired_name = _slugify_channel_name(channel_name) or channel_name
             channel = await guild.create_text_channel(
-                channel_name,
+                desired_name,
                 overwrites=overwrites,
                 reason="Provision quarantine channel"
             )
-            logger.info(f"Created channel '{channel_name}' in guild {guild_id}")
+            created = True
+            logger.info(f"Created channel '{channel.name}' in guild {guild_id}")
         else:
             await channel.edit(overwrites=overwrites, reason="Ensure quarantine channel permissions")
-            logger.info(f"Updated channel '{channel_name}' overwrites in guild {guild_id}")
+            logger.info(f"Updated channel '{channel.name}' overwrites in guild {guild_id}")
+
+        # If newly created, seed the Read Me message with Accept button
+        if created and isinstance(channel, discord.TextChannel):
+            await _seed_quarantine_readme_message(guild, channel)
 
         return True
     except discord.Forbidden:
@@ -491,6 +829,12 @@ async def start_web_server():
 @bot.event
 async def on_ready():
     logger.info(f"Logged in as {bot.user}.")
+
+    # Register persistent views so the button keeps working across restarts
+    try:
+        bot.add_view(AcceptRulesView())
+    except Exception as e:
+        logger.error(f"Failed to add persistent AcceptRulesView: {e}")
 
     # Expose DB credentials for modules like flag.py
     bot.db_user = DB_USER

@@ -146,6 +146,59 @@ def _find_text_channel_fuzzy(guild: discord.Guild, channel_name: str) -> Optiona
 
     return None
 
+def _merge_role_overwrite(existing: Optional[discord.PermissionOverwrite], **kwargs) -> discord.PermissionOverwrite:
+    """
+    Merge or create an overwrite, only changing the keys we pass in.
+    """
+    ow = existing or discord.PermissionOverwrite()
+    for k, v in kwargs.items():
+        setattr(ow, k, v)
+    return ow
+
+async def _enforce_quarantine_visibility(
+    guild: discord.Guild,
+    quarantine_role: discord.Role,
+    quarantine_channel: discord.TextChannel
+):
+    """
+    Ensure the quarantine role is denied view_channel everywhere,
+    except it's explicitly allowed in the quarantine channel.
+    Also apply denies to categories so children inherit them.
+    """
+    # 1) Categories: deny view_channel for the quarantine role
+    for cat in guild.categories:
+        try:
+            current = cat.overwrites_for(quarantine_role)
+            new_ow = _merge_role_overwrite(current, view_channel=False)
+            await cat.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: hide other categories")
+        except discord.Forbidden:
+            logger.warning(f"Missing perms to edit category {cat} for quarantine overwrites.")
+        except Exception as e:
+            logger.error(f"Error setting category overwrite {cat}: {e}", exc_info=True)
+
+    # 2) Text channels: deny everywhere except quarantine channel
+    for ch in guild.text_channels:
+        try:
+            if ch.id == quarantine_channel.id:
+                # Explicitly allow in the quarantine channel
+                current = ch.overwrites_for(quarantine_role)
+                new_ow = _merge_role_overwrite(
+                    current,
+                    view_channel=True,
+                    send_messages=True,
+                    read_message_history=True,
+                    add_reactions=True
+                )
+                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: allow in quarantine channel")
+            else:
+                current = ch.overwrites_for(quarantine_role)
+                new_ow = _merge_role_overwrite(current, view_channel=False)
+                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: hide non-quarantine channel")
+        except discord.Forbidden:
+            logger.warning(f"Missing perms to edit channel {ch} for quarantine overwrites.")
+        except Exception as e:
+            logger.error(f"Error setting channel overwrite {ch}: {e}", exc_info=True)
+
 async def _db_connect_dict():
     return await aiomysql.connect(
         host=DB_HOST,
@@ -380,127 +433,6 @@ async def _seed_quarantine_readme_message(guild: discord.Guild, channel: discord
     except Exception as e:
         logger.error(f"Failed to seed 'Read Me' message: {e}", exc_info=True)
 
-# ---------------- DB helper methods ----------------
-
-async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
-    """
-    Ensure a user exists in discord_users. On first insert, also capture their current roles
-    and store them in role_data as JSON: {"roles": ["<role_id>", ...]} (excluding @everyone).
-    """
-    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
-        logger.error("Missing DB credentials.")
-        return
-
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True
-        )
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT COUNT(*) FROM discord_users WHERE guild_id = %s AND discord_id = %s",
-                (str(guild_id), str(discord_id))
-            )
-            (count,) = await cursor.fetchone()
-            if count == 0:
-                # Build initial json_data
-                initial_json_data = json.dumps({"warnings": {}})
-
-                # Try to capture roles (IDs) for role_data, exclude @everyone
-                role_ids = []
-                try:
-                    guild = bot.get_guild(int(guild_id))
-                    member = None
-                    if guild:
-                        member = guild.get_member(int(discord_id))
-                        if member is None:
-                            # Fallback to API fetch if not cached
-                            try:
-                                member = await guild.fetch_member(int(discord_id))
-                            except Exception:
-                                member = None
-                    if member:
-                        role_ids = [str(r.id) for r in getattr(member, "roles", []) if not r.is_default()]
-                except Exception as e:
-                    logger.warning(f"Could not capture roles for new user {discord_id} in guild {guild_id}: {e}")
-
-                role_data_json = json.dumps({"roles": role_ids})
-
-                await cursor.execute(
-                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json)
-                )
-                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz and role_data={role_data_json}.")
-    except Exception as e:
-        logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
-
-async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
-    """
-    Helper function to post a new Discord embed and save its details to bot_messages table.
-    Expects rules_json_bytes to be bytes, will decode it.
-    """
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST,
-            user=DB_USER,
-            password=DB_PASSWORD,
-            db="serene_users",
-            charset='utf8mb4',
-            autocommit=True,
-            cursorclass=aiomysql.cursors.DictCursor
-        )
-        async with conn.cursor() as cursor:
-            guild = bot.get_guild(int(guild_id))
-            if not guild:
-                logger.warning(f"Bot not in guild {guild_id}. Cannot post rules embed.")
-                return
-
-            rules_channel = guild.get_channel(int(rules_channel_id))
-            if not rules_channel:
-                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
-                return
-
-            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
-
-            try:
-                embed_data_list = json.loads(rules_json_str)
-                if not isinstance(embed_data_list, list) or not embed_data_list:
-                    raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
-                embed_data = embed_data_list[0]
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
-                return
-
-            new_embed = discord.Embed.from_dict(embed_data)
-            sent_message = await rules_channel.send(embed=new_embed)
-            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
-
-            await cursor.execute(
-                "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
-                (str(guild_id), rules_json_str, str(sent_message.id))
-            )
-            logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
-
-    except discord.errors.Forbidden:
-        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
-    except Exception as e:
-        logger.error(f"Error posting and saving embed for guild {guild_id}: {e}", exc_info=True)
-    finally:
-        if conn:
-            conn.close()
-
 # --------------- HTTP handlers (CORS + webhook) ---------------
 
 CORS_HEADERS = {
@@ -704,7 +636,8 @@ async def websocket_handler(request):
 
 async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name: str) -> bool:
     """Create or update the quarantine role & channel for the guild.
-       When a new channel is created, seed it with the saved rules embed + Accept button."""
+       When a new channel is created, seed it with the saved rules embed + Accept button.
+       Also ensure the quarantine role is hidden from every other channel/category."""
     try:
         guild = bot.get_guild(int(guild_id))
         if not guild:
@@ -721,7 +654,7 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             )
             logger.info(f"Created role '{role_name}' in guild {guild_id}")
 
-        # Channel: create or update with proper overwrites
+        # Channel: create or update with proper overwrites for quarantine channel itself
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             role: discord.PermissionOverwrite(
@@ -749,6 +682,9 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
         else:
             await channel.edit(overwrites=overwrites, reason="Ensure quarantine channel permissions")
             logger.info(f"Updated channel '{channel.name}' overwrites in guild {guild_id}")
+
+        # NEW: enforce deny on all other channels/categories for the quarantine role
+        await _enforce_quarantine_visibility(guild, role, channel)
 
         # If newly created, seed the Read Me message with Accept button
         if created and isinstance(channel, discord.TextChannel):
@@ -950,6 +886,127 @@ async def hourly_db_check():
         logger.info("DB connection OK.")
     except Exception as e:
         logger.error(f"Hourly DB check failed: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+# ---------------------- DB helper methods ----------------
+
+async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
+    """
+    Ensure a user exists in discord_users. On first insert, also capture their current roles
+    and store them in role_data as JSON: {"roles": ["<role_id>", ...]} (excluding @everyone).
+    """
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        logger.error("Missing DB credentials.")
+        return
+
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT COUNT(*) FROM discord_users WHERE guild_id = %s AND discord_id = %s",
+                (str(guild_id), str(discord_id))
+            )
+            (count,) = await cursor.fetchone()
+            if count == 0:
+                # Build initial json_data
+                initial_json_data = json.dumps({"warnings": {}})
+
+                # Try to capture roles (IDs) for role_data, exclude @everyone
+                role_ids = []
+                try:
+                    guild = bot.get_guild(int(guild_id))
+                    member = None
+                    if guild:
+                        member = guild.get_member(int(discord_id))
+                        if member is None:
+                            # Fallback to API fetch if not cached
+                            try:
+                                member = await guild.fetch_member(int(discord_id))
+                            except Exception:
+                                member = None
+                    if member:
+                        role_ids = [str(r.id) for r in getattr(member, "roles", []) if not r.is_default()]
+                except Exception as e:
+                    logger.warning(f"Could not capture roles for new user {discord_id} in guild {guild_id}: {e}")
+
+                role_data_json = json.dumps({"roles": role_ids})
+
+                await cursor.execute(
+                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
+                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json)
+                )
+                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz and role_data={role_data_json}.")
+    except Exception as e:
+        logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
+
+async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
+    """
+    Helper function to post a new Discord embed and save its details to bot_messages table.
+    Expects rules_json_bytes to be bytes, will decode it.
+    """
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            db="serene_users",
+            charset='utf8mb4',
+            autocommit=True,
+            cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn.cursor() as cursor:
+            guild = bot.get_guild(int(guild_id))
+            if not guild:
+                logger.warning(f"Bot not in guild {guild_id}. Cannot post rules embed.")
+                return
+
+            rules_channel = guild.get_channel(int(rules_channel_id))
+            if not rules_channel:
+                logger.warning(f"Rules channel {rules_channel_id} not found for guild {guild_id}. Cannot post rules embed.")
+                return
+
+            rules_json_str = rules_json_bytes.decode('utf-8') if isinstance(rules_json_bytes, bytes) else rules_json_bytes
+
+            try:
+                embed_data_list = json.loads(rules_json_str)
+                if not isinstance(embed_data_list, list) or not embed_data_list:
+                    raise ValueError("Rules JSON is not a valid list of embeds or is empty.")
+                embed_data = embed_data_list[0]
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"Failed to parse rules JSON for guild {guild_id}: {e}")
+                return
+
+            new_embed = discord.Embed.from_dict(embed_data)
+            sent_message = await rules_channel.send(embed=new_embed)
+            logger.info(f"Posted new Discord message {sent_message.id} in channel {rules_channel_id} for guild {guild_id}.")
+
+            await cursor.execute(
+                "INSERT INTO bot_messages (guild_id, message, message_id) VALUES (%s, %s, %s)",
+                (str(guild_id), rules_json_str, str(sent_message.id))
+            )
+            logger.info(f"Inserted new entry into bot_messages table for guild {guild_id}.")
+
+    except discord.errors.Forbidden:
+        logger.error(f"Bot lacks permissions to send messages in channel {rules_channel_id} for guild {guild_id}.")
+    except Exception as e:
+        logger.error(f"Error posting and saving embed for guild {guild_id}: {e}", exc_info=True)
     finally:
         if conn:
             conn.close()

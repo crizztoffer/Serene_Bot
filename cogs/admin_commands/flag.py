@@ -145,20 +145,27 @@ async def _fetch_actions_config(cursor, guild_id: int | str) -> Dict[str, str]:
         }
     except Exception as e:
         logger.error(f"_fetch_actions_config failed for guild {guild_id}: {e}", exc_info=True)
-        return defaults
+    return defaults
 
-async def _fetch_quarantine_role_name(cursor, guild_id: int | str) -> Optional[str]:
+async def _fetch_quarantine_options(cursor, guild_id: int | str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (quarantine_role_name, quarantine_channel_name) from bot_flag_action_options.
+    """
     try:
         await cursor.execute(
-            "SELECT quarantine_role_name FROM bot_flag_action_options WHERE guild_id = %s",
+            "SELECT quarantine_role_name, quarantine_channel_name FROM bot_flag_action_options WHERE guild_id = %s",
             (str(guild_id),)
         )
         row = await cursor.fetchone()
-        if row:
-            return row[0]
+        if not row:
+            return (None, None)
+        # Row might be tuple; handle dict cursor too just in case
+        role_name = row[0] if isinstance(row, tuple) else row.get("quarantine_role_name")
+        ch_name = row[1] if isinstance(row, tuple) else row.get("quarantine_channel_name")
+        return (role_name, ch_name)
     except Exception as e:
-        logger.error(f"_fetch_quarantine_role_name error: {e}", exc_info=True)
-    return None
+        logger.error(f"_fetch_quarantine_options error for guild {guild_id}: {e}", exc_info=True)
+    return (None, None)
 
 # ---------- Components ----------
 
@@ -251,11 +258,16 @@ async def _apply_ban(member: discord.Member, pm_behavior: str):
 
 async def _apply_show_rules_disable_chat(
     cursor,
+    bot: discord.Client,
     member: discord.Member,
     guild_id: int | str,
-    quarantine_role_name: Optional[str]
+    quarantine_role_name: Optional[str],
+    quarantine_channel_name: Optional[str]
 ):
-    """Save current roles -> clear manageable roles -> assign quarantine role (by name)."""
+    """
+    Save current roles -> clear manageable roles -> assign quarantine role (by name)
+    -> enforce quarantine visibility across the guild (hide everything except the quarantine channel).
+    """
     guild = member.guild
     if not guild:
         return "no-guild"
@@ -301,13 +313,24 @@ async def _apply_show_rules_disable_chat(
 
     try:
         await member.add_roles(qrole, reason="Serene: show_rules_disable_chat")
-        return "quarantined"
     except discord.Forbidden:
         logger.error(f"Missing perms to add quarantine role to {member}")
         return "forbidden"
     except Exception as e:
         logger.error(f"Error adding quarantine role to {member}: {e}", exc_info=True)
         return "error"
+
+    # 4) Enforce server-wide visibility: only see quarantine channel
+    try:
+        # We rely on bot.ensure_quarantine_objects (added/exposed in bot.py)
+        if hasattr(bot, "ensure_quarantine_objects") and callable(getattr(bot, "ensure_quarantine_objects")):
+            await bot.ensure_quarantine_objects(str(guild.id), quarantine_role_name or "", quarantine_channel_name or "quarantine")
+        else:
+            logger.warning("bot.ensure_quarantine_objects not available; cannot enforce channel denies.")
+    except Exception as e:
+        logger.error(f"Failed to enforce quarantine visibility for guild {guild_id}: {e}", exc_info=True)
+
+    return "quarantined"
 
 # ---------- Confirm button ----------
 
@@ -363,9 +386,9 @@ class FlagConfirmButton(Button):
             )
 
             async with conn.cursor() as cursor:
-                # Fetch action config + quarantine role name once
+                # Fetch action config + quarantine options once
                 actions_cfg = await _fetch_actions_config(cursor, guild_id)
-                quarantine_role_name = await _fetch_quarantine_role_name(cursor, guild_id)
+                quarantine_role_name, quarantine_channel_name = await _fetch_quarantine_options(cursor, guild_id)
 
                 for user in view.selected_users:
                     # Convert to Member (we need roles/permissions)
@@ -451,7 +474,14 @@ class FlagConfirmButton(Button):
                         applied = "recorded"
                         if member and not member.guild_permissions.administrator:
                             if action_to_apply == "show_rules_disable_chat":
-                                applied = await _apply_show_rules_disable_chat(cursor, member, guild_id, quarantine_role_name)
+                                applied = await _apply_show_rules_disable_chat(
+                                    cursor,
+                                    bot,
+                                    member,
+                                    guild_id,
+                                    quarantine_role_name,
+                                    quarantine_channel_name
+                                )
                             elif action_to_apply.startswith("timeout_"):
                                 applied = await _apply_timeout(member, action_to_apply)
                             elif action_to_apply == "ban":

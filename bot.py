@@ -53,7 +53,6 @@ logger = logging.getLogger(__name__)
 
 # --- WebSocket room registries (game state & chat) ---
 bot.ws_rooms = {}
-bot.chat_ws_rooms = {}
 
 # ---------------- Utility helpers ----------------
 

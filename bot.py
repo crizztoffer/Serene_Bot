@@ -147,9 +147,6 @@ def _find_text_channel_fuzzy(guild: discord.Guild, channel_name: str) -> Optiona
     return None
 
 def _merge_role_overwrite(existing: Optional[discord.PermissionOverwrite], **kwargs) -> discord.PermissionOverwrite:
-    """
-    Merge or create an overwrite, only changing the keys we pass in.
-    """
     ow = existing or discord.PermissionOverwrite()
     for k, v in kwargs.items():
         setattr(ow, k, v)
@@ -161,39 +158,47 @@ async def _enforce_quarantine_visibility(
     quarantine_channel: discord.TextChannel
 ):
     """
-    Ensure the quarantine role is denied view_channel everywhere,
-    except it's explicitly allowed in the quarantine channel.
-    Also apply denies to categories so children inherit them.
+    Hide EVERYWHERE except the quarantine channel, where we explicitly allow.
+    Denies on the quarantine role override @everyone allows on default servers.
     """
-    # 1) Categories: deny view_channel for the quarantine role
+    # Categories: deny view_channel
     for cat in guild.categories:
         try:
             current = cat.overwrites_for(quarantine_role)
             new_ow = _merge_role_overwrite(current, view_channel=False)
-            await cat.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: hide other categories")
+            await cat.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: hide categories")
         except discord.Forbidden:
             logger.warning(f"Missing perms to edit category {cat} for quarantine overwrites.")
         except Exception as e:
             logger.error(f"Error setting category overwrite {cat}: {e}", exc_info=True)
 
-    # 2) Text channels: deny everywhere except quarantine channel
+    # Text channels
     for ch in guild.text_channels:
         try:
             if ch.id == quarantine_channel.id:
-                # Explicitly allow in the quarantine channel
                 current = ch.overwrites_for(quarantine_role)
                 new_ow = _merge_role_overwrite(
                     current,
                     view_channel=True,
                     send_messages=True,
                     read_message_history=True,
-                    add_reactions=True
+                    add_reactions=True,
                 )
-                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: allow in quarantine channel")
+                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: allow quarantine channel")
             else:
                 current = ch.overwrites_for(quarantine_role)
-                new_ow = _merge_role_overwrite(current, view_channel=False)
-                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: hide non-quarantine channel")
+                new_ow = _merge_role_overwrite(
+                    current,
+                    view_channel=False,
+                    send_messages=False,
+                    add_reactions=False,
+                    create_public_threads=False,
+                    create_private_threads=False,
+                    send_messages_in_threads=False,
+                    attach_files=False,
+                    embed_links=False,
+                )
+                await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: deny non-quarantine channel")
         except discord.Forbidden:
             logger.warning(f"Missing perms to edit channel {ch} for quarantine overwrites.")
         except Exception as e:

@@ -112,7 +112,7 @@ def _find_role_fuzzy(guild: discord.Guild, role_name: str) -> Optional[discord.R
         if role:
             return role
 
-    # 4) fallback: containment / startswith (least strict)
+    # 4) fallback: normalize spaces->hyphens
     for r in guild.roles:
         if r.name.lower().replace(" ", "-") == lowered.replace(" ", "-"):
             return r
@@ -147,6 +147,9 @@ def _find_text_channel_fuzzy(guild: discord.Guild, channel_name: str) -> Optiona
     return None
 
 def _merge_role_overwrite(existing: Optional[discord.PermissionOverwrite], **kwargs) -> discord.PermissionOverwrite:
+    """
+    Merge or create an overwrite, only changing the keys we pass in.
+    """
     ow = existing or discord.PermissionOverwrite()
     for k, v in kwargs.items():
         setattr(ow, k, v)
@@ -158,10 +161,12 @@ async def _enforce_quarantine_visibility(
     quarantine_channel: discord.TextChannel
 ):
     """
-    Hide EVERYWHERE except the quarantine channel, where we explicitly allow.
-    Denies on the quarantine role override @everyone allows on default servers.
+    Lock the server down for the quarantine role:
+      • DENY view/send/etc on EVERY category/channel,
+      • EXCEPT explicitly ALLOW in the quarantine channel.
+    This overrides @everyone allows on a fresh server.
     """
-    # Categories: deny view_channel
+    # 1) Categories: deny view_channel for the quarantine role
     for cat in guild.categories:
         try:
             current = cat.overwrites_for(quarantine_role)
@@ -172,17 +177,18 @@ async def _enforce_quarantine_visibility(
         except Exception as e:
             logger.error(f"Error setting category overwrite {cat}: {e}", exc_info=True)
 
-    # Text channels
+    # 2) Text channels: deny everywhere except quarantine channel
     for ch in guild.text_channels:
         try:
             if ch.id == quarantine_channel.id:
+                # Explicitly allow in the quarantine channel
                 current = ch.overwrites_for(quarantine_role)
                 new_ow = _merge_role_overwrite(
                     current,
                     view_channel=True,
                     send_messages=True,
                     read_message_history=True,
-                    add_reactions=True,
+                    add_reactions=True
                 )
                 await ch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: allow quarantine channel")
             else:
@@ -203,6 +209,23 @@ async def _enforce_quarantine_visibility(
             logger.warning(f"Missing perms to edit channel {ch} for quarantine overwrites.")
         except Exception as e:
             logger.error(f"Error setting channel overwrite {ch}: {e}", exc_info=True)
+
+    # 3) Voice/Stage channels: deny view/connect just in case
+    for vch in guild.voice_channels + guild.stage_channels:
+        try:
+            current = vch.overwrites_for(quarantine_role)
+            new_ow = _merge_role_overwrite(
+                current,
+                view_channel=False,
+                connect=False,
+                speak=False,
+                stream=False
+            )
+            await vch.set_permissions(quarantine_role, overwrite=new_ow, reason="Serene quarantine: deny voice/stage")
+        except discord.Forbidden:
+            logger.warning(f"Missing perms to edit voice/stage channel {vch} for quarantine overwrites.")
+        except Exception as e:
+            logger.error(f"Error setting voice/stage overwrite {vch}: {e}", exc_info=True)
 
 async def _db_connect_dict():
     return await aiomysql.connect(
@@ -430,6 +453,15 @@ async def _seed_quarantine_readme_message(guild: discord.Guild, channel: discord
                 description="Please review the server rules below and click **I Accept** to continue.",
                 color=discord.Color.blurple()
             )
+    except Exception:
+        # if the DB lookup failed or was invalid, still send a fallback
+        embed = discord.Embed(
+            title="Read Me",
+            description="Please review the server rules below and click **I Accept** to continue.",
+            color=discord.Color.blurple()
+        )
+
+    try:
         view = AcceptRulesView()
         await channel.send(content="**Read Me**", embed=embed, view=view)
         logger.info(f"Seeded quarantine 'Read Me' message in #{channel} for guild {guild.id}")
@@ -688,7 +720,7 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             await channel.edit(overwrites=overwrites, reason="Ensure quarantine channel permissions")
             logger.info(f"Updated channel '{channel.name}' overwrites in guild {guild_id}")
 
-        # NEW: enforce deny on all other channels/categories for the quarantine role
+        # Enforce deny on all other channels/categories for the quarantine role
         await _enforce_quarantine_visibility(guild, role, channel)
 
         # If newly created, seed the Read Me message with Accept button
@@ -702,6 +734,9 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
     except Exception as e:
         logger.error(f"ensure_quarantine_objects error: {e}", exc_info=True)
         return False
+
+# Expose to other modules (e.g., flag.py) so they can enforce after assigning the role
+bot.ensure_quarantine_objects = ensure_quarantine_objects
 
 async def admin_ws_handler(request):
     """

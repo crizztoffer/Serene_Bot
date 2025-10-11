@@ -687,86 +687,86 @@ async def chat_websocket_handler(request):
 
 async def websocket_handler(request):
     """
-    Game WebSocket: registers client in a room and dispatches messages to MechanicsMain.
+    Game WebSocket: registers a player's connection in a room via MechanicsMain.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    # >>>>> THIS IS THE NEW SUCCESS LOG YOU ASKED FOR <<<<<
     logger.info("✅ [/ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
     room_id = None
+    sender_id = None # This will be the player's discord_id
+
     try:
+        # Step 1: Receive the initial connection message to get room and player details.
         first_msg = await ws.receive_str()
         initial_data = json.loads(first_msg)
 
         room_id = initial_data.get('room_id')
-        guild_id = initial_data.get('guild_id')
-        channel_id = initial_data.get('channel_id')
         sender_id = initial_data.get('sender_id')
 
-        if not all([room_id, guild_id, channel_id, sender_id]):
-            logger.error(f"Initial WS missing parameters: {initial_data}")
-            await ws.send_str(json.dumps({"status": "error", "message": "Missing room, guild, channel, or sender ID."}))
-            return
+        if not all([room_id, sender_id]):
+            logger.error(f"Initial WS message missing room_id or sender_id: {initial_data}")
+            await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
+            await ws.close()
+            return ws
 
+        # Step 2: Add the WebSocket connection to the in-memory room registry.
         if room_id not in bot.ws_rooms:
             bot.ws_rooms[room_id] = set()
         bot.ws_rooms[room_id].add(ws)
-        logger.info(f"Game WS connected to room {room_id}. Now {len(bot.ws_rooms[room_id])} client(s).")
+        logger.info(f"Player {sender_id} WS connected to room {room_id}. Now {len(bot.ws_rooms[room_id])} client(s).")
 
+        # Step 3: Get the MechanicsMain cog to handle the connection logic.
         mechanics_cog = bot.get_cog('MechanicsMain')
         if not mechanics_cog:
             logger.error("MechanicsMain cog not available.")
-            await ws.send_str(json.dumps({"status": "error", "message": "Game mechanics not available."}))
-            return
+            await ws.send_str(json.dumps({"status": "error", "message": "Game mechanics are currently unavailable."}))
+            await ws.close()
+            return ws
 
-        await mechanics_cog.handle_websocket_game_action(initial_data)
+        # Step 4: Persist the player's connection in the database via the cog.
+        await mechanics_cog.player_connect(room_id, sender_id)
 
+        # Step 5: Listen for subsequent messages (e.g., ping/pong to keep alive).
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                # --- PING/PONG LOGIC ---
+                # Keepalive ping/pong handler
                 if msg.data == '{"action":"ping"}':
                     await ws.send_str('{"action":"pong"}')
                     continue
-                # --- END PING/PONG LOGIC ---
-                try:
-                    request_data = json.loads(msg.data)
-                    request_data['room_id'] = room_id
-                    request_data['guild_id'] = guild_id
-                    request_data['channel_id'] = channel_id
-                    request_data['sender_id'] = sender_id
-                    await mechanics_cog.handle_websocket_game_action(request_data)
-                except json.JSONDecodeError:
-                    await ws.send_str(json.dumps({"status": "error", "message": "Invalid JSON format."}))
-                except Exception as e:
-                    logger.error(f"Game WS processing error in room {room_id}: {e}", exc_info=True)
-                    await ws.send_str(json.dumps({"status": "error", "message": f"Internal server error: {e}"}))
-
-            elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Game WS error in room {room_id}: {ws.exception()}")
-            elif msg.type == web.WSMsgType.CLOSE:
-                logger.info(f"Game WS closed for room {room_id}.")
+                # Other messages are ignored as this handler's role is just presence.
+            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
+                logger.info(f"Game WS closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
                 break
 
     except asyncio.CancelledError:
-        logger.info(f"Game WS to room {room_id} cancelled.")
+        logger.info(f"Game WS for player {sender_id} in room {room_id} was cancelled.")
     except Exception as e:
         logger.error(f"Game WS handler error for room {room_id}: {e}", exc_info=True)
     finally:
+        # Step 6: Cleanup on disconnection.
+        # Remove from in-memory registry.
         if room_id and ws in bot.ws_rooms.get(room_id, set()):
             bot.ws_rooms[room_id].remove(ws)
             if not bot.ws_rooms[room_id]:
                 del bot.ws_rooms[room_id]
-            logger.info(f"Game WS disconnected from room {room_id}. Now {len(bot.ws_rooms.get(room_id, set()))} client(s).")
-        return ws
+            logger.info(f"Player {sender_id} WS disconnected from room {room_id}. Now {len(bot.ws_rooms.get(room_id, set()))} client(s).")
+
+        # Persist the disconnection in the database via the cog.
+        if room_id and sender_id:
+            mechanics_cog = bot.get_cog('MechanicsMain')
+            if mechanics_cog:
+                await mechanics_cog.player_disconnect(room_id, sender_id)
+
+    return ws
 
 # ---------------------- ADMIN WS: /admin_ws ----------------------
 
 async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name: str) -> bool:
     """Create or update the quarantine role & channel for the guild.
-       When a new channel is created, seed it with the saved rules embed + Accept button.
-       Also ensure the quarantine role is hidden from every other channel/category."""
+        When a new channel is created, seed it with the saved rules embed + Accept button.
+        Also ensure the quarantine role is hidden from every other channel/category."""
     try:
         guild = bot.get_guild(int(guild_id))
         if not guild:
@@ -886,7 +886,7 @@ def _log_registered_routes(app: web.Application):
         for r in app.router.routes():
             method = getattr(r, 'method', None) or ",".join(sorted(getattr(r, 'methods', []) or []))
             path = getattr(getattr(r, 'resource', None), 'canonical', None) or str(r.resource)
-            lines.append(f"   • {method:<6} {path}")
+            lines.append(f"    • {method:<6} {path}")
         if lines:
             logger.info("📡 aiohttp routes registered:\n%s", "\n".join(lines))
     except Exception as e:

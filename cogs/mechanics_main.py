@@ -419,8 +419,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             self.bot.ws_rooms = {}
         if room_id not in self.bot.ws_rooms:
             self.bot.ws_rooms[room_id] = set()
-
-        msg = json.dumps({"game_state": state})
+    
+        envelope = {
+            "game_state": state,
+            "server_ts": int(time.time())   # NEW: server epoch seconds
+        }
+        msg = json.dumps(envelope)
         for ws in list(self.bot.ws_rooms[room_id]):
             try:
                 await ws.send_str(msg)
@@ -464,31 +468,38 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _apply_blinds(self, state: dict):
         sorted_players = self._get_sorted_players(state)
         n = len(sorted_players)
-        if n == 0: return
+        if n == 0: 
+            return
         dealer = state['dealer_button_position']
         sb_idx = (dealer + 1) % n
         bb_idx = (dealer + 2) % n
         sb_amt = state.get('small_blind_amount', 5)
         bb_amt = state.get('big_blind_amount', 10)
-
+    
         sb = sorted_players[sb_idx] if n > sb_idx else None
         bb = sorted_players[bb_idx] if n > bb_idx else None
-
+    
         if sb:
             a = min(sb_amt, sb['total_chips'])
             sb['total_chips'] -= a
             sb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            sb['has_acted_in_round'] = True
+            # DO NOT set sb['has_acted_in_round'] here
+    
         if bb:
             a = min(bb_amt, bb['total_chips'])
             bb['total_chips'] -= a
             bb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            bb['has_acted_in_round'] = True
-
+            # DO NOT set bb['has_acted_in_round'] here
+    
         state['current_round_min_bet'] = bb['current_bet_in_round'] if bb else 0
-
+    
+        # Important: BB is the initial aggressor preflop, so others must still respond,
+        # and the round only completes after action has returned to BB.
+        state['last_aggressive_action_player_id'] = bb['discord_id'] if bb else None
+    
+        # write back mutated players
         for i, p in enumerate(state['players']):
             if sb and p['discord_id'] == sb['discord_id']:
                 state['players'][i] = sb

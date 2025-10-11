@@ -599,6 +599,87 @@ async def settings_saved_handler(request):
         if conn:
             conn.close()
 
+# ---------------------- CHAT WS: /chat_ws (NEW) ----------------------
+async def chat_websocket_handler(request):
+    """
+    Handles chat WebSocket connections for game lobbies and rooms.
+    """
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    
+    room_id = None
+    display_name = None
+    
+    try:
+        # 1. Handle initial registration message
+        first_msg_str = await ws.receive_str()
+        initial_data = json.loads(first_msg_str)
+        room_id = initial_data.get('room_id')
+        display_name = initial_data.get('displayName')
+
+        if not room_id or not display_name:
+            logger.error(f"Chat WS initial frame missing room_id or displayName: {initial_data}")
+            await ws.close()
+            return ws
+
+        # 2. Add user to the chat room registry
+        if room_id not in bot.chat_ws_rooms:
+            bot.chat_ws_rooms[room_id] = set()
+        bot.chat_ws_rooms[room_id].add(ws)
+        logger.info(f"'{display_name}' connected to chat room '{room_id}'.")
+
+        # 3. Announce user joining
+        join_message = {
+            "type": "user_joined",
+            "displayName": display_name,
+            "room_id": room_id
+        }
+        for client_ws in bot.chat_ws_rooms.get(room_id, set()):
+            await client_ws.send_str(json.dumps(join_message))
+
+        # 4. Listen for and broadcast messages
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                data = json.loads(msg.data)
+                if 'message' in data:
+                    broadcast_message = {
+                        "type": "new_message",
+                        "displayName": display_name,
+                        "message": data['message'],
+                        "room_id": room_id
+                    }
+                    for client_ws in bot.chat_ws_rooms.get(room_id, set()):
+                        await client_ws.send_str(json.dumps(broadcast_message))
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"Chat WS error for '{display_name}' in room '{room_id}': {ws.exception()}")
+
+    except Exception as e:
+        logger.error(f"Chat WS handler error for '{display_name}' in room '{room_id}': {e}", exc_info=True)
+    finally:
+        # 5. Handle disconnection
+        if room_id and display_name and ws in bot.chat_ws_rooms.get(room_id, set()):
+            bot.chat_ws_rooms[room_id].remove(ws)
+            if not bot.chat_ws_rooms[room_id]:
+                del bot.chat_ws_rooms[room_id]
+            
+            logger.info(f"'{display_name}' disconnected from chat room '{room_id}'.")
+            
+            # Announce user leaving
+            leave_message = {
+                "type": "user_left",
+                "displayName": display_name,
+                "room_id": room_id
+            }
+            if room_id in bot.chat_ws_rooms:
+                for client_ws in bot.chat_ws_rooms.get(room_id, set()):
+                    try:
+                        await client_ws.send_str(json.dumps(leave_message))
+                    except Exception:
+                        pass # Ignore errors for clients that might have disconnected simultaneously
+    
+    return ws
+
+
 # ---------------------- GAME WS: /ws ----------------------
 
 async def websocket_handler(request):
@@ -638,11 +719,11 @@ async def websocket_handler(request):
 
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                # --- START: ADDED PING/PONG LOGIC ---
+                # --- PING/PONG LOGIC ---
                 if msg.data == '{"action":"ping"}':
                     await ws.send_str('{"action":"pong"}')
                     continue
-                # --- END: ADDED PING/PONG LOGIC ---
+                # --- END PING/PONG LOGIC ---
                 try:
                     request_data = json.loads(msg.data)
                     request_data['room_id'] = room_id
@@ -796,6 +877,7 @@ async def start_web_server():
 
     # WS endpoints
     bot.web_app.router.add_get('/ws', websocket_handler)          # Game state WS
+    bot.web_app.router.add_get('/chat_ws', chat_websocket_handler) # Chat WS (Restored)
     bot.web_app.router.add_get('/admin_ws', admin_ws_handler)     # Admin actions WS
 
     port = int(os.getenv("PORT", 8080))

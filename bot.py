@@ -300,6 +300,7 @@ async def _fetch_rules_embed_for_guild(guild_id: str) -> Optional[discord.Embed]
                 (str(guild_id),)
             )
             row = await cursor.fetchone()
+
             if not row:
                 return None
 
@@ -716,6 +717,7 @@ async def game_was_handler(request):
     """
     Game WebSocket: registers a player's presence in a room via MechanicsMain.
     - Robust initial handshake (waits for first TEXT frame; ignores ping/pong/binary/close).
+    - After handshake, forwards any JSON frames with an 'action' to MechanicsMain.handle_websocket_game_action.
     - Does NOT hard-close on mechanics/DB failures; it warns the client and keeps the WS open.
     - Loud logs before/after prepare() to confirm upgrade attempts.
     """
@@ -811,17 +813,47 @@ async def game_was_handler(request):
                     "message": "Persistence failed; operating in ephemeral mode."
                 }))
 
-        # --- 5) Main receive loop: simple keepalive + future extensibility ---
+        # --- 5) Main receive loop: keepalive + DISPATCH GAME ACTIONS ---
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                # Keepalive support
-                if msg.data == '{"action":"ping"}' or msg.data.strip().lower() == 'ping':
+                raw = msg.data
+
+                # Simple keepalive
+                if raw == '{"action":"ping"}' or raw.strip().lower() == 'ping':
                     await ws.send_str('{"action":"pong"}')
                     continue
-                # (Extend here for future gameplay messages if needed)
+
+                # Gameplay dispatch (expects JSON with "action")
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    # Ignore non-JSON text frames (or log mildly)
+                    logger.warning(f"[/game_was] Ignoring non-JSON frame: {raw[:120]!r}")
+                    continue
+
+                if isinstance(data, dict) and "action" in data:
+                    if not mechanics_cog:
+                        mechanics_cog = bot.get_cog('MechanicsMain')
+
+                    if mechanics_cog:
+                        try:
+                            # Ensure room_id/sender context is present if the client omitted it on subsequent frames
+                            data.setdefault("room_id", room_id)
+                            data.setdefault("sender_id", sender_id)
+
+                            await mechanics_cog.handle_websocket_game_action(data)
+                        except Exception as e:
+                            logger.error(f"[/game_was] Dispatch error for action={data.get('action')} r={room_id}: {e}", exc_info=True)
+                            # Non-fatal: keep socket alive
+                    else:
+                        logger.error("[/game_was] MechanicsMain cog unavailable; cannot process action.")
+                        await ws.send_str(json.dumps({"status": "warn", "message": "Mechanics unavailable."}))
+
+                # Else: silently ignore unrelated messages
+                continue
 
             elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG, web.WSMsgType.BINARY):
-                # ignore; not used for gameplay yet
+                # ignore; not used for gameplay
                 continue
 
             elif msg.type == web.WSMsgType.ERROR:

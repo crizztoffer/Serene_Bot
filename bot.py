@@ -24,7 +24,7 @@ DB_HOST = os.getenv("DB_HOST")
 
 # URLs used by your site features
 GAME_WEB_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_room.php")
-GAME_WEBHOOK_URL = os.getenv("GAME_WEB_URL", "https://serenekeks.com/game_update_webhook.php")
+GAME_WEBHOOK_URL = os.getenv("GAME_WEBHOOK_URL", "https://serenekeks.com/game_update_webhook.php")  # (fixed env var name typo)
 
 # Auth token used by your admin page to talk to the bot
 BOT_ENTRY = os.getenv("BOT_ENTRY")
@@ -606,10 +606,13 @@ async def chat_websocket_handler(request):
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    
+
+    # Log once the upgrade succeeded – helpful in deployment logs
+    logger.info("✅ [/chat_ws] WebSocket upgraded successfully from %s", request.remote)
+
     room_id = None
     display_name = None
-    
+
     try:
         # 1. Handle initial registration message
         first_msg_str = await ws.receive_str()
@@ -661,9 +664,9 @@ async def chat_websocket_handler(request):
             bot.chat_ws_rooms[room_id].remove(ws)
             if not bot.chat_ws_rooms[room_id]:
                 del bot.chat_ws_rooms[room_id]
-            
+
             logger.info(f"'{display_name}' disconnected from chat room '{room_id}'.")
-            
+
             # Announce user leaving
             leave_message = {
                 "type": "user_left",
@@ -676,7 +679,7 @@ async def chat_websocket_handler(request):
                         await client_ws.send_str(json.dumps(leave_message))
                     except Exception:
                         pass # Ignore errors for clients that might have disconnected simultaneously
-    
+
     return ws
 
 
@@ -688,6 +691,9 @@ async def websocket_handler(request):
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
+
+    # >>>>> THIS IS THE NEW SUCCESS LOG YOU ASKED FOR <<<<<
+    logger.info("✅ [/ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
     room_id = None
     try:
@@ -834,6 +840,9 @@ async def admin_ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
+    # Success log on upgrade
+    logger.info("✅ [/admin_ws] WebSocket upgraded successfully from %s", request.remote)
+
     try:
         async for msg in ws:
             if msg.type != web.WSMsgType.TEXT:
@@ -870,22 +879,52 @@ async def admin_ws_handler(request):
 
 # ---------------------- WEB SERVER START ----------------------
 
+def _log_registered_routes(app: web.Application):
+    """Helper to dump the route table in a concise way for Railway logs."""
+    try:
+        lines = []
+        for r in app.router.routes():
+            method = getattr(r, 'method', None) or ",".join(sorted(getattr(r, 'methods', []) or []))
+            path = getattr(getattr(r, 'resource', None), 'canonical', None) or str(r.resource)
+            lines.append(f"   • {method:<6} {path}")
+        if lines:
+            logger.info("📡 aiohttp routes registered:\n%s", "\n".join(lines))
+    except Exception as e:
+        logger.warning(f"Could not log route table: {e}")
+
+async def _on_web_started(app: web.Application):
+    """Called after the site starts—ideal place to announce readiness."""
+    _log_registered_routes(app)
+    logger.info("✅ aiohttp web server is fully started and routing is active.")
+
 async def start_web_server():
     """Starts the aiohttp web server."""
+    # REST + CORS
     bot.web_app.router.add_options('/settings_saved', cors_preflight_handler)
+    logger.info("🛠️  Registered OPTIONS route: /settings_saved")
+
     bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
+    logger.info("🛠️  Registered POST route: /settings_saved")
 
     # WS endpoints
     bot.web_app.router.add_get('/ws', websocket_handler)
-    bot.web_app.router.add_get('/chat_ws', chat_websocket_handler) # Chat WS (Restored)
+    logger.info("🛠️  Registered WebSocket route: /ws")
+
+    bot.web_app.router.add_get('/chat_ws', chat_websocket_handler)  # Chat WS (Restored)
+    logger.info("🛠️  Registered WebSocket route: /chat_ws")
+
     bot.web_app.router.add_get('/admin_ws', admin_ws_handler)
+    logger.info("🛠️  Registered WebSocket route: /admin_ws")
+
+    # Log routes again once the server is started and accepting connections
+    bot.web_app.on_startup.append(_on_web_started)
 
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(bot.web_app)
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
-    logger.info(f"Web server started on http://0.0.0.0:{port}")
+    logger.info(f"🚀 Web server started on http://0.0.0.0:{port} (PORT={port})")
 
 # ---------------------- Discord events ----------------------
 

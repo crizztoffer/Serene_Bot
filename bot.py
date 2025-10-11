@@ -624,8 +624,8 @@ async def settings_saved_handler(request):
 async def health(_):
     return web.json_response({"ok": True, "ts": int(time.time())})
 
-async def ws_probe(_):
-    return web.Response(text="WS endpoint is here; use WebSocket upgrade.", status=426)
+async def game_was_probe(_):
+    return web.Response(text="game_was endpoint is here; use WebSocket upgrade.", status=426)
 
 # ---------------------- CHAT WS: /chat_ws (current) ----------------------
 async def chat_websocket_handler(request):
@@ -711,25 +711,25 @@ async def chat_websocket_handler(request):
     return ws
 
 
-# ---------------------- GAME WS: /ws (robust + loud logs) ----------------------
-async def websocket_handler(request):
+# ---------------------- GAME WS: /game_was (robust + loud logs) ----------------------
+async def game_was_handler(request):
     """
     Game WebSocket: registers a player's presence in a room via MechanicsMain.
     - Robust initial handshake (waits for first TEXT frame; ignores ping/pong/binary/close).
     - Does NOT hard-close on mechanics/DB failures; it warns the client and keeps the WS open.
     - Loud logs before/after prepare() to confirm upgrade attempts.
     """
-    logger.info("[/ws] HTTP request received from %s (will attempt WS upgrade)", request.remote)
+    logger.info("[/game_was] HTTP request received from %s (will attempt WS upgrade)", request.remote)
 
     ws = web.WebSocketResponse()
     try:
         ok = await ws.prepare(request)
-        logger.info("[/ws] prepare() returned %s — upgrade %s", ok, "OK" if ok else "FAILED")
+        logger.info("[/game_was] prepare() returned %s — upgrade %s", ok, "OK" if ok else "FAILED")
     except Exception as e:
-        logger.error(f"[/ws] prepare() raised: {e}", exc_info=True)
+        logger.error(f"[/game_was] prepare() raised: {e}", exc_info=True)
         return web.Response(text="Upgrade failed", status=400)
 
-    logger.info("✅ [/ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
+    logger.info("✅ [/game_was] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
     room_id = None
     sender_id = None
@@ -750,16 +750,16 @@ async def websocket_handler(request):
                 continue  # ignore control frames until we get TEXT
 
             elif msg.type == web.WSMsgType.BINARY:
-                logger.warning("[/ws] First frame was BINARY; ignoring and waiting for TEXT...")
+                logger.warning("[/game_was] First frame was BINARY; ignoring and waiting for TEXT...")
                 continue
 
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
-                logger.info("[/ws] Client closed before sending initial TEXT handshake.")
+                logger.info("[/game_was] Client closed before sending initial TEXT handshake.")
                 await ws.close()
                 return ws
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"[/ws] WS error before handshake: {ws.exception()}")
+                logger.error(f"[/game_was] WS error before handshake: {ws.exception()}")
                 await ws.close()
                 return ws
 
@@ -767,7 +767,7 @@ async def websocket_handler(request):
         try:
             initial_data = json.loads(first_msg_str)
         except json.JSONDecodeError:
-            logger.error(f"[/ws] Malformed initial JSON: {first_msg_str!r}")
+            logger.error(f"[/game_was] Malformed initial JSON: {first_msg_str!r}")
             await ws.send_str(json.dumps({"status": "error", "message": "Malformed initial JSON."}))
             await ws.close()
             return ws
@@ -776,7 +776,7 @@ async def websocket_handler(request):
         sender_id = initial_data.get('sender_id')
 
         if not room_id or not sender_id:
-            logger.error(f"[/ws] Initial WS message missing room_id or sender_id: {initial_data}")
+            logger.error(f"[/game_was] Initial WS message missing room_id or sender_id: {initial_data}")
             await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
             await ws.close()
             return ws
@@ -785,13 +785,13 @@ async def websocket_handler(request):
         if room_id not in bot.ws_rooms:
             bot.ws_rooms[room_id] = set()
         bot.ws_rooms[room_id].add(ws)
-        logger.info(f"[/ws] Player {sender_id} connected to room {room_id}. "
+        logger.info(f"[/game_was] Player {sender_id} connected to room {room_id}. "
                     f"Now {len(bot.ws_rooms[room_id])} client(s).")
 
         # --- 4) Try to persist presence via MechanicsMain (non-fatal) ---
         mechanics_cog = bot.get_cog('MechanicsMain')
         if not mechanics_cog:
-            logger.error("[/ws] MechanicsMain cog not available; continuing without persistence.")
+            logger.error("[/game_was] MechanicsMain cog not available; continuing without persistence.")
             await ws.send_str(json.dumps({
                 "status": "warn",
                 "message": "Game mechanics temporarily unavailable; connected in ephemeral mode."
@@ -805,7 +805,7 @@ async def websocket_handler(request):
                 else:
                     await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
             except Exception as e:
-                logger.error(f"[/ws] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+                logger.error(f"[/game_was] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
                 await ws.send_str(json.dumps({
                     "status": "warn",
                     "message": "Persistence failed; operating in ephemeral mode."
@@ -825,16 +825,16 @@ async def websocket_handler(request):
                 continue
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"[/ws] Error for player {sender_id} in room {room_id}: {ws.exception()}")
+                logger.error(f"[/game_was] Error for player {sender_id} in room {room_id}: {ws.exception()}")
 
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
-                logger.info(f"[/ws] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
+                logger.info(f"[/game_was] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
                 break
 
     except asyncio.CancelledError:
-        logger.info(f"[/ws] WS for player {sender_id} in room {room_id} was cancelled.")
+        logger.info(f"[/game_was] WS for player {sender_id} in room {room_id} was cancelled.")
     except Exception as e:
-        logger.error(f"[/ws] Handler error for room {room_id}: {e}", exc_info=True)
+        logger.error(f"[/game_was] Handler error for room {room_id}: {e}", exc_info=True)
     finally:
         # --- 6) Cleanup: remove from in-memory registry ---
         try:
@@ -842,7 +842,7 @@ async def websocket_handler(request):
                 bot.ws_rooms[room_id].remove(ws)
                 if not bot.ws_rooms[room_id]:
                     del bot.ws_rooms[room_id]
-                logger.info(f"[/ws] Player {sender_id} disconnected from room {room_id}. "
+                logger.info(f"[/game_was] Player {sender_id} disconnected from room {room_id}. "
                             f"Now {len(bot.ws_rooms.get(room_id, set()))} client(s).")
         except Exception:
             pass
@@ -852,7 +852,7 @@ async def websocket_handler(request):
             if room_id and sender_id and mechanics_cog and presence_persisted:
                 await mechanics_cog.player_disconnect(room_id, sender_id)
         except Exception as e:
-            logger.error(f"[/ws] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+            logger.error(f"[/game_was] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
 
         return ws
 
@@ -1004,12 +1004,12 @@ async def start_web_server():
     # Health & probe
     bot.web_app.router.add_get('/healthz', health)
     logger.info("🛠️  Registered GET route: /healthz")
-    bot.web_app.router.add_get('/ws_probe', ws_probe)
-    logger.info("🛠️  Registered GET route: /ws_probe")
+    bot.web_app.router.add_get('/game_was_probe', game_was_probe)
+    logger.info("🛠️  Registered GET route: /game_was_probe")
 
     # WS endpoints
-    bot.web_app.router.add_get('/ws', websocket_handler)
-    logger.info("🛠️  Registered WebSocket route: /ws")
+    bot.web_app.router.add_get('/game_was', game_was_handler)
+    logger.info("🛠️  Registered WebSocket route: /game_was")
 
     bot.web_app.router.add_get('/chat_ws', chat_websocket_handler)  # Chat WS
     logger.info("🛠️  Registered WebSocket route: /chat_ws")

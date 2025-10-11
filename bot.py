@@ -683,11 +683,12 @@ async def chat_websocket_handler(request):
     return ws
 
 
-# ---------------------- GAME WS: /ws ----------------------
-
+# ---------------------- GAME WS: /ws (robust) ----------------------
 async def websocket_handler(request):
     """
-    Game WebSocket: registers a player's connection in a room via MechanicsMain.
+    Game WebSocket: registers a player's presence in a room via MechanicsMain.
+    - Robust initial handshake (waits for first TEXT frame; ignores ping/pong/binary/close).
+    - Does NOT hard-close on mechanics/DB failures; it warns the client and keeps the WS open.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -695,71 +696,129 @@ async def websocket_handler(request):
     logger.info("✅ [/ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
     room_id = None
-    sender_id = None # This will be the player's discord_id
+    sender_id = None
+    mechanics_cog = None
+    presence_persisted = False  # track whether player_connect succeeded
 
     try:
-        # Step 1: Receive the initial connection message to get room and player details.
-        first_msg = await ws.receive_str()
-        initial_data = json.loads(first_msg)
+        # --- 1) Robust initial handshake: wait for TEXT JSON ---
+        first_msg_str = None
+        while True:
+            msg = await ws.receive()
+
+            if msg.type == web.WSMsgType.TEXT:
+                first_msg_str = msg.data
+                break
+
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
+                continue  # ignore control frames until we get TEXT
+
+            elif msg.type == web.WSMsgType.BINARY:
+                logger.warning("[/ws] First frame was BINARY; ignoring and waiting for TEXT...")
+                continue
+
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info("[/ws] Client closed before sending initial TEXT handshake.")
+                await ws.close()
+                return ws
+
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"[/ws] WS error before handshake: {ws.exception()}")
+                await ws.close()
+                return ws
+
+        # --- 2) Parse JSON payload: expect room_id & sender_id ---
+        try:
+            initial_data = json.loads(first_msg_str)
+        except json.JSONDecodeError:
+            logger.error(f"[/ws] Malformed initial JSON: {first_msg_str!r}")
+            await ws.send_str(json.dumps({"status": "error", "message": "Malformed initial JSON."}))
+            await ws.close()
+            return ws
 
         room_id = initial_data.get('room_id')
         sender_id = initial_data.get('sender_id')
 
-        if not all([room_id, sender_id]):
-            logger.error(f"Initial WS message missing room_id or sender_id: {initial_data}")
+        if not room_id or not sender_id:
+            logger.error(f"[/ws] Initial WS message missing room_id or sender_id: {initial_data}")
             await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
             await ws.close()
             return ws
 
-        # Step 2: Add the WebSocket connection to the in-memory room registry.
+        # --- 3) Add to in-memory presence registry immediately ---
         if room_id not in bot.ws_rooms:
             bot.ws_rooms[room_id] = set()
         bot.ws_rooms[room_id].add(ws)
-        logger.info(f"Player {sender_id} WS connected to room {room_id}. Now {len(bot.ws_rooms[room_id])} client(s).")
+        logger.info(f"[/ws] Player {sender_id} connected to room {room_id}. "
+                    f"Now {len(bot.ws_rooms[room_id])} client(s).")
 
-        # Step 3: Get the MechanicsMain cog to handle the connection logic.
+        # --- 4) Try to persist presence via MechanicsMain (non-fatal) ---
         mechanics_cog = bot.get_cog('MechanicsMain')
         if not mechanics_cog:
-            logger.error("MechanicsMain cog not available.")
-            await ws.send_str(json.dumps({"status": "error", "message": "Game mechanics are currently unavailable."}))
-            await ws.close()
-            return ws
+            logger.error("[/ws] MechanicsMain cog not available; continuing without persistence.")
+            await ws.send_str(json.dumps({
+                "status": "warn",
+                "message": "Game mechanics temporarily unavailable; connected in ephemeral mode."
+            }))
+        else:
+            try:
+                ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id)
+                presence_persisted = bool(ok)
+                if not ok:
+                    await ws.send_str(json.dumps({"status": "warn", "message": msg_text or "Could not persist presence."}))
+                else:
+                    await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
+            except Exception as e:
+                logger.error(f"[/ws] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+                await ws.send_str(json.dumps({
+                    "status": "warn",
+                    "message": "Persistence failed; operating in ephemeral mode."
+                }))
 
-        # Step 4: Persist the player's connection in the database via the cog.
-        await mechanics_cog.player_connect(room_id, sender_id)
-
-        # Step 5: Listen for subsequent messages (e.g., ping/pong to keep alive).
+        # --- 5) Main receive loop: simple keepalive + future extensibility ---
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                # Keepalive ping/pong handler
-                if msg.data == '{"action":"ping"}':
+                # Keepalive support
+                if msg.data == '{"action":"ping"}' or msg.data.strip().lower() == 'ping':
                     await ws.send_str('{"action":"pong"}')
                     continue
-                # Other messages are ignored as this handler's role is just presence.
-            elif msg.type in (web.WSMsgType.ERROR, web.WSMsgType.CLOSE):
-                logger.info(f"Game WS closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
+                # (Extend here for future gameplay messages if needed)
+
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG, web.WSMsgType.BINARY):
+                # ignore; not used for gameplay yet
+                continue
+
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"[/ws] Error for player {sender_id} in room {room_id}: {ws.exception()}")
+
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info(f"[/ws] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
                 break
 
     except asyncio.CancelledError:
-        logger.info(f"Game WS for player {sender_id} in room {room_id} was cancelled.")
+        logger.info(f"[/ws] WS for player {sender_id} in room {room_id} was cancelled.")
     except Exception as e:
-        logger.error(f"Game WS handler error for room {room_id}: {e}", exc_info=True)
+        logger.error(f"[/ws] Handler error for room {room_id}: {e}", exc_info=True)
     finally:
-        # Step 6: Cleanup on disconnection.
-        # Remove from in-memory registry.
-        if room_id and ws in bot.ws_rooms.get(room_id, set()):
-            bot.ws_rooms[room_id].remove(ws)
-            if not bot.ws_rooms[room_id]:
-                del bot.ws_rooms[room_id]
-            logger.info(f"Player {sender_id} WS disconnected from room {room_id}. Now {len(bot.ws_rooms.get(room_id, set()))} client(s).")
+        # --- 6) Cleanup: remove from in-memory registry ---
+        try:
+            if room_id and ws in bot.ws_rooms.get(room_id, set()):
+                bot.ws_rooms[room_id].remove(ws)
+                if not bot.ws_rooms[room_id]:
+                    del bot.ws_rooms[room_id]
+                logger.info(f"[/ws] Player {sender_id} disconnected from room {room_id}. "
+                            f"Now {len(bot.ws_rooms.get(room_id, set()))} client(s).")
+        except Exception:
+            pass
 
-        # Persist the disconnection in the database via the cog.
-        if room_id and sender_id:
-            mechanics_cog = bot.get_cog('MechanicsMain')
-            if mechanics_cog:
+        # --- Persist disconnection (non-fatal) ---
+        try:
+            if room_id and sender_id and mechanics_cog and presence_persisted:
                 await mechanics_cog.player_disconnect(room_id, sender_id)
+        except Exception as e:
+            logger.error(f"[/ws] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
 
-    return ws
+        return ws
 
 # ---------------------- ADMIN WS: /admin_ws ----------------------
 

@@ -876,9 +876,9 @@ async def start_web_server():
     bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
 
     # WS endpoints
-    bot.web_app.router.add_get('/ws', websocket_handler)          # Game state WS
+    bot.web_app.router.add_get('/ws', websocket_handler)
     bot.web_app.router.add_get('/chat_ws', chat_websocket_handler) # Chat WS (Restored)
-    bot.web_app.router.add_get('/admin_ws', admin_ws_handler)     # Admin actions WS
+    bot.web_app.router.add_get('/admin_ws', admin_ws_handler)
 
     port = int(os.getenv("PORT", 8080))
     runner = web.AppRunner(bot.web_app)

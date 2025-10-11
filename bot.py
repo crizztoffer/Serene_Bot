@@ -638,6 +638,11 @@ async def websocket_handler(request):
 
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
+                # --- START: ADDED PING/PONG LOGIC ---
+                if msg.data == '{"action":"ping"}':
+                    await ws.send_str('{"action":"pong"}')
+                    continue
+                # --- END: ADDED PING/PONG LOGIC ---
                 try:
                     request_data = json.loads(msg.data)
                     request_data['room_id'] = room_id

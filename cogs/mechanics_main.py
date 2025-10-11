@@ -155,9 +155,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         Ensures guild_id is always present in the returned state.
         Fetches kekchipz for each player from discord_users table.
         """
+        logger.info(f"--- ENTERING _load_game_state for room '{room_id}' ---")
+        logger.info(f"Function called with client guild_id: {guild_id}, channel_id: {channel_id}")
         conn = None
         try:
             conn = await self._get_db_connection()
+            logger.info("Database connection successful for _load_game_state.")
             async with conn.cursor() as cursor:
                 # Use TRIM to handle potential whitespace issues in the database entry
                 await cursor.execute(
@@ -218,36 +221,47 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 game_state.setdefault('small_blind_amount', 5)
                 game_state.setdefault('big_blind_amount', 10)
                 
+                logger.info(f"LOGGING CONTEXTS - Client Guild ID from function arg: {guild_id} | Game State Guild ID from DB: {game_state.get('guild_id')}")
+                
                 # Fetch kekchipz for each player using guild_id instead of channel_id
                 # And refresh their display name and avatar from Discord
                 guild = self.bot.get_guild(int(guild_id)) if guild_id else None
+                logger.info(f"LOGGING GUILD OBJECT - Discord.py guild object created from CLIENT's guild_id ({guild_id}): {'Found' if guild else 'NOT FOUND'}")
+                
                 for player in game_state.get('players', []):
                     player_discord_id = player['discord_id']
-                    if game_state['guild_id'] and player_discord_id:
+
+                    db_guild_context = game_state.get('guild_id')
+                    logger.info(f"Processing player {player_discord_id} using guild context from DB game_state: {db_guild_context}")
+                    
+                    if db_guild_context and player_discord_id:
                         await cursor.execute(
                             "SELECT kekchipz FROM discord_users WHERE discord_id = %s AND guild_id = %s",
-                            (player_discord_id, game_state['guild_id'])
+                            (player_discord_id, db_guild_context)
                         )
                         kekchipz_result = await cursor.fetchone()
                         if kekchipz_result and 'kekchipz' in kekchipz_result:
                             player['kekchipz_overall'] = kekchipz_result['kekchipz']
-                            logger.debug(f"[_load_game_state] Fetched kekchipz {player['kekchipz_overall']} for player {player_discord_id}.")
+                            logger.info(f"Kekchipz found for player {player_discord_id} in guild {db_guild_context}.")
                         else:
                             player['kekchipz_overall'] = 0
-                            logger.warning(f"[_load_game_state] Kekchipz not found for player {player_discord_id} in guild {game_state['guild_id']}. Setting to 0.")
+                            logger.warning(f"Kekchipz NOT FOUND for player {player_discord_id} in guild {db_guild_context}. Setting to 0.")
                     else:
                         player['kekchipz_overall'] = 0
-                        logger.warning(f"[_load_game_state] Missing guild_id or discord_id for player {player_discord_id}. Cannot fetch kekchipz. Setting to 0.")
+                        logger.warning(f"Missing guild_id in game_state or discord_id for player. Cannot fetch kekchipz.")
     
                     # --- Refresh player name and avatar from Discord ---
                     if guild:
                         try:
+                            logger.info(f"Attempting to fetch member {player_discord_id} from guild {guild.id} (client's guild context)")
                             member = await guild.fetch_member(int(player_discord_id))
                             player['name'] = member.display_name
                             player['avatar_url'] = str(member.avatar.url) if member.avatar else str(member.default_avatar.url)
-                            logger.debug(f"[_load_game_state] Refreshed Discord info for player {player_discord_id}: {player['name']}")
+                            logger.info(f"Successfully refreshed Discord info for player {player_discord_id}.")
                         except Exception as e:
-                            logger.warning(f"Could not refresh member info for {player_discord_id} from Discord: {e}. Using stored data.")
+                            logger.error(f"FAILED to refresh member info for {player_discord_id} from client's guild {guild.id}: {e}. This may be expected if the player is not in the viewing server.")
+                    else:
+                        logger.warning("Discord.py guild object is None, skipping member info refresh.")
                     # --- End refresh ---
     
                     player.setdefault('total_chips', 1000)
@@ -257,11 +271,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     player.setdefault('hand_revealed', False)  # Backwards compatibility
     
             await conn.commit()  # Commit after all read operations
+            logger.info(f"--- EXITING _load_game_state for room '{room_id}' ---")
             return game_state
     
         except Exception as e:
-            logger.error(f"Error loading game state for room {room_id}: {e}", exc_info=True)
-            # Rollback if an error occurs
+            logger.error(f"!!! CRITICAL ERROR in _load_game_state for room {room_id}: {e}", exc_info=True)
             if conn:
                 await conn.rollback()
             raise

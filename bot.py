@@ -36,20 +36,40 @@ intents.message_content = True
 intents.members = True
 intents.presences = True
 
+# Logging setup
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# --- Access logging middleware (logs ALL HTTP requests, including 404s) ---
+@web.middleware
+async def access_log_mw(request, handler):
+    start = time.time()
+    try:
+        resp = await handler(request)
+    except web.HTTPException as ex:
+        elapsed = (time.time() - start) * 1000
+        logging.info(f"HTTP {request.method} {request.path_qs} -> {ex.status} in {elapsed:.1f}ms from {request.remote}")
+        raise
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        logging.error(f"HTTP {request.method} {request.path_qs} -> 500 in {elapsed:.1f}ms from {request.remote}: {e}", exc_info=True)
+        raise
+    else:
+        elapsed = (time.time() - start) * 1000
+        status = getattr(resp, "status", 0)
+        logging.info(f"HTTP {request.method} {request.path_qs} -> {status} in {elapsed:.1f}ms from {request.remote}")
+        return resp
+
 bot = commands.Bot(command_prefix=BOT_PREFIX, intents=intents)
 
-# Attach aiohttp app so cogs can add routes if they want
-bot.web_app = web.Application()
+# Attach aiohttp app with middleware so cogs can add routes if they want
+bot.web_app = web.Application(middlewares=[access_log_mw])
 
 # ---- CRUCIAL: create /serene group BEFORE loading cogs ----
 serene_group = app_commands.Group(name="serene", description="The main Serene bot commands.")
 bot.tree.add_command(serene_group)
 # Optional: expose it so cogs can fetch it directly if they prefer
 bot.serene_group = serene_group
-
-# Logging setup
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 # --- WebSocket room registries (game state & chat) ---
 bot.ws_rooms = {}
@@ -599,7 +619,15 @@ async def settings_saved_handler(request):
         if conn:
             conn.close()
 
-# ---------------------- CHAT WS: /chat_ws (NEW) ----------------------
+# ---------------------- Health & Probe endpoints ----------------------
+
+async def health(_):
+    return web.json_response({"ok": True, "ts": int(time.time())})
+
+async def ws_probe(_):
+    return web.Response(text="WS endpoint is here; use WebSocket upgrade.", status=426)
+
+# ---------------------- CHAT WS: /chat_ws (current) ----------------------
 async def chat_websocket_handler(request):
     """
     Handles chat WebSocket connections for game lobbies and rooms.
@@ -678,20 +706,28 @@ async def chat_websocket_handler(request):
                     try:
                         await client_ws.send_str(json.dumps(leave_message))
                     except Exception:
-                        pass # Ignore errors for clients that might have disconnected simultaneously
+                        pass  # Ignore errors for clients that might have disconnected simultaneously
 
     return ws
 
 
-# ---------------------- GAME WS: /ws (robust) ----------------------
+# ---------------------- GAME WS: /ws (robust + loud logs) ----------------------
 async def websocket_handler(request):
     """
     Game WebSocket: registers a player's presence in a room via MechanicsMain.
     - Robust initial handshake (waits for first TEXT frame; ignores ping/pong/binary/close).
     - Does NOT hard-close on mechanics/DB failures; it warns the client and keeps the WS open.
+    - Loud logs before/after prepare() to confirm upgrade attempts.
     """
+    logger.info("[/ws] HTTP request received from %s (will attempt WS upgrade)", request.remote)
+
     ws = web.WebSocketResponse()
-    await ws.prepare(request)
+    try:
+        ok = await ws.prepare(request)
+        logger.info("[/ws] prepare() returned %s — upgrade %s", ok, "OK" if ok else "FAILED")
+    except Exception as e:
+        logger.error(f"[/ws] prepare() raised: {e}", exc_info=True)
+        return web.Response(text="Upgrade failed", status=400)
 
     logger.info("✅ [/ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
@@ -965,11 +1001,17 @@ async def start_web_server():
     bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
     logger.info("🛠️  Registered POST route: /settings_saved")
 
+    # Health & probe
+    bot.web_app.router.add_get('/healthz', health)
+    logger.info("🛠️  Registered GET route: /healthz")
+    bot.web_app.router.add_get('/ws_probe', ws_probe)
+    logger.info("🛠️  Registered GET route: /ws_probe")
+
     # WS endpoints
     bot.web_app.router.add_get('/ws', websocket_handler)
     logger.info("🛠️  Registered WebSocket route: /ws")
 
-    bot.web_app.router.add_get('/chat_ws', chat_websocket_handler)  # Chat WS (Restored)
+    bot.web_app.router.add_get('/chat_ws', chat_websocket_handler)  # Chat WS
     logger.info("🛠️  Registered WebSocket route: /chat_ws")
 
     bot.web_app.router.add_get('/admin_ws', admin_ws_handler)

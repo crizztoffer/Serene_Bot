@@ -493,7 +493,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 await ws.send_str(msg)
             except Exception as e:
                 logger.error(f"broadcast error to room {rid}: {e}", exc_info=True)
-
+    
     # ---- Helpers for turns/betting/flow ----
     def _get_sorted_players(self, state: dict):
         seated = [p for p in state.get('players', []) if p.get('seat_id')]
@@ -533,8 +533,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _apply_blinds(self, state: dict):
         sorted_players = self._get_sorted_players(state)
         n = len(sorted_players)
-        if n == 0:
+
+        # NEW: No blinds when fewer than 2 seated players
+        if n < 2:
+            state['current_round_min_bet'] = 0
+            state['last_aggressive_action_player_id'] = None
             return
+
         dealer = state['dealer_button_position']
         sb_idx = (dealer + 1) % n
         bb_idx = (dealer + 2) % n
@@ -549,18 +554,16 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             sb['total_chips'] -= a
             sb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # Important fix: do NOT set has_acted_in_round here
+            # do NOT set has_acted_in_round
 
         if bb:
             a = min(bb_amt, bb['total_chips'])
             bb['total_chips'] -= a
             bb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # Important fix: do NOT set has_acted_in_round here
+            # do NOT set has_acted_in_round
 
         state['current_round_min_bet'] = bb['current_bet_in_round'] if bb else 0
-
-        # BB is the initial aggressor preflop; others must respond until action completes back to BB
         state['last_aggressive_action_player_id'] = bb['discord_id'] if bb else None
 
         # Write back mutated players
@@ -609,10 +612,23 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return state
 
     def _check_round_completion(self, state: dict) -> bool:
-        active = [p for p in state['players'] if not p.get('folded', False)]
-        if len(active) <= 1:
+        # Consider only seated, non-folded players
+        active = [p for p in state['players'] if p.get('seat_id') and not p.get('folded', False)]
+
+        # No actors → complete
+        if len(active) == 0:
             return True
-        highest = max([p.get('current_bet_in_round', 0) for p in active], default=0)
+
+        # Exactly one actor: complete only if they've acted and there's nothing to call,
+        # or they are out of chips.
+        if len(active) == 1:
+            p = active[0]
+            to_call = (state.get('current_round_min_bet', 0) -
+                       p.get('current_bet_in_round', 0))
+            return p.get('has_acted_in_round', False) and (to_call <= 0 or p.get('total_chips', 0) == 0)
+
+        # 2+ actors: everyone acted and all bets are matched (or player is all-in)
+        highest = max((x.get('current_bet_in_round', 0) for x in active), default=0)
         for p in active:
             if not p.get('has_acted_in_round', False):
                 return False

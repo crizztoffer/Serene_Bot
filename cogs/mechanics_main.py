@@ -96,6 +96,52 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not hasattr(self.bot, "ws_rooms") or self.bot.ws_rooms is None:
             self.bot.ws_rooms = {}
 
+    # ------------------------------ NEW: WS room registration helpers ------------------------------
+    def _normalize_room_id(self, room_id: str) -> str:
+        """Trim and validate a room id. Returns normalized id or raises ValueError."""
+        if room_id is None:
+            raise ValueError("room_id missing")
+        rid = str(room_id).strip()
+        if not rid or rid.upper() == "N/A":
+            raise ValueError(f"invalid room_id: {room_id!r}")
+        return rid
+
+    def register_ws_connection(self, ws, room_id: str):
+        """
+        Call this from your WS router *after* parsing the first handshake JSON ({room_id, sender_id}).
+        This binds the socket to a single room bucket.
+        """
+        try:
+            rid = self._normalize_room_id(room_id)
+        except Exception as e:
+            logger.warning(f"register_ws_connection refused invalid room: {room_id!r} ({e})")
+            return False
+        rooms = getattr(self.bot, "ws_rooms", None)
+        if rooms is None:
+            self.bot.ws_rooms = {}
+            rooms = self.bot.ws_rooms
+        rooms.setdefault(rid, set()).add(ws)
+        # Attach for clean removal on close
+        setattr(ws, "_assigned_room", rid)
+        logger.info(f"[ws] bound connection {id(ws)} to room {rid}")
+        return True
+
+    def unregister_ws_connection(self, ws):
+        """
+        Call this in your WS router when the socket closes.
+        Ensures it is removed from its assigned room set.
+        """
+        rooms = getattr(self.bot, "ws_rooms", None)
+        room = getattr(ws, "_assigned_room", None)
+        if not rooms or not room:
+            return
+        bucket = rooms.get(room)
+        if bucket is not None:
+            bucket.discard(ws)
+            if not bucket:
+                rooms.pop(room, None)
+        logger.info(f"[ws] unbound connection {id(ws)} from room {room}")
+
     async def cog_load(self):
         logger.info("MechanicsMain cog loaded.")
 
@@ -110,7 +156,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         - Log presence; return (ok, message).
         """
         try:
-            logger.info(f"[player_connect] {sender_id} connected to room {room_id}.")
+            rid = self._normalize_room_id(room_id)
+            logger.info(f"[player_connect] {sender_id} connected to room {rid}.")
             return True, "presence recorded"
         except Exception as e:
             logger.error(f"[player_connect] error: {e}", exc_info=True)
@@ -118,7 +165,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def player_disconnect(self, room_id: str, sender_id: str):
         try:
-            logger.info(f"[player_disconnect] {sender_id} disconnected from room {room_id}.")
+            rid = self._normalize_room_id(room_id)
+            logger.info(f"[player_disconnect] {sender_id} disconnected from room {rid}.")
             return True, "presence removed"
         except Exception as e:
             logger.error(f"[player_disconnect] error: {e}", exc_info=True)
@@ -142,15 +190,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _load_game_state(self, room_id: str, guild_id: str = None, channel_id: str = None) -> dict:
         conn = None
         try:
+            rid = self._normalize_room_id(room_id)
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 await cursor.execute(
                     "SELECT game_state FROM bot_game_rooms WHERE TRIM(room_id) = %s",
-                    (room_id.strip(),)
+                    (rid,)
                 )
                 row = await cursor.fetchone()
                 if row and row['game_state']:
                     state = json.loads(row['game_state'])
+                    # Ensure state is stamped to the *requested* room id (hardening)
+                    state['room_id'] = rid
                     if 'guild_id' not in state or state['guild_id'] is None:
                         state['guild_id'] = guild_id
                     if 'channel_id' not in state or state['channel_id'] is None:
@@ -160,7 +211,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     deck = Deck()
                     deck.build(); deck.shuffle()
                     state = {
-                        'room_id': room_id,
+                        'room_id': rid,
                         'current_round': 'pre_game',
                         'players': [],
                         'dealer_hand': [],
@@ -231,7 +282,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not isinstance(state, dict):
             logger.error("Attempted to save non-dict game_state.")
             return
-        rid = (state.get("room_id") or room_id or "").strip()
+        rid = self._normalize_room_id(state.get("room_id") or room_id)
         js = json.dumps(state)
         conn = None
         try:
@@ -327,6 +378,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return True, "River dealt.", state
 
     async def evaluate_hands(self, room_id: str, state: dict):
+        # Guard: only evaluate from river
         if state['current_round'] != 'river':
             return False, f"Cannot evaluate from {state['current_round']}.", state
 
@@ -383,6 +435,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 "winners": winners
             }
         }
+        # Authoritative timer set here for showdown intermission
         state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
 
         # Payout
@@ -413,23 +466,33 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         return True, "Hands evaluated.", state
 
-    # ---- Broadcast ----
+    # ---- Broadcast (room-scoped; prevents cross-room leakage) ----
     async def broadcast_game_state(self, room_id: str, state: dict):
-        if not hasattr(self.bot, "ws_rooms") or self.bot.ws_rooms is None:
-            self.bot.ws_rooms = {}
-        if room_id not in self.bot.ws_rooms:
-            self.bot.ws_rooms[room_id] = set()
-    
+        try:
+            rid = self._normalize_room_id(room_id or state.get("room_id"))
+        except Exception as e:
+            logger.warning(f"broadcast refused invalid room id: {room_id!r} ({e})")
+            return
+
+        # Ensure the state is stamped with the normalized room id
+        state['room_id'] = rid
+
+        rooms = getattr(self.bot, "ws_rooms", None) or {}
+        bucket = rooms.get(rid, set())
+        if not bucket:
+            return
+
         envelope = {
-            "game_state": state,
-            "server_ts": int(time.time())   # NEW: server epoch seconds
+            "room_id": rid,               # <= lets the client drop frames from other rooms
+            "server_ts": int(time.time()),# <= client-side drift handling / countdown
+            "game_state": state
         }
         msg = json.dumps(envelope)
-        for ws in list(self.bot.ws_rooms[room_id]):
+        for ws in list(bucket):
             try:
                 await ws.send_str(msg)
             except Exception as e:
-                logger.error(f"broadcast error to room {room_id}: {e}", exc_info=True)
+                logger.error(f"broadcast error to room {rid}: {e}", exc_info=True)
 
     # ---- Helpers for turns/betting/flow ----
     def _get_sorted_players(self, state: dict):
@@ -462,44 +525,45 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state['timer_end_time'] = None
             state['current_player_turn_index'] = -1
             return state
+
+        # Authoritative per-turn timer
         state['timer_end_time'] = int(time.time()) + self.PLAYER_TURN_TIME
         return state
 
     async def _apply_blinds(self, state: dict):
         sorted_players = self._get_sorted_players(state)
         n = len(sorted_players)
-        if n == 0: 
+        if n == 0:
             return
         dealer = state['dealer_button_position']
         sb_idx = (dealer + 1) % n
         bb_idx = (dealer + 2) % n
         sb_amt = state.get('small_blind_amount', 5)
         bb_amt = state.get('big_blind_amount', 10)
-    
+
         sb = sorted_players[sb_idx] if n > sb_idx else None
         bb = sorted_players[bb_idx] if n > bb_idx else None
-    
+
         if sb:
             a = min(sb_amt, sb['total_chips'])
             sb['total_chips'] -= a
             sb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # DO NOT set sb['has_acted_in_round'] here
-    
+            # Important fix: do NOT set has_acted_in_round here
+
         if bb:
             a = min(bb_amt, bb['total_chips'])
             bb['total_chips'] -= a
             bb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # DO NOT set bb['has_acted_in_round'] here
-    
+            # Important fix: do NOT set has_acted_in_round here
+
         state['current_round_min_bet'] = bb['current_bet_in_round'] if bb else 0
-    
-        # Important: BB is the initial aggressor preflop, so others must still respond,
-        # and the round only completes after action has returned to BB.
+
+        # BB is the initial aggressor preflop; others must respond until action completes back to BB
         state['last_aggressive_action_player_id'] = bb['discord_id'] if bb else None
-    
-        # write back mutated players
+
+        # Write back mutated players
         for i, p in enumerate(state['players']):
             if sb and p['discord_id'] == sb['discord_id']:
                 state['players'][i] = sb
@@ -507,6 +571,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 state['players'][i] = bb
 
     async def _start_betting_round(self, room_id: str, state: dict):
+        # Reset per-round flags (but not total_chips)
         for p in state['players']:
             if not p.get('folded', False):
                 p['current_bet_in_round'] = 0
@@ -586,50 +651,65 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         sender   = request_data.get('sender_id')
         channel  = request_data.get('channel_id')
 
+        # Strict field checks
         if not all([action, room_id, sender]):
             logger.warning(f"WS action missing fields: {request_data}")
             return
 
         try:
-            state = await self._load_game_state(room_id, guild_id, channel)
+            rid = self._normalize_room_id(room_id)
+            state = await self._load_game_state(rid, guild_id, channel)
+
+            # Defensive: stamp the normalized rid into state (prevents accidental cross-room writes)
+            state['room_id'] = rid
 
             mutating = {"add_player", "leave_player", "start_new_round_pre_flop", "player_action", "auto_action_timeout"}
 
             if action == "get_state":
                 ok, msg = True, "state"
+
             elif action == "add_player":
                 pdata = request_data.get('player_data')
                 if not isinstance(pdata, dict):
                     return
-                ok, msg, state = await self._add_player_to_game(room_id, pdata, state, guild_id, channel)
+                ok, msg, state = await self._add_player_to_game(rid, pdata, state, guild_id, channel)
+
             elif action == "leave_player":
                 pid = request_data.get('discord_id')
                 if not pid: return
-                ok, msg, state = await self._leave_player(room_id, pid, state)
+                ok, msg, state = await self._leave_player(rid, pid, state)
+
             elif action == "start_new_round_pre_flop":
+                # Only allow from pre_game or showdown to avoid overwriting mid-hand states
                 if state.get('current_round') in ['pre_game', 'showdown']:
-                    ok, msg, state = await self._start_new_round_pre_flop(room_id, state, guild_id, channel)
+                    ok, msg, state = await self._start_new_round_pre_flop(rid, state, guild_id, channel)
                     if ok and not state.get('game_started_once', False):
                         state['game_started_once'] = True
                 else:
+                    # Ignore illegal transitions rather than clobbering state
+                    logger.info(f"start_new_round_pre_flop ignored from round {state.get('current_round')}")
                     return
+
             elif action == "player_action":
                 pid = request_data.get('player_id')
                 at  = request_data.get('action_type')
                 amt = request_data.get('amount', 0)
                 if not all([pid, at]): return
-                ok, msg, state = await self._handle_player_action(room_id, pid, at, amt, state)
+                ok, msg, state = await self._handle_player_action(rid, pid, at, amt, state)
+
             elif action == "auto_action_timeout":
                 pid = request_data.get('player_id')
                 if not pid: return
-                ok, msg, state = await self._auto_action_on_timeout(room_id, pid, state)
+                ok, msg, state = await self._auto_action_on_timeout(rid, pid, state)
+
             else:
                 return
 
             if ok:
                 if action in mutating:
-                    await self._save_game_state(room_id, state)
-                await self.broadcast_game_state(room_id, state)
+                    await self._save_game_state(rid, state)
+                await self.broadcast_game_state(rid, state)
+
         except Exception as e:
             logger.error(f"handle_websocket_game_action error: {e}", exc_info=True)
             raise
@@ -733,6 +813,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not cur or cur['discord_id'] != player_id:
             return False, "Not your turn.", state
 
+        # Server-authoritative timeout check
         if int(time.time()) < state.get('timer_end_time', 0):
             return False, "Turn has not timed out yet.", state
 
@@ -768,6 +849,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return state
 
     async def _add_player_to_game(self, room_id: str, pdata: dict, state: dict, guild_id: str = None, channel_id: str = None):
+        # Ensure this add applies to the intended room only
+        try:
+            rid = self._normalize_room_id(room_id)
+        except Exception as e:
+            return False, str(e), state
+
+        state['room_id'] = rid
         players = state.get('players', [])
         pid = pdata['discord_id']
         name = pdata['name']
@@ -781,6 +869,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 return False, f"Player {name} is already in {seat_id}.", state
             if existing.get('seat_id'):
                 return False, f"Player {name} is already seated elsewhere.", state
+            if any(p.get('seat_id') == seat_id for p in players):
+                return False, f"Seat {seat_id} is occupied.", state
             existing['seat_id'] = seat_id
             existing['name'] = name
             existing['avatar_url'] = pdata.get('avatar_url')
@@ -822,6 +912,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return False, "Player not found.", state
 
     async def _start_new_game(self, room_id: str, state: dict, guild_id: str = None, channel_id: str = None):
+        try:
+            rid = self._normalize_room_id(room_id)
+        except Exception as e:
+            return False, str(e), state
+
+        state['room_id'] = rid
         deck = Deck(); deck.build(); deck.shuffle()
         state.update({
             'current_round': 'pre_flop',

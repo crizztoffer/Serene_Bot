@@ -75,6 +75,24 @@ bot.serene_group = serene_group
 bot.ws_rooms = {}
 bot.chat_ws_rooms = {}
 
+# --- Online session tracking for kekchipz rewards ---
+# { (guild_id:int, user_id:int): {"start": float_unix, "last_award": float_unix} }
+online_sessions = {}
+
+def _kekchipz_rate_for_minute(online_minutes: int) -> int:
+    """
+    Per-minute reward rate based on continuous online time.
+    0–15 min: 10/min
+    15–60 min: 25/min
+    60+ min: 50/min
+    """
+    if online_minutes < 15:
+        return 10
+    elif online_minutes < 60:
+        return 25
+    else:
+        return 50
+
 # ---------------- Utility helpers ----------------
 
 def _slugify_channel_name(name: str) -> str:
@@ -735,6 +753,7 @@ async def game_was_handler(request):
 
     room_id = None
     sender_id = None
+    guild_id = None  # <- NEW: capture guild_id from client
     mechanics_cog = None
     presence_persisted = False  # track whether player_connect succeeded
 
@@ -765,7 +784,7 @@ async def game_was_handler(request):
                 await ws.close()
                 return ws
 
-        # --- 2) Parse JSON payload: expect room_id & sender_id ---
+        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id recommended) ---
         try:
             initial_data = json.loads(first_msg_str)
         except json.JSONDecodeError:
@@ -776,6 +795,7 @@ async def game_was_handler(request):
 
         room_id = initial_data.get('room_id')
         sender_id = initial_data.get('sender_id')
+        guild_id = initial_data.get('guild_id')  # recommend client include this
 
         if not room_id or not sender_id:
             logger.error(f"[/game_was] Initial WS message missing room_id or sender_id: {initial_data}")
@@ -812,6 +832,13 @@ async def game_was_handler(request):
                     "status": "warn",
                     "message": "Persistence failed; operating in ephemeral mode."
                 }))
+
+        # --- NEW: set current_room_id in DB if we know guild_id ---
+        if presence_persisted and guild_id:
+            try:
+                await set_current_room_id(int(guild_id), int(sender_id), str(room_id))
+            except Exception as e:
+                logger.warning(f"Could not set current_room_id for user {sender_id}: {e}")
 
         # --- 5) Main receive loop: keepalive + DISPATCH GAME ACTIONS ---
         async for msg in ws:
@@ -885,6 +912,13 @@ async def game_was_handler(request):
                 await mechanics_cog.player_disconnect(room_id, sender_id)
         except Exception as e:
             logger.error(f"[/game_was] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+
+        # --- NEW: clear current_room_id if it still matches this room ---
+        try:
+            if presence_persisted and room_id and sender_id and guild_id:
+                await clear_current_room_if_matches(int(guild_id), int(sender_id), str(room_id))
+        except Exception as e:
+            logger.error(f"Failed to clear current_room_id for {sender_id}: {e}")
 
         return ws
 
@@ -1100,6 +1134,14 @@ async def on_ready():
             if not member.bot:
                 await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
 
+    # Start reward loop (kekchipz)
+    try:
+        if not award_kekchipz_loop.is_running():
+            award_kekchipz_loop.start()
+            logger.info("✅ Started award_kekchipz_loop")
+    except Exception as e:
+        logger.error(f"Failed to start award_kekchipz_loop: {e}")
+
     # Post rules embed if missing (startup)
     conn_on_ready = None
     try:
@@ -1170,6 +1212,15 @@ async def on_command_error(ctx, error):
         logger.error(f"Command error: {error}")
         await ctx.send(f"Unexpected error: {error}")
 
+# NEW: reset continuous session if user goes offline/invisible
+@bot.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    if after.bot:
+        return
+    key = (after.guild.id, after.id)
+    if after.status == discord.Status.offline:
+        online_sessions.pop(key, None)
+
 @tasks.loop(hours=1)
 async def hourly_db_check():
     conn = None
@@ -1189,12 +1240,85 @@ async def hourly_db_check():
         if conn:
             conn.close()
 
+# ---------------------- Rewards loop ----------------------
+
+@tasks.loop(seconds=60)
+async def award_kekchipz_loop():
+    """
+    Every minute, iterate all guild members and award kekchipz to those currently online.
+    Tiers:
+      0–15 min: +10/min
+      15–60 min: +25/min
+      60+ min: +50/min
+    Resets when user goes offline.
+    """
+    now = time.time()
+    increments = {}  # {(guild_id, user_id): delta}
+
+    for guild in bot.guilds:
+        for member in guild.members:
+            if member.bot:
+                continue
+
+            # Consider online, idle, dnd as "online"
+            if member.status not in (discord.Status.online, discord.Status.idle, discord.Status.dnd):
+                online_sessions.pop((guild.id, member.id), None)
+                continue
+
+            key = (guild.id, member.id)
+            sess = online_sessions.get(key)
+            if not sess:
+                online_sessions[key] = {"start": now, "last_award": now}
+                continue
+
+            start_ts = sess["start"]
+            last_award_ts = sess["last_award"]
+            minutes_due = int((now - last_award_ts) // 60)
+            if minutes_due <= 0:
+                continue
+
+            # Cap catch-up to avoid huge spikes if the loop stalls
+            minutes_to_process = min(minutes_due, 10)
+            delta = 0
+
+            for i in range(minutes_to_process):
+                online_minutes = int((last_award_ts - start_ts) // 60) + i
+                delta += _kekchipz_rate_for_minute(online_minutes)
+
+            increments[key] = increments.get(key, 0) + delta
+            online_sessions[key]["last_award"] = last_award_ts + (minutes_to_process * 60)
+
+    if not increments:
+        return
+
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            for (guild_id, user_id), add_amount in increments.items():
+                try:
+                    await cursor.execute(
+                        "UPDATE discord_users SET kekchipz = kekchipz + %s WHERE guild_id = %s AND discord_id = %s",
+                        (add_amount, str(guild_id), str(user_id))
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update kekchipz for {user_id} in {guild_id}: {e}")
+    except Exception as e:
+        logger.error(f"DB error during award_kekchipz_loop: {e}")
+    finally:
+        if conn:
+            conn.close()
+
 # ---------------------- DB helper methods ----------------
 
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     """
     Ensure a user exists in discord_users. On first insert, also capture their current roles
     and store them in role_data as JSON: {"roles": ["<role_id>", ...]} (excluding @everyone).
+    Also initializes current_room_id to NULL (meaning: not in any room).
     """
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
@@ -1241,11 +1365,11 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
                 role_data_json = json.dumps({"roles": role_ids})
 
                 await cursor.execute(
-                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data) "
-                    "VALUES (%s, %s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json)
+                    "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data, current_room_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json, None)  # None -> NULL
                 )
-                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz and role_data={role_data_json}.")
+                logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz, role_data={role_data_json}, current_room_id=NULL.")
     except Exception as e:
         logger.error(f"DB error in add_user_to_db_if_not_exists: {e}")
     finally:
@@ -1253,6 +1377,58 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             conn.close()
 
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
+
+async def set_current_room_id(guild_id: int, user_id: int, room_id: Optional[str]):
+    """
+    Sets current_room_id; pass None to clear (NULL).
+    """
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "UPDATE discord_users SET current_room_id = %s "
+                "WHERE guild_id = %s AND discord_id = %s",
+                (room_id, str(guild_id), str(user_id))
+            )
+    except Exception as e:
+        logger.error(f"set_current_room_id DB error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+async def clear_current_room_if_matches(guild_id: int, user_id: int, room_id: str):
+    """
+    Clears current_room_id back to NULL if it still equals room_id.
+    Protects against multi-tab races.
+    """
+    conn = None
+    try:
+        conn = await aiomysql.connect(
+            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
+            db="serene_users", charset='utf8mb4', autocommit=True,
+            cursorclass=aiomysql.cursors.DictCursor
+        )
+        async with conn.cursor() as cursor:
+            await cursor.execute(
+                "SELECT current_room_id FROM discord_users WHERE guild_id=%s AND discord_id=%s",
+                (str(guild_id), str(user_id))
+            )
+            row = await cursor.fetchone()
+            if row and row.get("current_room_id") == room_id:
+                await cursor.execute(
+                    "UPDATE discord_users SET current_room_id = NULL "
+                    "WHERE guild_id = %s AND discord_id = %s",
+                    (str(guild_id), str(user_id))
+                )
+    except Exception as e:
+        logger.error(f"clear_current_room_if_matches DB error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
     """

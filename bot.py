@@ -82,16 +82,24 @@ online_sessions = {}
 def _kekchipz_rate_for_minute(online_minutes: int) -> int:
     """
     Per-minute reward rate based on continuous online time.
-    0–15 min: 10/min
-    15–60 min: 25/min
-    60+ min: 50/min
+
+    < 30 min:        1/min
+    30–59 min:       2/min
+    60–89 min:       3/min
+    90–119 min:      4/min
+    120–179 min:     4/min
+    180+ min:        5/min
     """
-    if online_minutes < 15:
-        return 10
+    if online_minutes < 30:
+        return 1
     elif online_minutes < 60:
-        return 25
+        return 2
+    elif online_minutes < 90:
+        return 3
+    elif online_minutes < 180:
+        return 4
     else:
-        return 50
+        return 5
 
 # ---------------- Utility helpers ----------------
 
@@ -1255,9 +1263,12 @@ async def award_kekchipz_loop():
     """
     Every minute, iterate all guild members and award kekchipz to those currently online.
     Tiers:
-      0–15 min: +10/min
-      15–60 min: +25/min
-      60+ min: +50/min
+      < 30 min:        +1/min
+      30–59 min:       +2/min
+      60–89 min:       +3/min
+      90–119 min:      +4/min
+      120–179 min:     +4/min
+      180+ min:        +5/min
     Resets when user goes offline.
     """
     now = time.time()

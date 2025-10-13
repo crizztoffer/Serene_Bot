@@ -753,7 +753,7 @@ async def game_was_handler(request):
 
     room_id = None
     sender_id = None
-    guild_id = None  # <- NEW: capture guild_id from client
+    guild_id = None  # captured from client payload if provided
     mechanics_cog = None
     presence_persisted = False  # track whether player_connect succeeded
 
@@ -784,7 +784,7 @@ async def game_was_handler(request):
                 await ws.close()
                 return ws
 
-        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id recommended) ---
+        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id optional) ---
         try:
             initial_data = json.loads(first_msg_str)
         except json.JSONDecodeError:
@@ -820,25 +820,34 @@ async def game_was_handler(request):
             }))
         else:
             try:
-                ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id)
+                # MechanicsMain should handle DB side-effects like current_room_id
+                ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id, guild_id=guild_id)
                 presence_persisted = bool(ok)
                 if not ok:
                     await ws.send_str(json.dumps({"status": "warn", "message": msg_text or "Could not persist presence."}))
                 else:
                     await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
+            except TypeError:
+                # Backward-compat if cog doesn't accept guild_id kwarg
+                try:
+                    ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id)
+                    presence_persisted = bool(ok)
+                    if not ok:
+                        await ws.send_str(json.dumps({"status": "warn", "message": msg_text or "Could not persist presence."}))
+                    else:
+                        await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
+                except Exception as e:
+                    logger.error(f"[/game_was] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+                    await ws.send_str(json.dumps({
+                        "status": "warn",
+                        "message": "Persistence failed; operating in ephemeral mode."
+                    }))
             except Exception as e:
                 logger.error(f"[/game_was] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
                 await ws.send_str(json.dumps({
                     "status": "warn",
                     "message": "Persistence failed; operating in ephemeral mode."
                 }))
-
-        # --- NEW: set current_room_id in DB if we know guild_id ---
-        if presence_persisted and guild_id:
-            try:
-                await set_current_room_id(int(guild_id), int(sender_id), str(room_id))
-            except Exception as e:
-                logger.warning(f"Could not set current_room_id for user {sender_id}: {e}")
 
         # --- 5) Main receive loop: keepalive + DISPATCH GAME ACTIONS ---
         async for msg in ws:
@@ -867,6 +876,8 @@ async def game_was_handler(request):
                             # Ensure room_id/sender context is present if the client omitted it on subsequent frames
                             data.setdefault("room_id", room_id)
                             data.setdefault("sender_id", sender_id)
+                            if guild_id is not None:
+                                data.setdefault("guild_id", guild_id)
 
                             await mechanics_cog.handle_websocket_game_action(data)
                         except Exception as e:
@@ -909,16 +920,13 @@ async def game_was_handler(request):
         # --- Persist disconnection (non-fatal) ---
         try:
             if room_id and sender_id and mechanics_cog and presence_persisted:
-                await mechanics_cog.player_disconnect(room_id, sender_id)
+                # MechanicsMain should clear DB-side state (e.g., current_room_id) as needed
+                try:
+                    await mechanics_cog.player_disconnect(room_id, sender_id, guild_id=guild_id)
+                except TypeError:
+                    await mechanics_cog.player_disconnect(room_id, sender_id)
         except Exception as e:
             logger.error(f"[/game_was] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
-
-        # --- NEW: clear current_room_id if it still matches this room ---
-        try:
-            if presence_persisted and room_id and sender_id and guild_id:
-                await clear_current_room_if_matches(int(guild_id), int(sender_id), str(room_id))
-        except Exception as e:
-            logger.error(f"Failed to clear current_room_id for {sender_id}: {e}")
 
         return ws
 
@@ -1212,7 +1220,7 @@ async def on_command_error(ctx, error):
         logger.error(f"Command error: {error}")
         await ctx.send(f"Unexpected error: {error}")
 
-# NEW: reset continuous session if user goes offline/invisible
+# reset continuous session if user goes offline/invisible
 @bot.event
 async def on_presence_update(before: discord.Member, after: discord.Member):
     if after.bot:
@@ -1312,7 +1320,7 @@ async def award_kekchipz_loop():
         if conn:
             conn.close()
 
-# ---------------------- DB helper methods ----------------
+# ---------------------- DB helper methods ----------------------
 
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     """
@@ -1377,58 +1385,6 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             conn.close()
 
 bot.add_user_to_db_if_not_exists = add_user_to_db_if_not_exists
-
-async def set_current_room_id(guild_id: int, user_id: int, room_id: Optional[str]):
-    """
-    Sets current_room_id; pass None to clear (NULL).
-    """
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
-            db="serene_users", charset='utf8mb4', autocommit=True
-        )
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "UPDATE discord_users SET current_room_id = %s "
-                "WHERE guild_id = %s AND discord_id = %s",
-                (room_id, str(guild_id), str(user_id))
-            )
-    except Exception as e:
-        logger.error(f"set_current_room_id DB error: {e}")
-    finally:
-        if conn:
-            conn.close()
-
-async def clear_current_room_if_matches(guild_id: int, user_id: int, room_id: str):
-    """
-    Clears current_room_id back to NULL if it still equals room_id.
-    Protects against multi-tab races.
-    """
-    conn = None
-    try:
-        conn = await aiomysql.connect(
-            host=DB_HOST, user=DB_USER, password=DB_PASSWORD,
-            db="serene_users", charset='utf8mb4', autocommit=True,
-            cursorclass=aiomysql.cursors.DictCursor
-        )
-        async with conn.cursor() as cursor:
-            await cursor.execute(
-                "SELECT current_room_id FROM discord_users WHERE guild_id=%s AND discord_id=%s",
-                (str(guild_id), str(user_id))
-            )
-            row = await cursor.fetchone()
-            if row and row.get("current_room_id") == room_id:
-                await cursor.execute(
-                    "UPDATE discord_users SET current_room_id = NULL "
-                    "WHERE guild_id = %s AND discord_id = %s",
-                    (str(guild_id), str(user_id))
-                )
-    except Exception as e:
-        logger.error(f"clear_current_room_if_matches DB error: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 async def post_and_save_embed(guild_id, rules_json_bytes, rules_channel_id):
     """

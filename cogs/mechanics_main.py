@@ -10,7 +10,10 @@ from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
 
-# --- Texas Hold'em Hand Evaluation Logic ---
+# --- Texas/Casino Hold'em Hand Evaluation Logic ---
+# NOTE: This implementation adjudicates players vs. a **dealer hand** (Casino Hold’em style).
+# If you want true Texas Hold’em (players competing only vs each other), remove the dealer logic
+# in evaluate_hands() and compare players against players (and add side pots).
 HAND_RANKINGS = {
     "High Card": 0,
     "One Pair": 1,
@@ -24,9 +27,16 @@ HAND_RANKINGS = {
     "Royal Flush": 9
 }
 
-def get_rank_value(rank):
+def get_rank_value(rank: str) -> int:
+    """
+    Map rank string to numeric value.
+    This implementation expects '0' to represent Ten (10).
+    Valid ranks: '2'..'9', '0' (Ten), 'J','Q','K','A'
+    """
     if rank.isdigit():
-        if rank == '0': return 10
+        # '0' is Ten
+        if rank == '0':
+            return 10
         return int(rank)
     return {'J': 11, 'Q': 12, 'K': 13, 'A': 14}.get(rank, 0)
 
@@ -34,19 +44,22 @@ def evaluate_poker_hand(cards):
     def rank_value(card): return get_rank_value(card.rank)
 
     def is_straight(ranks):
+        # ranks: list[int]
         ranks = sorted(set(ranks), reverse=True)
+        # Wheel straight A-2-3-4-5
         if {14, 2, 3, 4, 5}.issubset(set(ranks)):
             return True, 5
         for i in range(len(ranks) - 4):
-            w = ranks[i:i+5]
-            if all(w[j] - w[j+1] == 1 for j in range(4)):
-                return True, w[0]
+            window = ranks[i:i+5]
+            if all(window[j] - window[j+1] == 1 for j in range(4)):
+                return True, window[0]
         return False, None
 
     def classify(hand):
         ranks = sorted([rank_value(c) for c in hand], reverse=True)
         suits = [c.suit[0].upper() for c in hand]
         rank_counts = {r: ranks.count(r) for r in set(ranks)}
+        # Sort by (count desc, rank desc)
         cg = sorted(rank_counts.items(), key=lambda x: (-x[1], -x[0]))
         grouped = [r for r, _ in cg]
 
@@ -54,23 +67,30 @@ def evaluate_poker_hand(cards):
         straight, hi = is_straight(ranks)
 
         if flush and straight:
-            if hi == 14:  # A-high straight flush
+            if hi == 14:
                 return "Royal Flush", (HAND_RANKINGS["Royal Flush"],)
             return "Straight Flush", (HAND_RANKINGS["Straight Flush"], hi)
         if cg[0][1] == 4:
+            # Four of a kind + kicker
             return "Four of a Kind", (HAND_RANKINGS["Four of a Kind"], cg[0][0], grouped[1])
         if cg[0][1] == 3 and cg[1][1] >= 2:
+            # Full house: trips rank, then pair rank
             return "Full House", (HAND_RANKINGS["Full House"], cg[0][0], cg[1][0])
         if flush:
+            # Flush tiebreak: kickers high-to-low
             return "Flush", (HAND_RANKINGS["Flush"], *ranks)
         if straight:
             return "Straight", (HAND_RANKINGS["Straight"], hi)
         if cg[0][1] == 3:
+            # Trips + two kickers
             return "Three of a Kind", (HAND_RANKINGS["Three of a Kind"], cg[0][0], *grouped[1:3])
         if cg[0][1] == 2 and cg[1][1] == 2:
+            # Two pair: high pair, low pair, kicker
             return "Two Pair", (HAND_RANKINGS["Two Pair"], cg[0][0], cg[1][0], grouped[2])
         if cg[0][1] == 2:
+            # One pair + three kickers
             return "One Pair", (HAND_RANKINGS["One Pair"], cg[0][0], *grouped[1:4])
+        # High card: five kickers
         return "High Card", (HAND_RANKINGS["High Card"], *ranks)
 
     best_name, best_score = "", (-1,)
@@ -96,7 +116,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not hasattr(self.bot, "ws_rooms") or self.bot.ws_rooms is None:
             self.bot.ws_rooms = {}
 
-    # ------------------------------ NEW: WS room registration helpers ------------------------------
+    # ------------------------------ WS room registration helpers ------------------------------
     def _normalize_room_id(self, room_id: str) -> str:
         """Trim and validate a room id. Returns normalized id or raises ValueError."""
         if room_id is None:
@@ -107,10 +127,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return rid
 
     def register_ws_connection(self, ws, room_id: str):
-        """
-        Call this from your WS router *after* parsing the first handshake JSON ({room_id, sender_id}).
-        This binds the socket to a single room bucket.
-        """
+        """Bind a socket to a room bucket (called after handshake)."""
         try:
             rid = self._normalize_room_id(room_id)
         except Exception as e:
@@ -121,16 +138,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             self.bot.ws_rooms = {}
             rooms = self.bot.ws_rooms
         rooms.setdefault(rid, set()).add(ws)
-        # Attach for clean removal on close
         setattr(ws, "_assigned_room", rid)
         logger.info(f"[ws] bound connection {id(ws)} to room {rid}")
         return True
 
     def unregister_ws_connection(self, ws):
-        """
-        Call this in your WS router when the socket closes.
-        Ensures it is removed from its assigned room set.
-        """
+        """Unbind a socket from its room (called on close)."""
         rooms = getattr(self.bot, "ws_rooms", None)
         room = getattr(ws, "_assigned_room", None)
         if not rooms or not room:
@@ -150,11 +163,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # ---- Presence hooks used by /game_was (handshake) ----
     async def player_connect(self, room_id: str, sender_id: str):
-        """
-        Optional persistence for presence. Current behavior:
-        - No DB writes (keeps it fast).
-        - Log presence; return (ok, message).
-        """
+        """Presence note: fast/no DB write. Return (ok, message)."""
         try:
             rid = self._normalize_room_id(room_id)
             logger.info(f"[player_connect] {sender_id} connected to room {rid}.")
@@ -200,7 +209,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 row = await cursor.fetchone()
                 if row and row['game_state']:
                     state = json.loads(row['game_state'])
-                    # Ensure state is stamped to the *requested* room id (hardening)
                     state['room_id'] = rid
                     if 'guild_id' not in state or state['guild_id'] is None:
                         state['guild_id'] = guild_id
@@ -231,7 +239,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         'channel_id': channel_id
                     }
 
-                # Back-compat fields
+                # Back-compat & defaults
                 state.setdefault('current_player_turn_index', -1)
                 state.setdefault('current_betting_round_pot', 0)
                 state.setdefault('current_round_min_bet', 0)
@@ -268,6 +276,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     p.setdefault('has_acted_in_round', False)
                     p.setdefault('folded', False)
                     p.setdefault('hand_revealed', False)
+                    p.setdefault('is_spectating', False)
+                    p.setdefault('is_all_in', False)
 
             await conn.commit()
             return state
@@ -288,7 +298,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                q = "UPDATE bot_game_rooms SET game_state = %s WHERE TRIM(room_id) = %s"
+                q = "UPDATE bot_game_rooms SET game_state = %s, last_activity = NOW() WHERE TRIM(room_id) = %s"
                 await cursor.execute(q, (js, rid))
                 if cursor.rowcount == 0:
                     raise ValueError(f"Game room '{rid}' not found for update.")
@@ -303,16 +313,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # ---- Dealing helpers ----
     async def deal_hole_cards(self, room_id: str, state: dict):
-        if not state.get('players'):
-            return False, "No players in the game to deal cards.", state
+        players_in_hand = [p for p in state.get('players', []) if p.get('seat_id') and not p.get('is_spectating')]
+        if not players_in_hand:
+            return False, "No active players to deal cards to.", state
 
         deck = Deck(state.get('deck', []))
         if state['current_round'] == 'pre_game' or not deck.cards:
             deck.build(); deck.shuffle()
 
-        for p in state.get('players', []):
+        for p in players_in_hand:
             p['hand'] = []
             p['folded'] = False
+            p['is_all_in'] = False
             p['current_bet_in_round'] = 0
             p['has_acted_in_round'] = False
             c1, c2 = deck.deal_card(), deck.deal_card()
@@ -346,11 +358,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             board.append(c.to_output_format())
         state['deck'] = deck.to_output_format()
         state['board_cards'] = board
-        state['current_round'] = "flop"
         return True, "Flop dealt.", state
 
     async def deal_turn(self, room_id: str, state: dict):
-        if state['current_round'] != 'flop':
+        if state['current_round'] != 'pre-turn':
             return False, f"Cannot deal turn from {state['current_round']}.", state
         deck = Deck(state.get('deck', []))
         board = state.get('board_cards', [])
@@ -360,11 +371,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         board.append(c.to_output_format())
         state['deck'] = deck.to_output_format()
         state['board_cards'] = board
-        state['current_round'] = "turn"
         return True, "Turn dealt.", state
 
     async def deal_river(self, room_id: str, state: dict):
-        if state['current_round'] != 'turn':
+        if state['current_round'] != 'pre-river':
             return False, f"Cannot deal river from {state['current_round']}.", state
         deck = Deck(state.get('deck', []))
         board = state.get('board_cards', [])
@@ -374,18 +384,16 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         board.append(c.to_output_format())
         state['deck'] = deck.to_output_format()
         state['board_cards'] = board
-        state['current_round'] = "river"
         return True, "River dealt.", state
 
     async def evaluate_hands(self, room_id: str, state: dict):
-        # Guard: only evaluate from river
-        if state['current_round'] != 'river':
+        if state['current_round'] != 'pre-showdown':
             return False, f"Cannot evaluate from {state['current_round']}.", state
 
         players = state.get('players', [])
         board = [Card.from_output_format(c) for c in state.get('board_cards', [])]
         dealer = [Card.from_output_format(c) for c in state.get('dealer_hand', [])]
-        active = [p for p in players if not p.get('folded', False)]
+        active = [p for p in players if not p.get('folded', False) and not p.get('is_spectating')]
         if len(board) != 5:
             return False, "Board not complete.", state
 
@@ -425,7 +433,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         winning_hand_name = evals[0]['hand_type'] if winners and evals else d_name
 
-        state['current_round'] = "showdown"
         state['last_evaluation'] = {
             "dealer_evaluation": dealer_eval,
             "evaluations": evals,
@@ -435,10 +442,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 "winners": winners
             }
         }
-        # Authoritative timer set here for showdown intermission
-        state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
-
-        # Payout
+        
+        # Payout (single pot; no side pots)
         if winners:
             pot = state.get('current_betting_round_pot', 0)
             per = pot // max(1, len(winners))
@@ -466,7 +471,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         return True, "Hands evaluated.", state
 
-    # ---- Broadcast (room-scoped; prevents cross-room leakage) ----
+    # ---- Broadcast (room-scoped; drop dead sockets) ----
     async def broadcast_game_state(self, room_id: str, state: dict):
         try:
             rid = self._normalize_room_id(room_id or state.get("room_id"))
@@ -474,45 +479,55 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             logger.warning(f"broadcast refused invalid room id: {room_id!r} ({e})")
             return
 
-        # Ensure the state is stamped with the normalized room id
         state['room_id'] = rid
-
         rooms = getattr(self.bot, "ws_rooms", None) or {}
         bucket = rooms.get(rid, set())
         if not bucket:
             return
 
         envelope = {
-            "room_id": rid,               # <= lets the client drop frames from other rooms
-            "server_ts": int(time.time()),# <= client-side drift handling / countdown
+            "room_id": rid,
+            "server_ts": int(time.time()),
             "game_state": state
         }
         msg = json.dumps(envelope)
+        to_drop = []
         for ws in list(bucket):
             try:
                 await ws.send_str(msg)
             except Exception as e:
                 logger.error(f"broadcast error to room {rid}: {e}", exc_info=True)
-    
+                to_drop.append(ws)
+        # Cleanup failed sockets so we don't spam errors forever
+        for ws in to_drop:
+            try:
+                bucket.discard(ws)
+            except Exception:
+                pass
+        if not bucket:
+            rooms.pop(rid, None)
+
     # ---- Helpers for turns/betting/flow ----
-    def _get_sorted_players(self, state: dict):
+    def _get_sorted_players(self, state: dict, active_only: bool = False):
         seated = [p for p in state.get('players', []) if p.get('seat_id')]
+        if active_only:
+            seated = [p for p in seated if not p.get('is_spectating', False)]
         return sorted(seated, key=lambda p: int(p['seat_id'].replace('seat_', '')))
 
     def _get_next_active_player_index(self, state: dict, current_index: int) -> int:
-        sorted_players = self._get_sorted_players(state)
+        sorted_players = self._get_sorted_players(state, active_only=True)
         n = len(sorted_players)
         if n == 0: return -1
         start = (current_index + 1) % n if current_index != -1 else 0
         for i in range(n):
             idx = (start + i) % n
             p = sorted_players[idx]
-            if not p.get('folded', False) and p.get('total_chips', 0) > 0:
+            if not p.get('folded', False) and not p.get('is_all_in', False) and p.get('total_chips', 0) > 0:
                 return idx
         return -1
 
     async def _start_player_turn(self, room_id: str, state: dict):
-        sorted_players = self._get_sorted_players(state)
+        sorted_players = self._get_sorted_players(state, active_only=True)
         idx = state['current_player_turn_index']
         if not sorted_players:
             state['timer_end_time'] = None
@@ -526,15 +541,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state['current_player_turn_index'] = -1
             return state
 
-        # Authoritative per-turn timer
         state['timer_end_time'] = int(time.time()) + self.PLAYER_TURN_TIME
         return state
 
     async def _apply_blinds(self, state: dict):
-        sorted_players = self._get_sorted_players(state)
+        sorted_players = self._get_sorted_players(state, active_only=True)
         n = len(sorted_players)
 
-        # NEW: No blinds when fewer than 2 seated players
         if n < 2:
             state['current_round_min_bet'] = 0
             state['last_aggressive_action_player_id'] = None
@@ -554,19 +567,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             sb['total_chips'] -= a
             sb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # do NOT set has_acted_in_round
 
         if bb:
             a = min(bb_amt, bb['total_chips'])
             bb['total_chips'] -= a
             bb['current_bet_in_round'] += a
             state['current_betting_round_pot'] += a
-            # do NOT set has_acted_in_round
 
-        state['current_round_min_bet'] = bb['current_bet_in_round'] if bb else 0
+        # Defensive: if BB was effectively all-in for 0 (rare), don't regress min bet.
+        bb_current = bb['current_bet_in_round'] if bb else 0
+        state['current_round_min_bet'] = max(state.get('current_round_min_bet', 0), bb_current)
         state['last_aggressive_action_player_id'] = bb['discord_id'] if bb else None
 
-        # Write back mutated players
         for i, p in enumerate(state['players']):
             if sb and p['discord_id'] == sb['discord_id']:
                 state['players'][i] = sb
@@ -574,15 +586,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 state['players'][i] = bb
 
     async def _start_betting_round(self, room_id: str, state: dict):
-        # Reset per-round flags (but not total_chips)
         for p in state['players']:
-            if not p.get('folded', False):
+            if not p.get('folded', False) and not p.get('is_spectating'):
                 p['current_bet_in_round'] = 0
                 p['has_acted_in_round'] = False
         state['current_round_min_bet'] = 0
         state['last_aggressive_action_player_id'] = None
 
-        sorted_players = self._get_sorted_players(state)
+        sorted_players = self._get_sorted_players(state, active_only=True)
         n = len(sorted_players)
         if n == 0: return state
 
@@ -602,72 +613,82 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state = await self._advance_game_phase(room_id, state)
         return state
 
-    async def _end_betting_round(self, room_id: str, state: dict):
-        for p in state['players']:
-            state['current_betting_round_pot'] += p['current_bet_in_round']
-            p['current_bet_in_round'] = 0
-            p['has_acted_in_round'] = False
-        state['current_round_min_bet'] = 0
-        state['last_aggressive_action_player_id'] = None
-        return state
-
     def _check_round_completion(self, state: dict) -> bool:
-        # Consider only seated, non-folded players
-        active = [p for p in state['players'] if p.get('seat_id') and not p.get('folded', False)]
+        active = [p for p in state['players'] if p.get('seat_id')
+                  and not p.get('folded', False)
+                  and not p.get('is_spectating')]
 
-        # No actors → complete
-        if len(active) == 0:
+        if len(active) <= 1:
             return True
 
-        # Exactly one actor: complete only if they've acted and there's nothing to call,
-        # or they are out of chips.
-        if len(active) == 1:
-            p = active[0]
-            to_call = (state.get('current_round_min_bet', 0) -
-                       p.get('current_bet_in_round', 0))
-            return p.get('has_acted_in_round', False) and (to_call <= 0 or p.get('total_chips', 0) == 0)
-
-        # 2+ actors: everyone acted and all bets are matched (or player is all-in)
         highest = max((x.get('current_bet_in_round', 0) for x in active), default=0)
         for p in active:
+            # Treat all-in as "acted" and not required to match further
+            if p.get('is_all_in', False):
+                continue
             if not p.get('has_acted_in_round', False):
                 return False
             if p.get('current_bet_in_round', 0) < highest and p.get('total_chips', 0) > 0:
                 return False
         return True
 
+    # REWRITTEN STATE MACHINE
     async def _advance_game_phase(self, room_id: str, state: dict):
-        state = await self._end_betting_round(room_id, state)
-        nxt = None
-        if state['current_round'] == 'pre_flop':
-            ok, _, state = await self.deal_flop(room_id, state); nxt = 'flop'
-        elif state['current_round'] == 'flop':
-            ok, _, state = await self.deal_turn(room_id, state); nxt = 'turn'
-        elif state['current_round'] == 'turn':
-            ok, _, state = await self.deal_river(room_id, state); nxt = 'river'
-        elif state['current_round'] == 'river':
-            ok, _, state = await self.evaluate_hands(room_id, state); nxt = 'showdown'
-        elif state['current_round'] == 'showdown':
-            ok, _, state = await self._start_new_round_pre_flop(room_id, state, state['guild_id'], state['channel_id']); nxt = 'pre_flop'
-        else:
-            ok = False
+        current_round = state['current_round']
+        logger.info(f"Attempting to advance from round: {current_round}")
 
-        if not ok:
-            return state
+        while True:
+            last_round = state['current_round']
 
-        if nxt in ['pre_flop', 'flop', 'turn', 'river']:
-            state = await self._start_betting_round(room_id, state)
+            if state['current_round'] == 'pre_flop':
+                ok, _, state = await self.deal_flop(room_id, state)
+                if ok: state['current_round'] = 'flop'
+
+            elif state['current_round'] == 'flop':
+                state['current_round'] = 'pre-turn'
+                state = await self._start_betting_round(room_id, state)
+
+            elif state['current_round'] == 'pre-turn':
+                ok, _, state = await self.deal_turn(room_id, state)
+                if ok: state['current_round'] = 'turn'
+
+            elif state['current_round'] == 'turn':
+                state['current_round'] = 'pre-river'
+                state = await self._start_betting_round(room_id, state)
+
+            elif state['current_round'] == 'pre-river':
+                ok, _, state = await self.deal_river(room_id, state)
+                if ok: state['current_round'] = 'river'
+            
+            elif state['current_round'] == 'river':
+                state['current_round'] = 'pre-showdown'
+                state = await self._start_betting_round(room_id, state)
+
+            elif state['current_round'] == 'pre-showdown':
+                ok, _, state = await self.evaluate_hands(room_id, state)
+                if ok: state['current_round'] = 'showdown'
+
+            elif state['current_round'] == 'showdown':
+                state['current_round'] = 'post-showdown'
+                state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
+            
+            # Stop chaining if we reached a state that waits for input/timer
+            if state['current_round'] == last_round or \
+               state['current_round'] in ['pre-turn', 'pre-river', 'pre-showdown', 'post-showdown'] or \
+               (state['current_round'] == 'pre_flop' and not state.get('game_started_once')):
+                break
+        
+        logger.info(f"Advanced to round: {state['current_round']}")
         return state
 
     # ---- WS Action entrypoint (used by /game_was loop) ----
     async def handle_websocket_game_action(self, request_data: dict):
-        action   = request_data.get('action')
-        room_id  = request_data.get('room_id')
-        guild_id = request_data.get('guild_id')
-        sender   = request_data.get('sender_id')
-        channel  = request_data.get('channel_id')
+        action     = request_data.get('action')
+        room_id    = request_data.get('room_id')
+        guild_id   = request_data.get('guild_id')
+        sender     = request_data.get('sender_id')
+        channel    = request_data.get('channel_id')
 
-        # Strict field checks
         if not all([action, room_id, sender]):
             logger.warning(f"WS action missing fields: {request_data}")
             return
@@ -675,20 +696,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             rid = self._normalize_room_id(room_id)
             state = await self._load_game_state(rid, guild_id, channel)
-
-            # Defensive: stamp the normalized rid into state (prevents accidental cross-room writes)
             state['room_id'] = rid
-
             mutating = {"add_player", "leave_player", "start_new_round_pre_flop", "player_action", "auto_action_timeout"}
+            ok, msg = False, ""
 
             if action == "get_state":
                 ok, msg = True, "state"
 
             elif action == "add_player":
                 pdata = request_data.get('player_data')
-                if not isinstance(pdata, dict):
-                    return
-                ok, msg, state = await self._add_player_to_game(rid, pdata, state, guild_id, channel)
+                if not isinstance(pdata, dict): return
+                ok, msg, state = await self._add_player_to_game(rid, pdata, state)
 
             elif action == "leave_player":
                 pid = request_data.get('discord_id')
@@ -696,13 +714,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 ok, msg, state = await self._leave_player(rid, pid, state)
 
             elif action == "start_new_round_pre_flop":
-                # Only allow from pre_game or showdown to avoid overwriting mid-hand states
-                if state.get('current_round') in ['pre_game', 'showdown']:
+                if state.get('current_round') in ['pre_game', 'post-showdown']:
                     ok, msg, state = await self._start_new_round_pre_flop(rid, state, guild_id, channel)
                     if ok and not state.get('game_started_once', False):
                         state['game_started_once'] = True
                 else:
-                    # Ignore illegal transitions rather than clobbering state
                     logger.info(f"start_new_round_pre_flop ignored from round {state.get('current_round')}")
                     return
 
@@ -735,12 +751,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if state is None:
             return False, "Internal error", state
 
-        sorted_players = self._get_sorted_players(state)
+        sorted_players = self._get_sorted_players(state, active_only=True)
         p = next((x for x in state['players'] if x['discord_id'] == player_id), None)
         if not p:
             return False, "Player not found in game.", state
 
-        cur = sorted_players[state['current_player_turn_index']] if state['current_player_turn_index'] != -1 and len(sorted_players) > state['current_player_turn_index'] else None
+        cur_idx = state['current_player_turn_index']
+        cur = sorted_players[cur_idx] if cur_idx != -1 and len(sorted_players) > cur_idx else None
+        
         if not cur or cur['discord_id'] != player_id:
             return False, "It's not your turn.", state
         if p.get('folded', False):
@@ -753,9 +771,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             p['folded'] = True
             p['has_acted_in_round'] = True
             ok, msg = True, f"{p['name']} folded."
-            if len([x for x in state['players'] if x.get('seat_id')]) == 1:
-                state = await self._handle_single_player_fold(room_id, state)
-                return True, msg, state
 
         elif action_type == 'check':
             if to_call > 0:
@@ -764,25 +779,30 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             ok, msg = True, f"{p['name']} checked."
 
         elif action_type == 'call':
-            bet = min(to_call, p['total_chips'])
+            bet = min(max(0, to_call), p['total_chips'])
             p['total_chips'] -= bet
             p['current_bet_in_round'] += bet
             p['has_acted_in_round'] = True
-            ok, msg = True, f"{p['name']} called ${bet}." if bet >= to_call else f"{p['name']} called and is All-In with ${bet}."
+            if p['total_chips'] == 0:
+                p['is_all_in'] = True
+            ok, msg = True, f"{p['name']} called ${bet}."
 
         elif action_type in ('bet', 'raise'):
+            # amount here is the additional amount to put in now (not total)
             if amount <= to_call:
                 return False, f"Bet/Raise must exceed ${to_call}.", state
             if p['total_chips'] < amount:
                 return False, f"Not enough chips to bet/raise ${amount}.", state
             p['total_chips'] -= amount
             p['current_bet_in_round'] += amount
-            state['current_round_min_bet'] = p['current_bet_in_round']
+            state['current_round_min_bet'] = max(state['current_round_min_bet'], p['current_bet_in_round'])
             state['last_aggressive_action_player_id'] = player_id
             for x in state['players']:
-                if x['discord_id'] != player_id and not x.get('folded', False):
+                if x['discord_id'] != player_id and not x.get('folded', False) and not x.get('is_spectating'):
                     x['has_acted_in_round'] = False
             p['has_acted_in_round'] = True
+            if p['total_chips'] == 0:
+                p['is_all_in'] = True
             ok, msg = True, f"{p['name']} {action_type}d ${amount}."
 
         elif action_type == 'all_in':
@@ -791,15 +811,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 return False, "You have no chips to go all-in.", state
             p['total_chips'] = 0
             p['current_bet_in_round'] += amt
+            p['is_all_in'] = True
             if p['current_bet_in_round'] > state['current_round_min_bet']:
                 state['current_round_min_bet'] = p['current_bet_in_round']
                 state['last_aggressive_action_player_id'] = player_id
                 for x in state['players']:
-                    if x['discord_id'] != player_id and not x.get('folded', False):
+                    if x['discord_id'] != player_id and not x.get('folded', False) and not x.get('is_spectating'):
                         x['has_acted_in_round'] = False
             p['has_acted_in_round'] = True
-            ok, msg = True, f"{p['name']} went All-In with ${amt}!"
-
+            ok, msg = True, f"{p['name']} went All-In!"
         else:
             return False, "Invalid action.", state
 
@@ -817,135 +837,101 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return ok, msg, state
 
     async def _auto_action_on_timeout(self, room_id: str, player_id: str, state: dict = None):
-        if state is None:
-            return False, "Internal error", state
-
-        sorted_players = self._get_sorted_players(state)
-        p = next((x for x in state['players'] if x['discord_id'] == player_id), None)
-        if not p:
-            return False, "Player not found.", state
-
-        cur = sorted_players[state['current_player_turn_index']] if state['current_player_turn_index'] != -1 and len(sorted_players) > state['current_player_turn_index'] else None
-        if not cur or cur['discord_id'] != player_id:
-            return False, "Not your turn.", state
-
-        # Server-authoritative timeout check
+        # Guard: only act after timer expiry
         if int(time.time()) < state.get('timer_end_time', 0):
             return False, "Turn has not timed out yet.", state
+        
+        to_call = state.get('current_round_min_bet', 0) - next((p.get('current_bet_in_round',0) for p in state['players'] if p['discord_id'] == player_id), 0)
+        action = 'check' if to_call <= 0 else 'fold'
+        return await self._handle_player_action(room_id, player_id, action, 0, state)
 
-        to_call = state.get('current_round_min_bet', 0) - p.get('current_bet_in_round', 0)
-        if to_call > 0:
-            p['folded'] = True
-            p['hand_revealed'] = True
-            msg = f"{p['name']} automatically folded."
-        else:
-            p['has_acted_in_round'] = True
-            msg = f"{p['name']} automatically checked."
-
-        if self._check_round_completion(state):
-            state = await self._advance_game_phase(room_id, state)
-        else:
-            nxt = self._get_next_active_player_index(state, state['current_player_turn_index'])
-            if nxt != -1:
-                state['current_player_turn_index'] = nxt
-                state = await self._start_player_turn(room_id, state)
-            else:
-                state = await self._advance_game_phase(room_id, state)
-        return True, msg, state
-
-    async def _handle_single_player_fold(self, room_id: str, state: dict):
-        if state['current_round'] == 'flop':
-            _, _, state = await self.deal_turn(room_id, state)
-            _, _, state = await self.deal_river(room_id, state)
-        elif state['current_round'] == 'turn':
-            _, _, state = await self.deal_river(room_id, state)
-        state['current_round'] = "showdown"
-        state['last_evaluation'] = {"winning_info": {"message": "You folded. Revealing dealer hand and board."}}
-        state['timer_end_time'] = int(time.time()) + self.POST_SHOWDOWN_TIME
-        return state
-
-    async def _add_player_to_game(self, room_id: str, pdata: dict, state: dict, guild_id: str = None, channel_id: str = None):
-        # Ensure this add applies to the intended room only
-        try:
-            rid = self._normalize_room_id(room_id)
-        except Exception as e:
-            return False, str(e), state
-
-        state['room_id'] = rid
-        players = state.get('players', [])
+    async def _add_player_to_game(self, room_id: str, pdata: dict, state: dict):
         pid = pdata['discord_id']
         name = pdata['name']
         seat_id = pdata.get('seat_id')
-        if not seat_id:
-            return False, "Seat ID is required.", state
+        guild_id = state.get('guild_id')
+        if not all([pid, name, seat_id, guild_id]):
+            return False, "Missing player data for join.", state
+        
+        # Prevent multi-game join using current_room_id
+        conn = None
+        try:
+            conn = await self._get_db_connection()
+            async with conn.cursor() as cursor:
+                await cursor.execute("SELECT current_room_id FROM discord_users WHERE discord_id = %s AND guild_id = %s", (pid, guild_id))
+                res = await cursor.fetchone()
+                if res and res.get('current_room_id') and res['current_room_id'] != room_id:
+                    return False, "You are already in another game.", state
 
-        existing = next((p for p in players if p['discord_id'] == pid), None)
-        if existing:
-            if existing.get('seat_id') == seat_id:
-                return False, f"Player {name} is already in {seat_id}.", state
-            if existing.get('seat_id'):
-                return False, f"Player {name} is already seated elsewhere.", state
-            if any(p.get('seat_id') == seat_id for p in players):
-                return False, f"Seat {seat_id} is occupied.", state
-            existing['seat_id'] = seat_id
-            existing['name'] = name
-            existing['avatar_url'] = pdata.get('avatar_url')
-        else:
-            if any(p.get('seat_id') == seat_id for p in players):
-                return False, f"Seat {seat_id} is occupied.", state
+                # Add to table state
+                players = state.get('players', [])
+                if any(p.get('seat_id') == seat_id for p in players):
+                    return False, f"Seat {seat_id} is occupied.", state
+                if any(p.get('discord_id') == pid for p in players):
+                    return False, "You are already in this game.", state
 
-            guild = self.bot.get_guild(int(guild_id)) if guild_id else None
-            avatar_url = None
-            if guild:
-                try:
-                    m = await guild.fetch_member(int(pid))
-                    name = m.display_name
-                    avatar_url = str(m.avatar.url) if m.avatar else str(m.default_avatar.url)
-                except Exception:
-                    pass
+                is_spectator = state.get('current_round') != 'pre_game'
+                
+                players.append({
+                    'discord_id': pid, 'name': name, 'seat_id': seat_id, 'avatar_url': pdata.get('avatar_url'),
+                    'total_chips': 1000, 'hand': [], 'current_bet_in_round': 0, 'has_acted_in_round': False,
+                    'folded': is_spectator, 'hand_revealed': False, 'kekchipz_overall': 0, 'is_spectating': is_spectator,
+                    'is_all_in': False
+                })
+                state['players'] = players
 
-            players.append({
-                'discord_id': pid,
-                'name': name,
-                'hand': [],
-                'seat_id': seat_id,
-                'avatar_url': avatar_url,
-                'total_chips': 1000,
-                'current_bet_in_round': 0,
-                'has_acted_in_round': False,
-                'folded': False,
-                'hand_revealed': False,
-                'kekchipz_overall': 0
-            })
-        state['players'] = players
+                await cursor.execute("UPDATE discord_users SET current_room_id = %s WHERE discord_id = %s AND guild_id = %s", (room_id, pid, guild_id))
+            await conn.commit()
+        except Exception as e:
+            if conn: await conn.rollback()
+            logger.error(f"_add_player_to_game DB error: {e}", exc_info=True)
+            return False, "Database error while adding player.", state
+        finally:
+            if conn: conn.close()
+
+        # Auto-start game when first player sits (keeps your previous behavior)
+        seated = self._get_sorted_players(state)
+        if len(seated) >= 1 and state['current_round'] == 'pre_game':
+            logger.info(f"First player sat down in room {room_id}, starting game.")
+            return await self._start_new_round_pre_flop(room_id, state, state.get('guild_id'), state.get('channel_id'))
+
         return True, "Player added.", state
 
     async def _leave_player(self, room_id: str, discord_id: str, state: dict):
-        before = len(state.get('players', []))
-        state['players'] = [p for p in state.get('players', []) if p['discord_id'] != discord_id]
-        if len(state['players']) < before:
-            return True, "Player left.", state
-        return False, "Player not found.", state
+        players = state.get('players', [])
+        player_to_remove = next((p for p in players if p['discord_id'] == discord_id), None)
+
+        if not player_to_remove:
+            return False, "Player not found.", state
+        
+        # Forfeit any bet to pot
+        state['current_betting_round_pot'] += player_to_remove.get('current_bet_in_round', 0)
+        state['players'] = [p for p in players if p['discord_id'] != discord_id]
+
+        # Clear multi-game status
+        conn = None
+        try:
+            conn = await self._get_db_connection()
+            async with conn.cursor() as cursor:
+                await cursor.execute(
+                    "UPDATE discord_users SET current_room_id = NULL WHERE discord_id = %s AND guild_id = %s",
+                    (discord_id, state.get('guild_id'))
+                )
+            await conn.commit()
+        except Exception as e:
+            if conn: await conn.rollback()
+            logger.error(f"_leave_player DB error: {e}", exc_info=True)
+        finally:
+            if conn: conn.close()
+
+        return True, "Player left.", state
 
     async def _start_new_game(self, room_id: str, state: dict, guild_id: str = None, channel_id: str = None):
-        try:
-            rid = self._normalize_room_id(room_id)
-        except Exception as e:
-            return False, str(e), state
-
-        state['room_id'] = rid
         deck = Deck(); deck.build(); deck.shuffle()
         state.update({
-            'current_round': 'pre_flop',
-            'deck': deck.to_output_format(),
-            'board_cards': [],
-            'dealer_hand': [],
-            'last_evaluation': None,
-            'current_player_turn_index': -1,
-            'current_betting_round_pot': 0,
-            'current_round_min_bet': 0,
-            'last_aggressive_action_player_id': None,
-            'timer_end_time': None
+            'current_round': 'pre_flop', 'deck': deck.to_output_format(), 'board_cards': [], 'dealer_hand': [],
+            'last_evaluation': None, 'current_player_turn_index': -1, 'current_betting_round_pot': 0,
+            'current_round_min_bet': 0, 'last_aggressive_action_player_id': None, 'timer_end_time': None
         })
         for p in state['players']:
             p['hand'] = []
@@ -953,24 +939,29 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             p['has_acted_in_round'] = False
             p['folded'] = False
             p['hand_revealed'] = False
-            p['total_chips'] = p.get('kekchipz_overall', 1000)
+            p['is_spectating'] = False
+            p['is_all_in'] = False
         return True, "New game started.", state
 
     async def _start_new_round_pre_flop(self, room_id: str, state: dict, guild_id: str = None, channel_id: str = None):
         ok, msg, state = await self._start_new_game(room_id, state, guild_id, channel_id)
         if not ok:
             return False, msg, state
-        seated = [p for p in state.get('players', []) if p.get('seat_id')]
-        if len(seated) == 0:
-            return False, "No players available.", state
+        
+        seated = self._get_sorted_players(state, active_only=True)
+        if not seated:
+            state['current_round'] = 'pre_game'
+            return True, "Round ended, waiting for players.", state
+
         state['dealer_button_position'] = (state.get('dealer_button_position', -1) + 1) % len(seated)
+        
         ok, msg, state = await self.deal_hole_cards(room_id, state)
-        if not ok:
-            return False, msg, state
+        if not ok: return False, msg, state
+        
         ok, msg, state = await self.deal_dealer_cards(room_id, state)
-        if not ok:
-            return False, msg, state
-        await self._start_betting_round(room_id, state)
+        if not ok: return False, msg, state
+        
+        state = await self._start_betting_round(room_id, state)
         return True, "Round started.", state
 
 

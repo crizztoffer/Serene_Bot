@@ -3,8 +3,8 @@ import asyncio
 import random
 import io
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont # Pillow library for image manipulation
-import time # Import the time module for timestamps
+from PIL import Image, ImageDraw, ImageFont  # Pillow library for image manipulation
+import time  # Import the time module for timestamps
 from discord.ext import commands
 import aiomysql
 
@@ -34,13 +34,14 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> 
             autocommit=True
         )
         async with conn.cursor() as cursor:
+            # FIX: channel_id -> guild_id
             await cursor.execute(
-                "SELECT kekchipz FROM discord_users WHERE channel_id = %s AND discord_id = %s",
+                "SELECT kekchipz FROM discord_users WHERE guild_id = %s AND discord_id = %s",
                 (str(guild_id), str(discord_id))
             )
             result = await cursor.fetchone()
             if result:
-                return result[0]
+                return int(result[0])
             else:
                 print(f"User {discord_id} not found in DB for guild {guild_id}. Returning 0.")
                 return 0
@@ -51,6 +52,15 @@ async def get_user_kekchipz(guild_id: int, discord_id: int, db_config: dict) -> 
         if conn:
             await conn.ensure_closed()
 
+def _simple_png_rgba(width: int, height: int, color_rgba):
+    """
+    Create a simple RGBA PNG and return it as a BytesIO positioned at start.
+    """
+    img = Image.new('RGBA', (width, height), color_rgba)
+    bio = io.BytesIO()
+    img.save(bio, format='PNG')
+    bio.seek(0)
+    return bio
 
 async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_display_name: str, db_config: dict) -> io.BytesIO:
     """
@@ -75,7 +85,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
         balance = await get_user_kekchipz(guild_id, discord_id, db_config)
         
         # --- MODIFICATION: Format balance with commas and no cents ---
-        balance_text = f"${balance:,}" # Formats integer with commas (e.g., 1000 -> 1,000)
+        balance_text = f"${balance:,}"  # Formats integer with commas (e.g., 1000 -> 1,000)
 
         # Fetch the base image
         async with aiohttp.ClientSession() as session:
@@ -85,7 +95,7 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
                 if base_image.mode != 'RGBA':
                     base_image = base_image.convert('RGBA')
 
-        # Resize the entire image to be 1/4 smaller (0.33 of original size)
+        # Resize the entire image to be 1/4 smaller (0.42 of original size)
         original_width, original_height = base_image.size
         new_width = int(original_width * 0.42)
         new_height = int(original_height * 0.42)
@@ -108,10 +118,10 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
         draw = ImageDraw.Draw(base_image)
 
-        text_color = (0, 128, 255, 255) # RGBA for #0066ff
+        text_color = (0, 128, 255, 255)  # RGBA for #0066ff
 
         # Calculate text size and position to center it
-        bbox = draw.textbbox((0,0), balance_text, font=font)
+        bbox = draw.textbbox((0, 0), balance_text, font=font)
         text_width = bbox[2] - bbox[0]
         text_height = bbox[3] - bbox[1]
 
@@ -131,11 +141,10 @@ async def create_kekchipz_balance_image(guild_id: int, discord_id: int, player_d
 
     except aiohttp.ClientError as e:
         print(f"Error fetching base image from {base_image_url}: {e}")
-        return io.BytesIO(Image.new('RGBA', (400, 200), (255, 0, 0, 128)).save(io.BytesIO(), format='PNG'))
+        return _simple_png_rgba(400, 200, (255, 0, 0, 128))
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
-        return io.BytesIO(Image.new('RGBA', (400, 200), (0, 255, 0, 128)).save(io.BytesIO(), format='PNG'))
-
+        return _simple_png_rgba(400, 200, (0, 255, 0, 128))
 
 async def start(interaction: discord.Interaction, bot: commands.Bot):
     """

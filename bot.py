@@ -938,6 +938,126 @@ async def game_was_handler(request):
 
         return ws
 
+# ---------------------- AVATAR WS: /avatar_ws ----------------------
+
+async def _resolve_member_avatar(guild_id: int, user_id: int) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Returns (avatar_url, display_name) for a member, or (None, None) if not found.
+    Uses cache first; falls back to API fetch. Provides a safe default avatar if needed.
+    """
+    try:
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            return (None, None)
+
+        member: Optional[discord.Member] = guild.get_member(int(user_id))
+        if member is None:
+            try:
+                member = await guild.fetch_member(int(user_id))
+            except Exception:
+                member = None
+
+        if not member:
+            return (None, None)
+
+        # Preferred: display_avatar (handles server avatar / global avatar / default)
+        try:
+            asset = member.display_avatar
+            if hasattr(asset, "with_size"):
+                url = asset.with_size(128).url
+            else:
+                url = str(asset.url)
+        except Exception:
+            url = getattr(getattr(member, "avatar", None), "url", None)
+
+        if not url:
+            url = "https://cdn.discordapp.com/embed/avatars/0.png"
+
+        display_name = getattr(member, "display_name", None) or getattr(member, "name", None) or str(member.id)
+        return (str(url), str(display_name))
+    except Exception:
+        return (None, None)
+
+async def avatar_ws_handler(request):
+    """
+    Lightweight WS for resolving Discord avatar URLs.
+    Usage:
+      send {"op":"get_avatar","guild_id":"123","discord_id":"456"}
+      or   {"op":"get_avatar","guild_id":"123","discord_ids":["456","789"]}
+    Replies one message per requested user with type="avatar".
+    Keeps the socket open for multiple requests; client may close anytime.
+    """
+    ws = web.WebSocketResponse()
+    await ws.prepare(request)
+    logger.info("✅ [/avatar_ws] WebSocket upgraded successfully from %s", request.remote)
+
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT:
+                continue
+
+            # Parse JSON
+            try:
+                data = json.loads(msg.data)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "error": "invalid_json"})
+                continue
+
+            # Allow simple ping
+            if isinstance(data, str) and data.lower() == "ping":
+                await ws.send_str("pong")
+                continue
+
+            if not isinstance(data, dict):
+                await ws.send_json({"type": "error", "error": "invalid_payload"})
+                continue
+
+            op = data.get("op") or "get_avatar"  # default to get_avatar for back-compat
+            if op != "get_avatar":
+                await ws.send_json({"type": "error", "error": "unknown_op"})
+                continue
+
+            guild_id = data.get("guild_id")
+            one_id = data.get("discord_id")
+            many_ids = data.get("discord_ids")
+
+            if not guild_id or (not one_id and not many_ids):
+                await ws.send_json({"type": "error", "error": "missing_fields"})
+                continue
+
+            # Normalize to a list
+            ids: List[str] = []
+            if one_id:
+                ids.append(str(one_id))
+            if isinstance(many_ids, list):
+                ids.extend([str(x) for x in many_ids if x is not None])
+
+            # Resolve each and emit a per-user response
+            for uid in ids:
+                avatar_url, display_name = await _resolve_member_avatar(int(guild_id), int(uid))
+                if avatar_url:
+                    await ws.send_json({
+                        "type": "avatar",
+                        "ok": True,
+                        "guild_id": str(guild_id),
+                        "discord_id": str(uid),
+                        "display_name": display_name,
+                        "avatar_url": avatar_url
+                    })
+                else:
+                    await ws.send_json({
+                        "type": "avatar",
+                        "ok": False,
+                        "guild_id": str(guild_id),
+                        "discord_id": str(uid),
+                        "error": "not_found"
+                    })
+
+    except Exception as e:
+        logger.error(f"[/avatar_ws] error: {e}", exc_info=True)
+    finally:
+        return ws
+
 # ---------------------- ADMIN WS: /admin_ws ----------------------
 
 async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name: str) -> bool:
@@ -1098,6 +1218,9 @@ async def start_web_server():
 
     bot.web_app.router.add_get('/admin_ws', admin_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /admin_ws")
+
+    bot.web_app.router.add_get('/avatar_ws', avatar_ws_handler)
+    logger.info("🛠️  Registered WebSocket route: /avatar_ws")
 
     # Log routes again once the server is started and accepting connections
     bot.web_app.on_startup.append(_on_web_started)

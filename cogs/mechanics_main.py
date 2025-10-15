@@ -856,55 +856,74 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return await self._handle_player_action(room_id, player_id, action, 0, state)
 
     async def _add_player_to_game(self, room_id: str, pdata: dict, state: dict):
-        pid = pdata['discord_id']
-        name = pdata['name']
+        pid = pdata.get('discord_id')
+        name = pdata.get('name')
         seat_id = pdata.get('seat_id')
         guild_id = state.get('guild_id')
-        if not all([pid, name, seat_id, guild_id]):
+    
+        if not all([pid, name, seat_id]):
             return False, "Missing player data for join.", state
         
-        # Prevent multi-game join using current_room_id
-        conn = None
+        # --- START: MODIFIED DATABASE LOGIC ---
+        can_perform_db_checks = False
         try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                await cursor.execute("SELECT current_room_id FROM discord_users WHERE discord_id = %s AND guild_id = %s", (pid, guild_id))
-                res = await cursor.fetchone()
-                if res and res.get('current_room_id') and res['current_room_id'] != room_id:
-                    return False, "You are already in another game.", state
-
-                # Add to table state
-                players = state.get('players', [])
-                if any(p.get('seat_id') == seat_id for p in players):
-                    return False, f"Seat {seat_id} is occupied.", state
-                if any(p.get('discord_id') == pid for p in players):
-                    return False, "You are already in this game.", state
-
-                is_spectator = state.get('current_round') != 'pre_game'
-                
-                players.append({
-                    'discord_id': pid, 'name': name, 'seat_id': seat_id, 'avatar_url': pdata.get('avatar_url'),
-                    'total_chips': 1000, 'hand': [], 'current_bet_in_round': 0, 'has_acted_in_round': False,
-                    'folded': is_spectator, 'hand_revealed': False, 'kekchipz_overall': 0, 'is_spectating': is_spectator,
-                    'is_all_in': False
-                })
-                state['players'] = players
-
-                await cursor.execute("UPDATE discord_users SET current_room_id = %s WHERE discord_id = %s AND guild_id = %s", (room_id, pid, guild_id))
-            await conn.commit()
-        except Exception as e:
-            if conn: await conn.rollback()
-            logger.error(f"_add_player_to_game DB error: {e}", exc_info=True)
-            return False, "Database error while adding player.", state
-        finally:
-            if conn: conn.close()
-
+            # DB operations require valid numeric IDs.
+            int(pid)
+            int(guild_id)
+            can_perform_db_checks = True
+        except (ValueError, TypeError, AttributeError):
+            logger.warning(
+                f"Skipping per-player DB checks for room '{room_id}' due to invalid ID format. "
+                f"pid='{pid}', guild_id='{guild_id}'"
+            )
+    
+        if can_perform_db_checks:
+            # This block now ONLY runs if the IDs from the client are valid.
+            conn = None
+            try:
+                conn = await self._get_db_connection()
+                async with conn.cursor() as cursor:
+                    # 1. Check if the user is in another game
+                    await cursor.execute("SELECT current_room_id FROM discord_users WHERE discord_id = %s AND guild_id = %s", (pid, guild_id))
+                    res = await cursor.fetchone()
+                    if res and res.get('current_room_id') and res['current_room_id'] != room_id:
+                        return False, "You are already in another game.", state
+    
+                    # 2. Tag the user as being in this game room
+                    await cursor.execute("UPDATE discord_users SET current_room_id = %s WHERE discord_id = %s AND guild_id = %s", (room_id, pid, guild_id))
+                await conn.commit()
+            except Exception as e:
+                if conn: await conn.rollback()
+                logger.error(f"_add_player_to_game DB error: {e}", exc_info=True)
+                # If the DB fails for other reasons, we should still stop.
+                return False, "A database error occurred while trying to join.", state
+            finally:
+                if conn: conn.close()
+        # --- END: MODIFIED DATABASE LOGIC ---
+    
+        # Add player to the in-memory state (this will now always run)
+        players = state.get('players', [])
+        if any(p.get('seat_id') == seat_id for p in players):
+            return False, f"Seat {seat_id} is occupied.", state
+        if any(p.get('discord_id') == pid for p in players):
+            return False, "You are already in this game.", state
+    
+        is_spectator = state.get('current_round') != 'pre_game'
+        
+        players.append({
+            'discord_id': pid, 'name': name, 'seat_id': seat_id, 'avatar_url': pdata.get('avatar_url'),
+            'total_chips': 1000, 'hand': [], 'current_bet_in_round': 0, 'has_acted_in_round': False,
+            'folded': is_spectator, 'hand_revealed': False, 'kekchipz_overall': 0, 'is_spectating': is_spectator,
+            'is_all_in': False
+        })
+        state['players'] = players
+    
         # Auto-start game when first player sits
         seated = self._get_sorted_players(state)
         if len(seated) >= 1 and state['current_round'] == 'pre_game':
             logger.info(f"First player sat down in room {room_id}, starting game.")
             return await self._start_new_round_pre_flop(room_id, state, state.get('guild_id'), state.get('channel_id'))
-
+    
         return True, "Player added.", state
 
     async def _leave_player(self, room_id: str, discord_id: str, state: dict):

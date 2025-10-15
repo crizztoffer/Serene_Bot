@@ -201,19 +201,6 @@ def _merge_role_overwrite(existing: Optional[discord.PermissionOverwrite], **kwa
         setattr(ow, k, v)
     return ow
 
-# --- Shared room normalizer used for WS registry keys ---
-def _normalize_room_id_for_registry(room_id: str) -> Optional[str]:
-    """
-    Normalize room id used as the in-memory registry key for WS buckets.
-    Mirrors the Cog's normalization (trim, reject empty/N/A).
-    """
-    if room_id is None:
-        return None
-    rid = str(room_id).strip()
-    if not rid or rid.upper() == "N/A":
-        return None
-    return rid
-
 async def _enforce_quarantine_visibility(
     guild: discord.Guild,
     quarantine_role: discord.Role,
@@ -463,6 +450,7 @@ async def _restore_member_roles(member: discord.Member, quarantine_role: Optiona
         logger.error(f"Missing permissions to add roles to {member}.")
     except Exception as e:
         logger.error(f"Error adding roles to {member}: {e}")
+
 # ---------------- Views (Buttons) ----------------
 
 class AcceptRulesView(discord.ui.View):
@@ -684,7 +672,7 @@ async def chat_websocket_handler(request):
         # 1. Handle initial registration message
         first_msg_str = await ws.receive_str()
         initial_data = json.loads(first_msg_str)
-        room_id = _normalize_room_id_for_registry(initial_data.get('room_id'))
+        room_id = initial_data.get('room_id')
         display_name = initial_data.get('displayName')
 
         if not room_id or not display_name:
@@ -750,13 +738,15 @@ async def chat_websocket_handler(request):
     return ws
 
 
-# ---------------------- GAME WS: /game_was (normalized registry key) ----------------------
+# ---------------------- GAME WS: /game_was (robust + loud logs) ----------------------
 async def game_was_handler(request):
     """
     Game WebSocket: registers a player's presence in a room via MechanicsMain.
-    - Normalizes the room_id once and uses it consistently as the registry key.
-    - After handshake, forwards JSON frames with an 'action' to MechanicsMain.handle_websocket_game_action.
+    - Robust initial handshake (waits for first TEXT frame; ignores ping/pong/binary/close).
+    - After handshake, forwards any JSON frames with an 'action' to MechanicsMain.handle_websocket_game_action.
+    - Uses MechanicsMain.register_ws_connection/unregister_ws_connection so room keys are normalized.
     - Does NOT hard-close on mechanics/DB failures; it warns the client and keeps the WS open.
+    - Loud logs before/after prepare() to confirm upgrade attempts.
     """
     logger.info("[/game_was] HTTP request received from %s (will attempt WS upgrade)", request.remote)
 
@@ -770,13 +760,12 @@ async def game_was_handler(request):
 
     logger.info("✅ [/game_was] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
 
-    raw_room_id = None
-    norm_room_id = None
+    room_id = None
     sender_id = None
-    guild_id = None
-    channel_id = None  # carried through to state
+    guild_id = None  # captured from client payload if provided
     mechanics_cog = None
     presence_persisted = False  # track whether player_connect succeeded
+    registered_in_bucket = False
 
     try:
         # --- 1) Robust initial handshake: wait for TEXT JSON ---
@@ -805,7 +794,7 @@ async def game_was_handler(request):
                 await ws.close()
                 return ws
 
-        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id/channel_id optional) ---
+        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id optional) ---
         try:
             initial_data = json.loads(first_msg_str)
         except json.JSONDecodeError:
@@ -814,26 +803,18 @@ async def game_was_handler(request):
             await ws.close()
             return ws
 
-        raw_room_id = initial_data.get('room_id')
-        norm_room_id = _normalize_room_id_for_registry(raw_room_id)
+        room_id = initial_data.get('room_id')
         sender_id = initial_data.get('sender_id')
-        guild_id = initial_data.get('guild_id')
+        guild_id = initial_data.get('guild_id')  # recommend client include this
         channel_id = initial_data.get('channel_id')
 
-        if not norm_room_id or not sender_id:
+        if not room_id or not sender_id:
             logger.error(f"[/game_was] Initial WS message missing room_id or sender_id: {initial_data}")
             await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
             await ws.close()
             return ws
 
-        # --- 3) Add to in-memory presence registry immediately (normalized key) ---
-        if norm_room_id not in bot.ws_rooms:
-            bot.ws_rooms[norm_room_id] = set()
-        bot.ws_rooms[norm_room_id].add(ws)
-        logger.info(f"[/game_was] Player {sender_id} connected to room {norm_room_id}. "
-                    f"Now {len(bot.ws_rooms[norm_room_id])} client(s).")
-
-        # --- 4) Try to persist presence via MechanicsMain (non-fatal) ---
+        # --- 3) Add to in-memory presence registry immediately (normalized) ---
         mechanics_cog = bot.get_cog('MechanicsMain')
         if not mechanics_cog:
             logger.error("[/game_was] MechanicsMain cog not available; continuing without persistence.")
@@ -843,15 +824,43 @@ async def game_was_handler(request):
             }))
         else:
             try:
-                # Preferred signature (room_id, sender_id). If your Cog later accepts guild_id, this stays compatible.
-                ok, msg_text = await mechanics_cog.player_connect(norm_room_id, sender_id)
+                # Register this WS into the normalized room bucket
+                registered_in_bucket = mechanics_cog.register_ws_connection(ws, room_id)
+                if not registered_in_bucket:
+                    await ws.send_str(json.dumps({"status": "error", "message": "Room id invalid."}))
+                    await ws.close()
+                    return ws
+                logger.info("[/game_was] Registered WS %s into room bucket", id(ws))
+            except Exception as e:
+                logger.error(f"[/game_was] register_ws_connection failed: {e}", exc_info=True)
+                await ws.send_str(json.dumps({"status": "warn", "message": "Unable to register socket to room."}))
+
+        # --- 4) Try to persist presence via MechanicsMain (non-fatal) ---
+        if mechanics_cog:
+            try:
+                ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id, guild_id=guild_id)
                 presence_persisted = bool(ok)
                 if not ok:
                     await ws.send_str(json.dumps({"status": "warn", "message": msg_text or "Could not persist presence."}))
                 else:
                     await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
+            except TypeError:
+                # Backward-compat if cog doesn't accept guild_id kwarg
+                try:
+                    ok, msg_text = await mechanics_cog.player_connect(room_id, sender_id)
+                    presence_persisted = bool(ok)
+                    if not ok:
+                        await ws.send_str(json.dumps({"status": "warn", "message": msg_text or "Could not persist presence."}))
+                    else:
+                        await ws.send_str(json.dumps({"status": "ok", "message": "Presence persisted."}))
+                except Exception as e:
+                    logger.error(f"[/game_was] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
+                    await ws.send_str(json.dumps({
+                        "status": "warn",
+                        "message": "Persistence failed; operating in ephemeral mode."
+                    }))
             except Exception as e:
-                logger.error(f"[/game_was] player_connect failed for r={norm_room_id} user={sender_id}: {e}", exc_info=True)
+                logger.error(f"[/game_was] player_connect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
                 await ws.send_str(json.dumps({
                     "status": "warn",
                     "message": "Persistence failed; operating in ephemeral mode."
@@ -881,8 +890,8 @@ async def game_was_handler(request):
 
                     if mechanics_cog:
                         try:
-                            # Ensure normalized room/sender context is present if the client omitted on subsequent frames
-                            data.setdefault("room_id", norm_room_id)
+                            # Ensure room_id/sender context is present if the client omitted it on subsequent frames
+                            data.setdefault("room_id", room_id)
                             data.setdefault("sender_id", sender_id)
                             if guild_id is not None:
                                 data.setdefault("guild_id", guild_id)
@@ -891,7 +900,7 @@ async def game_was_handler(request):
 
                             await mechanics_cog.handle_websocket_game_action(data)
                         except Exception as e:
-                            logger.error(f"[/game_was] Dispatch error for action={data.get('action')} r={norm_room_id}: {e}", exc_info=True)
+                            logger.error(f"[/game_was] Dispatch error for action={data.get('action')} r={room_id}: {e}", exc_info=True)
                             # Non-fatal: keep socket alive
                     else:
                         logger.error("[/game_was] MechanicsMain cog unavailable; cannot process action.")
@@ -905,37 +914,36 @@ async def game_was_handler(request):
                 continue
 
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"[/game_was] Error for player {sender_id} in room {norm_room_id}: {ws.exception()}")
+                logger.error(f"[/game_was] Error for player {sender_id} in room {room_id}: {ws.exception()}")
 
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
-                logger.info(f"[/game_was] Closing for player {sender_id} in room {norm_room_id}. Reason: {msg.type.name}")
+                logger.info(f"[/game_was] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
                 break
 
     except asyncio.CancelledError:
-        logger.info(f"[/game_was] WS for player {sender_id} in room {norm_room_id} was cancelled.")
+        logger.info(f"[/game_was] WS for player {sender_id} in room {room_id} was cancelled.")
     except Exception as e:
-        logger.error(f"[/game_was] Handler error for room {norm_room_id}: {e}", exc_info=True)
+        logger.error(f"[/game_was] Handler error for room {room_id}: {e}", exc_info=True)
     finally:
-        # --- 6) Cleanup: remove from in-memory registry ---
+        # --- 6) Cleanup: remove from in-memory registry via MechanicsMain ---
         try:
-            if norm_room_id and ws in bot.ws_rooms.get(norm_room_id, set()):
-                bot.ws_rooms[norm_room_id].remove(ws)
-                if not bot.ws_rooms[norm_room_id]:
-                    del bot.ws_rooms[norm_room_id]
-                logger.info(f"[/game_was] Player {sender_id} disconnected from room {norm_room_id}. "
-                            f"Now {len(bot.ws_rooms.get(norm_room_id, set()))} client(s).")
+            if registered_in_bucket:
+                mc = mechanics_cog or bot.get_cog('MechanicsMain')
+                if mc:
+                    mc.unregister_ws_connection(ws)
         except Exception:
             pass
 
         # --- Persist disconnection (non-fatal) ---
         try:
-            if norm_room_id and sender_id and mechanics_cog and presence_persisted:
+            if room_id and sender_id and mechanics_cog and presence_persisted:
+                # MechanicsMain should clear DB-side state (e.g., current_room_id) as needed
                 try:
-                    await mechanics_cog.player_disconnect(norm_room_id, sender_id)
-                except Exception as e:
-                    logger.error(f"[/game_was] player_disconnect failed for r={norm_room_id} user={sender_id}: {e}", exc_info=True)
+                    await mechanics_cog.player_disconnect(room_id, sender_id, guild_id=guild_id)
+                except TypeError:
+                    await mechanics_cog.player_disconnect(room_id, sender_id)
         except Exception as e:
-            logger.error(f"[/game_was] disconnection persistence wrapper failed: {e}", exc_info=True)
+            logger.error(f"[/game_was] player_disconnect failed for r={room_id} user={sender_id}: {e}", exc_info=True)
 
         return ws
 
@@ -1245,7 +1253,7 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Failed to add persistent AcceptRulesView: {e}")
 
-    # Expose DB credentials for modules like flag.py / MechanicsMain
+    # Expose DB credentials for modules like flag.py
     bot.db_user = DB_USER
     bot.db_password = DB_PASSWORD
     bot.db_host = DB_HOST
@@ -1272,7 +1280,7 @@ async def on_ready():
     for guild in bot.guilds:
         for member in guild.members:
             if not member.bot:
-                await add_user_to_db_if_not_exists(guild.id, member.display_name, member.id)
+                await add_user_to_db_if_not_exists(member.guild.id, member.display_name, member.id)
 
     # Start reward loop (kekchipz)
     try:

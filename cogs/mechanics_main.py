@@ -471,8 +471,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         p['kekchipz_overall'] += per
 
         return True, "Hands evaluated.", state
-
+        
     # ---- Broadcast (room-scoped; drop dead sockets) ----
+    
     async def broadcast_game_state(self, room_id: str, state: dict):
         try:
             rid = self._normalize_room_id(room_id or state.get("room_id"))
@@ -898,7 +899,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         finally:
             if conn: conn.close()
 
-        # Auto-start game when first player sits (keeps your previous behavior)
+        # Auto-start game when first player sits
         seated = self._get_sorted_players(state)
         if len(seated) >= 1 and state['current_round'] == 'pre_game':
             logger.info(f"First player sat down in room {room_id}, starting game.")

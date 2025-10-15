@@ -162,20 +162,20 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         logger.info("MechanicsMain cog unloaded.")
 
     # ---- Presence hooks used by /game_was (handshake) ----
-    async def player_connect(self, room_id: str, sender_id: str):
+    async def player_connect(self, room_id: str, sender_id: str, guild_id: str = None):
         """Presence note: fast/no DB write. Return (ok, message)."""
         try:
             rid = self._normalize_room_id(room_id)
-            logger.info(f"[player_connect] {sender_id} connected to room {rid}.")
+            logger.info(f"[player_connect] {sender_id} connected to room {rid}. (guild_id={guild_id})")
             return True, "presence recorded"
         except Exception as e:
             logger.error(f"[player_connect] error: {e}", exc_info=True)
             return False, "presence failed"
 
-    async def player_disconnect(self, room_id: str, sender_id: str):
+    async def player_disconnect(self, room_id: str, sender_id: str, guild_id: str = None):
         try:
             rid = self._normalize_room_id(room_id)
-            logger.info(f"[player_disconnect] {sender_id} disconnected from room {rid}.")
+            logger.info(f"[player_disconnect] {sender_id} disconnected from room {rid}. (guild_id={guild_id})")
             return True, "presence removed"
         except Exception as e:
             logger.error(f"[player_disconnect] error: {e}", exc_info=True)
@@ -210,9 +210,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if row and row['game_state']:
                     state = json.loads(row['game_state'])
                     state['room_id'] = rid
-                    if 'guild_id' not in state or state['guild_id'] is None:
+                    # Keep provided guild/channel if the stored state lacks them
+                    if not state.get('guild_id'):
                         state['guild_id'] = guild_id
-                    if 'channel_id' not in state or state['channel_id'] is None:
+                    if not state.get('channel_id'):
                         state['channel_id'] = channel_id
                 else:
                     # New state
@@ -482,7 +483,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state['room_id'] = rid
         rooms = getattr(self.bot, "ws_rooms", None) or {}
         bucket = rooms.get(rid, set())
+
+        # Instrumentation to catch key-mismatch issues
+        try:
+            logger.info(f"[broadcast] room={rid} recipients={len(bucket)}")
+        except Exception:
+            pass
+
         if not bucket:
+            logger.warning(f"[broadcast] no recipients for room {rid} (key mismatch?)")
             return
 
         envelope = {

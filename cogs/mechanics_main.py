@@ -54,7 +54,7 @@ def evaluate_poker_hand(cards):
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot
-        logger.info("MechanicsMain (Timed Start) initialized.")
+        logger.info("MechanicsMain (Update-Only) initialized.")
         self.db_user = bot.db_user
         self.db_password = bot.db_password
         self.db_host = bot.db_host
@@ -87,7 +87,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             cursorclass=aiomysql.cursors.DictCursor
         )
 
-    # --- MODIFIED: This function now handles creating the initial DB row ---
+    # --- CORRECTED: This function is now READ-ONLY ---
     async def _load_game_state(self, room_id: str) -> dict:
         conn = None
         try:
@@ -96,32 +96,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 await cursor.execute("SELECT game_state FROM bot_game_rooms WHERE room_id = %s", (room_id,))
                 row = await cursor.fetchone()
 
-                # If the row exists and has a game state, load it.
-                if row and row['game_state']:
+                if row and row.get('game_state'):
                     logger.info(f"Loaded existing game state for room '{room_id}'")
                     return json.loads(row['game_state'])
-
-                # If the row exists but game_state is NULL, or if the row doesn't exist at all,
-                # create and save the default "pre-game" state.
-                else:
-                    logger.warning(f"No game state found for '{room_id}'. Initializing 'pre-game' state in DB.")
-                    default_state = {'room_id': room_id, 'current_round': 'pre-game', 'players': []}
-                    
-                    # This query will INSERT the default state if the row is missing,
-                    # or UPDATE the game_state if the row exists but the column is NULL.
-                    await cursor.execute(
-                        """
-                        INSERT INTO bot_game_rooms (room_id, game_state)
-                        VALUES (%s, %s)
-                        ON DUPLICATE KEY UPDATE game_state = VALUES(game_state)
-                        """,
-                        (room_id, json.dumps(default_state))
-                    )
-                    await conn.commit()
-                    return default_state
+                
+                # If row is not found, or game_state is NULL, return None.
+                # The action handler is now responsible for initialization.
+                logger.warning(f"No valid game state found in DB for room '{room_id}'. The row may be missing or the game_state column is NULL.")
+                return None
         finally:
             if conn: conn.close()
 
+    # --- CORRECTED: This function is now UPDATE-ONLY ---
     async def _save_game_state(self, room_id: str, state: dict):
         conn = None
         try:
@@ -132,9 +118,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     (json.dumps(state), room_id)
                 )
                 if rows_affected == 0:
-                    logger.error(f"Failed to save state: Room '{room_id}' not found.")
+                    logger.error(f"CRITICAL: Failed to save state. Room with room_id '{room_id}' was not found in the database for update.")
             await conn.commit()
-            logger.info(f"Saved state for room '{room_id}'")
+            logger.info(f"Successfully saved (updated) game state for room '{room_id}'")
         except Exception as e:
             if conn: await conn.rollback()
             logger.error(f"DB save error for room '{room_id}': {e}", exc_info=True)
@@ -149,50 +135,53 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             try: await ws.send_str(msg)
             except: self.unregister_ws_connection(ws)
 
-    # --- ADDED BACK: Game Start and Dealing Logic ---
+    # --- Game Start Logic (needed for the timer) ---
     async def _start_new_round_pre_flop(self, state: dict):
         logger.info(f"Starting 'pre-flop' round for room '{state.get('room_id')}'")
         
-        # Reset state for a new round
         deck = Deck(); deck.build(); deck.shuffle()
         state.update({
             'current_round': 'pre_flop',
             'deck': deck.to_output_format(),
             'board_cards': [],
             'dealer_hand': [],
-            'pre_flop_timer_start_time': None, # Clear the timer
+            'pre_flop_timer_start_time': None,
         })
-        for p in state['players']:
-            p['hand'] = [] # Clear hands
+        for p in state['players']: p['hand'] = []
         
-        # Deal cards
         for p in state['players']:
             if not p.get('is_spectating'):
                 p['hand'] = [deck.deal_card().to_output_format(), deck.deal_card().to_output_format()]
         state['dealer_hand'] = [deck.deal_card().to_output_format(), deck.deal_card().to_output_format()]
         state['deck'] = deck.to_output_format()
-
-        # NOTE: Betting/turn logic would go here, but is omitted per previous requests.
-        # The state is now correctly 'pre-flop' with cards dealt.
+        
         return state
 
-    # --- MODIFIED: Main Action Handler with Timer Logic ---
+    # --- CORRECTED: Main Action Handler with New Initialization Logic ---
     async def handle_websocket_game_action(self, data: dict):
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
         
         try:
             state = await self._load_game_state(room_id)
+
+            # --- NEW: Initialize state IN MEMORY if the database row was empty ---
+            if state is None:
+                logger.info(f"Loaded empty state for '{room_id}'. Initializing 'pre-game' state in memory.")
+                state = {
+                    'room_id': room_id,
+                    'current_round': 'pre_game',
+                    'players': []
+                }
+            
             state['guild_id'] = data.get('guild_id')
             state['channel_id'] = data.get('channel_id')
 
-            # --- NEW: Check if the 60-second timer has expired ---
             timer_start = state.get('pre_flop_timer_start_time')
             if state.get('current_round') == 'pre-game' and timer_start:
                 if time.time() >= timer_start + 60:
                     logger.info(f"60s timer expired for room '{room_id}'. Transitioning to pre-flop.")
                     state = await self._start_new_round_pre_flop(state)
-                    # After transitioning, we still save and broadcast below.
 
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
@@ -207,25 +196,21 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 })
                 logger.info(f"Player {player_id} sat in seat {seat_id} in room '{room_id}'.")
 
-                # --- NEW: If this is the first player, start the 60-second timer ---
                 if len(state['players']) == 1 and state['current_round'] == 'pre-game':
                     state['pre_flop_timer_start_time'] = time.time()
                     logger.info(f"First player sat down. 60-second pre-flop timer started for room '{room_id}'.")
             
             else:
-                logger.warning(f"Received unsupported action: '{action}'")
-                return # Only handle 'player_sit' for now
+                return
 
             await self._save_game_state(room_id, state)
             await self.broadcast_game_state(room_id, state)
 
         except Exception as e:
-            logger.error(f"Error handling action '{action}' for room '{room_id}': {e}", exc_info=True)
+            logger.error(f"Error in handle_websocket_game_action ('{action}'): {e}", exc_info=True)
 
-    # --- KEPT: Winner Evaluation Logic (for future use) ---
     async def evaluate_hands(self, state: dict):
-        # ... (full evaluation logic is here, but not called by the simple sit-down action) ...
-        pass
+        pass # Evaluation logic remains here for future use
 
 async def setup(bot):
     await bot.add_cog(MechanicsMain(bot))

@@ -157,7 +157,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         
         return state
 
-    # --- CORRECTED: Main Action Handler with Fixed Logic Flow ---
+    # --- UPDATED: Main Action Handler with One-Time Timer Logic ---
     async def handle_websocket_game_action(self, data: dict):
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
@@ -169,7 +169,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 logger.info(f"Loaded empty state for '{room_id}'. Initializing 'pre-game' state in memory.")
                 state = {
                     'room_id': room_id,
-                    'current_round': 'pre_game',
+                    'current_round': 'pre-game',
                     'players': []
                 }
             
@@ -177,22 +177,16 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state['channel_id'] = data.get('channel_id')
 
             timer_start = state.get('pre_flop_timer_start_time')
-            if state.get('current_round') == 'pre-game' and timer_start:
-                if time.time() >= timer_start + 60:
-                    logger.info(f"60s timer expired for room '{room_id}'. Transitioning to pre-flop.")
-                    state = await self._start_new_round_pre_flop(state)
+            if state.get('current_round') == 'pre-game' and timer_start and time.time() >= timer_start + 60:
+                logger.info(f"60s timer expired for room '{room_id}'. Transitioning to pre-flop.")
+                state = await self._start_new_round_pre_flop(state)
 
-            # --- START of THE FIX ---
-            # This logic now correctly handles 'player_sit' and rejects unknown actions.
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
                 seat_id, player_id = pdata.get('seat_id'), pdata.get('discord_id')
 
-                if not all([seat_id, player_id]):
-                    return # Exit if data is incomplete
-
-                if any(p.get('discord_id') == player_id for p in state['players']):
-                    return # Exit if player is already seated
+                if not all([seat_id, player_id]) or any(p.get('discord_id') == player_id for p in state['players']):
+                    return
                 
                 state['players'].append({
                     'discord_id': player_id, 'name': pdata.get('name', 'Player'),
@@ -200,16 +194,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 })
                 logger.info(f"Player {player_id} sat in seat {seat_id} in room '{room_id}'.")
 
-                if len(state['players']) == 1 and state['current_round'] == 'pre-game':
+                # --- MODIFIED: This condition now checks for the one-time flag ---
+                if len(state['players']) == 1 and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
                     state['pre_flop_timer_start_time'] = time.time()
-                    logger.info(f"First player sat down. 60-second pre-flop timer started for room '{room_id}'.")
+                    state['initial_countdown_triggered'] = True # <-- NEW: Set the one-time flag
+                    logger.info(f"First-ever player sat down. 60-second pre-flop timer started for room '{room_id}'.")
             
+            elif action is not None:
+                pass 
             else:
-                logger.warning(f"Received unknown or unsupported action: '{action}'")
-                return # Exit for any action that is NOT 'player_sit'
-            # --- END of THE FIX ---
+                return
 
-            # These lines will now be correctly executed after a 'player_sit' action.
             await self._save_game_state(room_id, state)
             await self.broadcast_game_state(room_id, state)
 

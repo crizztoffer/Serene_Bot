@@ -112,20 +112,23 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         finally:
             if conn: conn.close()
 
+    # In cogs/mechanics_main.py
+    
     async def _save_game_state(self, room_id: str, state: dict):
         conn = None
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
-                # This is the corrected "upsert" query without the 'last_activity' column.
-                await cursor.execute(
-                    """
-                    INSERT INTO bot_game_rooms (room_id, game_state, guild_id, channel_id)
-                    VALUES (%s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE game_state = VALUES(game_state)
-                    """,
-                    (room_id, json.dumps(state), state.get('guild_id'), state.get('channel_id'))
+                # This query now ONLY performs an UPDATE.
+                rows_affected = await cursor.execute(
+                    "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
+                    (json.dumps(state), room_id)
                 )
+                
+                # If no rows were updated, it means the room_id was not found.
+                if rows_affected == 0:
+                    logger.error(f"Failed to save state: Room with room_id '{room_id}' was not found in the database.")
+                    
             await conn.commit()
             logger.info(f"Successfully saved game state for room '{room_id}'")
         except Exception as e:

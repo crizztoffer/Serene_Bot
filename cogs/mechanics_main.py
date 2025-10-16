@@ -53,27 +53,24 @@ def evaluate_poker_hand(cards):
 
 # In cogs/mechanics_main.py
 
+# In cogs/mechanics_main.py
+
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot
-        logger.info("MechanicsMain (Active Timer) initialized.")
+        logger.info("MechanicsMain (Corrected Timer Logic) initialized.")
         self.db_user = bot.db_user
         self.db_password = bot.db_password
         self.db_host = bot.db_host
         self.db_name = "serene_users"
         if not hasattr(bot, "ws_rooms"): bot.ws_rooms = {}
         
-        # A set to track rooms that need timer checks to avoid scanning the entire DB
         self.rooms_with_active_timers = set()
-        
-        # Start the background task
         self.check_game_timers.start()
 
     def cog_unload(self):
-        # Gracefully stop the task when the cog is unloaded
         self.check_game_timers.cancel()
 
-    # --- All helper functions (_normalize_room_id, etc.) remain the same ---
     def _normalize_room_id(self, room_id: str) -> str:
         if not room_id: raise ValueError("room_id missing")
         return str(room_id).strip()
@@ -123,9 +120,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     (json.dumps(state), room_id)
                 )
                 if rows_affected == 0:
-                    logger.error(f"CRITICAL: Failed to save state. Room with room_id '{room_id}' was not found for update.")
+                    logger.error(f"CRITICAL: Failed to save state. Room '{room_id}' not found for update.")
             await conn.commit()
-            logger.info(f"Successfully saved (updated) game state for room '{room_id}'")
+            logger.info(f"Successfully saved state for room '{room_id}'")
         except Exception as e:
             if conn: await conn.rollback()
             logger.error(f"DB save error for room '{room_id}': {e}", exc_info=True)
@@ -155,39 +152,30 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state['deck'] = deck.to_output_format()
         return state
 
-    # --- NEW: Active Background Task for Timers ---
-    @tasks.loop(seconds=5.0) # Check every 5 seconds for expired timers
+    @tasks.loop(seconds=5.0)
     async def check_game_timers(self):
-        if not self.rooms_with_active_timers:
-            return
-
+        if not self.rooms_with_active_timers: return
         for room_id in list(self.rooms_with_active_timers):
             try:
                 state = await self._load_game_state(room_id)
                 if not state:
                     self.rooms_with_active_timers.discard(room_id)
                     continue
-
                 timer_start = state.get('pre_flop_timer_start_time')
                 if state.get('current_round') == 'pre-game' and timer_start and time.time() >= timer_start + 60:
                     logger.info(f"[TIMER TASK] 60s timer expired for room '{room_id}'. Transitioning.")
-                    
                     state = await self._start_new_round_pre_flop(state)
-                    
                     await self._save_game_state(room_id, state)
                     await self.broadcast_game_state(room_id, state)
-
                     self.rooms_with_active_timers.discard(room_id)
-
             except Exception as e:
                 logger.error(f"[TIMER TASK] Error checking room '{room_id}': {e}", exc_info=True)
-                self.rooms_with_active_timers.discard(room_id) # Remove on error
+                self.rooms_with_active_timers.discard(room_id)
 
     @check_game_timers.before_loop
     async def before_check_game_timers(self):
         await self.bot.wait_until_ready()
 
-    # --- MODIFIED: Action Handler now adds rooms to the timer task ---
     async def handle_websocket_game_action(self, data: dict):
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
@@ -200,13 +188,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state['guild_id'] = data.get('guild_id')
             state['channel_id'] = data.get('channel_id')
             
-            # --- The passive check is still useful for immediate responsiveness ---
             timer_start = state.get('pre_flop_timer_start_time')
             if state.get('current_round') == 'pre-game' and timer_start and time.time() >= timer_start + 60:
                 logger.info(f"[ACTION HANDLER] Timer expired for '{room_id}'. Transitioning.")
                 state = await self._start_new_round_pre_flop(state)
-                self.rooms_with_active_timers.discard(room_id) # Remove from active checks
+                self.rooms_with_active_timers.discard(room_id)
 
+            # --- RESTORED a structure that correctly falls through ---
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
                 seat_id, player_id = pdata.get('seat_id'), pdata.get('discord_id')
@@ -222,12 +210,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if len(state['players']) == 1 and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
                     state['pre_flop_timer_start_time'] = time.time()
                     state['initial_countdown_triggered'] = True
-                    # --- Add this room to the set of rooms the background task needs to check ---
                     self.rooms_with_active_timers.add(room_id)
                     logger.info(f"First player sat. Room '{room_id}' added to active timer checks.")
             
-            elif action is not None: pass
-            else: return
+            elif action is not None:
+                # This 'pass' is crucial. It allows actions we don't explicitly handle
+                # (or the timer check above) to proceed to the save/broadcast step.
+                pass
+            
+            else:
+                # Only return early if there is no action at all.
+                return
 
             await self._save_game_state(room_id, state)
             await self.broadcast_game_state(room_id, state)

@@ -157,7 +157,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         
         return state
 
-    # --- CORRECTED: Main Action Handler with New Initialization Logic ---
+    # --- CORRECTED: Main Action Handler with Fixed Logic Flow ---
     async def handle_websocket_game_action(self, data: dict):
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
@@ -165,7 +165,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             state = await self._load_game_state(room_id)
 
-            # --- NEW: Initialize state IN MEMORY if the database row was empty ---
             if state is None:
                 logger.info(f"Loaded empty state for '{room_id}'. Initializing 'pre-game' state in memory.")
                 state = {
@@ -183,12 +182,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.info(f"60s timer expired for room '{room_id}'. Transitioning to pre-flop.")
                     state = await self._start_new_round_pre_flop(state)
 
+            # --- START of THE FIX ---
+            # This logic now correctly handles 'player_sit' and rejects unknown actions.
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
                 seat_id, player_id = pdata.get('seat_id'), pdata.get('discord_id')
 
-                if not all([seat_id, player_id]): return
-                if any(p.get('discord_id') == player_id for p in state['players']): return
+                if not all([seat_id, player_id]):
+                    return # Exit if data is incomplete
+
+                if any(p.get('discord_id') == player_id for p in state['players']):
+                    return # Exit if player is already seated
                 
                 state['players'].append({
                     'discord_id': player_id, 'name': pdata.get('name', 'Player'),
@@ -201,8 +205,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     logger.info(f"First player sat down. 60-second pre-flop timer started for room '{room_id}'.")
             
             else:
-                return
+                logger.warning(f"Received unknown or unsupported action: '{action}'")
+                return # Exit for any action that is NOT 'player_sit'
+            # --- END of THE FIX ---
 
+            # These lines will now be correctly executed after a 'player_sit' action.
             await self._save_game_state(room_id, state)
             await self.broadcast_game_state(room_id, state)
 

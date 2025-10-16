@@ -117,11 +117,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
+                # This is the corrected "upsert" query without the 'last_activity' column.
                 await cursor.execute(
                     """
-                    INSERT INTO bot_game_rooms (room_id, game_state, last_activity, guild_id, channel_id)
-                    VALUES (%s, %s, NOW(), %s, %s)
-                    ON DUPLICATE KEY UPDATE game_state = VALUES(game_state), last_activity = NOW()
+                    INSERT INTO bot_game_rooms (room_id, game_state, guild_id, channel_id)
+                    VALUES (%s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE game_state = VALUES(game_state)
                     """,
                     (room_id, json.dumps(state), state.get('guild_id'), state.get('channel_id'))
                 )
@@ -131,6 +132,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if conn: await conn.rollback()
             logger.error(f"Failed to save game state for room '{room_id}': {e}", exc_info=True)
             raise
+        finally:
+            if conn: conn.close()
 
     async def broadcast_game_state(self, room_id: str, state: dict):
         bucket = self.bot.ws_rooms.get(room_id, set())

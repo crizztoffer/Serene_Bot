@@ -54,13 +54,24 @@ def evaluate_poker_hand(cards):
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot
-        logger.info("MechanicsMain (Update-Only) initialized.")
+        logger.info("MechanicsMain (Active Timer) initialized.")
         self.db_user = bot.db_user
         self.db_password = bot.db_password
         self.db_host = bot.db_host
         self.db_name = "serene_users"
         if not hasattr(bot, "ws_rooms"): bot.ws_rooms = {}
+        
+        # --- NEW: A set to track rooms that need timer checks ---
+        self.rooms_with_active_timers = set()
+        
+        # --- NEW: Start the background task ---
+        self.check_game_timers.start()
 
+    # The cog_unload is important to gracefully stop the task
+    def cog_unload(self):
+        self.check_game_timers.cancel()
+
+    # --- All helper functions (_normalize_room_id, register_ws_connection, etc.) remain the same ---
     def _normalize_room_id(self, room_id: str) -> str:
         if not room_id: raise ValueError("room_id missing")
         return str(room_id).strip()
@@ -87,7 +98,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             cursorclass=aiomysql.cursors.DictCursor
         )
 
-    # --- CORRECTED: This function is now READ-ONLY ---
     async def _load_game_state(self, room_id: str) -> dict:
         conn = None
         try:
@@ -95,19 +105,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT game_state FROM bot_game_rooms WHERE room_id = %s", (room_id,))
                 row = await cursor.fetchone()
-
                 if row and row.get('game_state'):
-                    logger.info(f"Loaded existing game state for room '{room_id}'")
                     return json.loads(row['game_state'])
-                
-                # If row is not found, or game_state is NULL, return None.
-                # The action handler is now responsible for initialization.
-                logger.warning(f"No valid game state found in DB for room '{room_id}'. The row may be missing or the game_state column is NULL.")
                 return None
         finally:
             if conn: conn.close()
 
-    # --- CORRECTED: This function is now UPDATE-ONLY ---
     async def _save_game_state(self, room_id: str, state: dict):
         conn = None
         try:
@@ -118,9 +121,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     (json.dumps(state), room_id)
                 )
                 if rows_affected == 0:
-                    logger.error(f"CRITICAL: Failed to save state. Room with room_id '{room_id}' was not found in the database for update.")
+                    logger.error(f"CRITICAL: Failed to save state. Room '{room_id}' not found for update.")
             await conn.commit()
-            logger.info(f"Successfully saved (updated) game state for room '{room_id}'")
+            logger.info(f"Successfully saved state for room '{room_id}'")
         except Exception as e:
             if conn: await conn.rollback()
             logger.error(f"DB save error for room '{room_id}': {e}", exc_info=True)
@@ -135,51 +138,65 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             try: await ws.send_str(msg)
             except: self.unregister_ws_connection(ws)
 
-    # --- Game Start Logic (needed for the timer) ---
     async def _start_new_round_pre_flop(self, state: dict):
         logger.info(f"Starting 'pre-flop' round for room '{state.get('room_id')}'")
-        
         deck = Deck(); deck.build(); deck.shuffle()
         state.update({
-            'current_round': 'pre_flop',
-            'deck': deck.to_output_format(),
-            'board_cards': [],
-            'dealer_hand': [],
-            'pre_flop_timer_start_time': None,
+            'current_round': 'pre_flop', 'deck': deck.to_output_format(), 'board_cards': [],
+            'dealer_hand': [], 'pre_flop_timer_start_time': None,
         })
         for p in state['players']: p['hand'] = []
-        
         for p in state['players']:
             if not p.get('is_spectating'):
                 p['hand'] = [deck.deal_card().to_output_format(), deck.deal_card().to_output_format()]
         state['dealer_hand'] = [deck.deal_card().to_output_format(), deck.deal_card().to_output_format()]
         state['deck'] = deck.to_output_format()
-        
         return state
 
-    # --- UPDATED: Main Action Handler with One-Time Timer Logic ---
+    # --- NEW: Active Background Task for Timers ---
+    @tasks.loop(seconds=5.0) # Check every 5 seconds
+    async def check_game_timers(self):
+        # Loop over a copy of the set in case it gets modified during iteration
+        for room_id in list(self.rooms_with_active_timers):
+            try:
+                state = await self._load_game_state(room_id)
+                if not state:
+                    self.rooms_with_active_timers.discard(room_id)
+                    continue
+
+                timer_start = state.get('pre_flop_timer_start_time')
+                if state.get('current_round') == 'pre-game' and timer_start and time.time() >= timer_start + 60:
+                    logger.info(f"[TIMER TASK] 60s timer expired for room '{room_id}'. Transitioning.")
+                    
+                    # Transition the state
+                    state = await self._start_new_round_pre_flop(state)
+                    
+                    # Save and broadcast the new state
+                    await self._save_game_state(room_id, state)
+                    await self.broadcast_game_state(room_id, state)
+
+                    # Remove from the set so we don't check it again
+                    self.rooms_with_active_timers.discard(room_id)
+
+            except Exception as e:
+                logger.error(f"[TIMER TASK] Error checking timer for room '{room_id}': {e}", exc_info=True)
+                self.rooms_with_active_timers.discard(room_id) # Remove on error to prevent loops
+
+    @check_game_timers.before_loop
+    async def before_check_game_timers(self):
+        await self.bot.wait_until_ready() # Ensure the bot is fully loaded before starting the task
+
+    # --- MODIFIED: Action Handler no longer checks the timer ---
     async def handle_websocket_game_action(self, data: dict):
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
         
         try:
             state = await self._load_game_state(room_id)
-
             if state is None:
-                logger.info(f"Loaded empty state for '{room_id}'. Initializing 'pre-game' state in memory.")
-                state = {
-                    'room_id': room_id,
-                    'current_round': 'pre-game',
-                    'players': []
-                }
+                state = {'room_id': room_id, 'current_round': 'pre-game', 'players': []}
             
-            state['guild_id'] = data.get('guild_id')
-            state['channel_id'] = data.get('channel_id')
-
-            timer_start = state.get('pre_flop_timer_start_time')
-            if state.get('current_round') == 'pre-game' and timer_start and time.time() >= timer_start + 60:
-                logger.info(f"60s timer expired for room '{room_id}'. Transitioning to pre-flop.")
-                state = await self._start_new_round_pre_flop(state)
+            state['guild_id'], state['channel_id'] = data.get('guild_id'), data.get('channel_id')
 
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
@@ -192,27 +209,22 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     'discord_id': player_id, 'name': pdata.get('name', 'Player'),
                     'seat_id': seat_id, 'avatar_url': pdata.get('avatar_url'), 'total_chips': 1000
                 })
-                logger.info(f"Player {player_id} sat in seat {seat_id} in room '{room_id}'.")
 
-                # --- MODIFIED: This condition now checks for the one-time flag ---
                 if len(state['players']) == 1 and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
                     state['pre_flop_timer_start_time'] = time.time()
-                    state['initial_countdown_triggered'] = True # <-- NEW: Set the one-time flag
-                    logger.info(f"First-ever player sat down. 60-second pre-flop timer started for room '{room_id}'.")
-            
-            elif action is not None:
-                pass 
+                    state['initial_countdown_triggered'] = True
+                    # --- NEW: Register this room for active timer checks ---
+                    self.rooms_with_active_timers.add(room_id)
+                    logger.info(f"First player sat. Room '{room_id}' added to active timer checks.")
             else:
                 return
 
             await self._save_game_state(room_id, state)
             await self.broadcast_game_state(room_id, state)
-
         except Exception as e:
             logger.error(f"Error in handle_websocket_game_action ('{action}'): {e}", exc_info=True)
 
-    async def evaluate_hands(self, state: dict):
-        pass # Evaluation logic remains here for future use
+    async def evaluate_hands(self, state: dict): pass
 
 async def setup(bot):
     await bot.add_cog(MechanicsMain(bot))

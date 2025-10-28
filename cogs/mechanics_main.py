@@ -362,7 +362,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def _to_post_showdown(self, state: dict):
         state["current_round"] = "post_showdown"
-        # Continue showing winners (if any) for whatever remains of the 15s (timer already started in _to_showdown)
+        # winners continue to display; timer already started
 
     async def _finish_betting_round_and_advance(self, state: dict):
         # If only one player remains active, jump to showdown
@@ -407,7 +407,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 # Betting rounds: enforce per-player auto timer
                 elif phase in BETTING_ROUNDS:
                     if not state.get("current_bettor"):
-                        # End of orbit
+                        # End of orbit -> advance phase immediately
                         await self._finish_betting_round_and_advance(state)
                     else:
                         # If timer expired, auto-fold and advance
@@ -417,9 +417,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                                 if str(p.get("discord_id")) == str(pid):
                                     p["is_folded"] = True
                                     p["in_hand"] = False
-                                    # Optional: forfeit current bet to pot here
-                                    # state["pot"] = int(state.get("pot", 0)) + int(p.get("bet", 0))
-                                    # p["bet"] = 0
                                     break
                             if self._active_player_count(state) <= 1:
                                 await self._finish_betting_round_and_advance(state)
@@ -465,7 +462,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state['guild_id'] = data.get('guild_id')
             state['channel_id'] = data.get('channel_id')
 
-            # Handle pre-game timeout if anyone interacts and the timer already elapsed
+            # If anyone interacts and pre-game countdown already elapsed, jump to pre-flop
             t0 = state.get('pre_flop_timer_start_time')
             if state.get('current_round') == 'pre-game' and t0 and time.time() >= t0 + PRE_GAME_WAIT_SECS:
                 await self._to_pre_flop(state)
@@ -476,14 +473,21 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or data.get('sender_id'))
                 if not seat_id or not player_id:
+                    # Still save/broadcast current state
+                    await self._save_game_state(room_id, state)
+                    await self.broadcast_game_state(room_id, state)
                     return
 
                 # Already seated? ignore
                 if any(str(p.get('discord_id')) == player_id for p in state['players']):
+                    await self._save_game_state(room_id, state)
+                    await self.broadcast_game_state(room_id, state)
                     return
 
                 # Seat free?
                 if any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
+                    await self._save_game_state(room_id, state)
+                    await self.broadcast_game_state(room_id, state)
                     return
 
                 is_mid_hand = state.get('current_round') not in ('pre-game', 'post_showdown')
@@ -517,8 +521,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
                     # If mid-hand, fold/forfeit (optional: move bet to pot)
                     if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
-                        # state['pot'] = int(state.get('pot', 0)) + int(p.get('bet', 0))
-                        # p['bet'] = 0
                         p['is_folded'] = True
                         p['in_hand'] = False
 
@@ -532,6 +534,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         else:
                             self._advance_bettor_pointer(state)
 
+                # keep timers alive for this room
+                self.rooms_with_active_timers.add(room_id)
+
             elif action == 'fold':
                 player_id = str(data.get('sender_id') or data.get('discord_id'))
                 p = self._find_player(state, player_id)
@@ -544,6 +549,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
+
+                self.rooms_with_active_timers.add(room_id)
 
             elif action == 'player_action':
                 # payload: {"move": "check"|"call"|"bet"|"raise"|"fold", "amount": optional}
@@ -559,13 +566,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             p["in_hand"] = False
                         elif move in ("check", "call", "bet", "raise"):
                             # TODO: Add betting logic, pot management, min-raise, etc.
-                            # For now we only advance the pointer.
                             pass
 
+                        # When the acting player has finished, advance immediately
                         if self._active_player_count(state) <= 1:
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
+
+                self.rooms_with_active_timers.add(room_id)
 
             elif action == 'advance_phase':
                 # Optional admin/testing action to force phase movement
@@ -577,9 +586,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 elif phase == 'showdown':     await self._to_post_showdown(state)
                 elif phase == 'post_showdown':await self._to_pre_flop(state)
 
+                self.rooms_with_active_timers.add(room_id)
+
             elif action is not None:
                 # Unknown but non-null action: ignore (still save/broadcast)
-                pass
+                self.rooms_with_active_timers.add(room_id)
             else:
                 # No action at all — nothing to do
                 return

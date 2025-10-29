@@ -372,27 +372,27 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self._mark_dirty(state)
 
     async def _to_flop(self, state: dict):
-        # Reveal 3 community cards
-        state["board_cards"].extend(self._deal_from_deck(state, 3))
-        # Immediately proceed to the betting round after flop
+        new_cards = self._deal_from_deck(state, 3)
+        logger.info(f"[{state.get('room_id')}] FLOP -> {new_cards}")
+        state["board_cards"].extend(new_cards)
         state["current_round"] = "pre_turn"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
         self._mark_dirty(state)
 
     async def _to_turn(self, state: dict):
-        # Reveal 1 card
-        state["board_cards"].extend(self._deal_from_deck(state, 1))
-        # Proceed to betting after turn
+        new_cards = self._deal_from_deck(state, 1)
+        logger.info(f"[{state.get('room_id')}] TURN -> {new_cards}")
+        state["board_cards"].extend(new_cards)
         state["current_round"] = "pre_river"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
         self._mark_dirty(state)
 
     async def _to_river(self, state: dict):
-        # Reveal 1 card
-        state["board_cards"].extend(self._deal_from_deck(state, 1))
-        # Proceed to betting after river
+        new_cards = self._deal_from_deck(state, 1)
+        logger.info(f"[{state.get('room_id')}] RIVER -> {new_cards}")
+        state["board_cards"].extend(new_cards)
         state["current_round"] = "pre_showdown"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
@@ -415,8 +415,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self._mark_dirty(state)
 
     async def _finish_betting_round_and_advance(self, state: dict):
-        # If only one player remains active, jump to showdown
-        if self._active_player_count(state) <= 1:
+        # Only short-circuit if NO active players remain
+        if self._active_player_count(state) == 0:
             await self._to_showdown(state)
             return
 
@@ -471,7 +471,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                                     p["in_hand"] = False
                                     self._mark_dirty(state)
                                     break
-                            if self._active_player_count(state) <= 1:
+                            if self._active_player_count(state) == 0:
                                 await self._finish_betting_round_and_advance(state)
                             else:
                                 self._advance_bettor_pointer(state)
@@ -535,10 +535,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 pdata = data.get('player_data', {})
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or data.get('sender_id'))
-                if not seat_id or not player_id:
-                    # No structural change
-                    pass
-                else:
+                if seat_id and player_id:
                     # Already seated? ignore
                     if any(str(p.get('discord_id')) == player_id for p in state['players']):
                         pass
@@ -577,7 +574,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     in_betting_round = state.get("current_round") in BETTING_ROUNDS
                     was_current = (state.get("current_bettor") == player_id)
 
-                    # If mid-hand, fold/forfeit (optional: move bet to pot)
+                    # If mid-hand, fold/forfeit
                     if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
                         p['is_folded'] = True
                         p['in_hand'] = False
@@ -589,7 +586,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
                     # If it was their turn, advance immediately (or finish round)
                     if in_betting_round and was_current:
-                        if self._active_player_count(state) <= 1:
+                        if self._active_player_count(state) == 0:
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
@@ -605,7 +602,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         p['is_folded'] = True
                         p['in_hand'] = False
                         self._mark_dirty(state)
-                        if self._active_player_count(state) <= 1:
+                        if self._active_player_count(state) == 0:
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
@@ -627,11 +624,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             self._mark_dirty(state)
                         elif move in ("check", "call", "bet", "raise"):
                             # TODO: pot/bet logic
-                            # Even with placeholder, advancing pointer is a structural change
                             pass
 
                         # When the acting player has finished, advance immediately
-                        if self._active_player_count(state) <= 1:
+                        if self._active_player_count(state) == 0:
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)

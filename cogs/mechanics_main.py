@@ -369,12 +369,42 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             self.rank = rank
             self.suit = suit
 
-    def _mk_eval_card(self, cdict):
-        if not cdict: return None
-        rank = cdict.get("rank") or cdict.get("r") or (cdict.get("code", "")[:1] if cdict.get("code") else None)
-        suit = cdict.get("suit") or cdict.get("s") or (cdict.get("code", " ")[-1:] if cdict.get("code") else None)
-        if not rank or not suit: return None
-        return self._EvalCard(str(rank), str(suit))
+    # --- tolerant parser: accepts dicts *or* strings like "AS", "0H", "10D", "Td"
+    def _mk_eval_card(self, c):
+        if not c:
+            return None
+
+        # Dict-like payload (preferred)
+        if isinstance(c, dict):
+            code = c.get("code")
+            rank = c.get("rank") or c.get("r")
+            suit = c.get("suit") or c.get("s")
+            if not rank or not suit:
+                if isinstance(code, str) and len(code) >= 2:
+                    t = code.strip().upper()
+                    s = t[-1]
+                    r = t[:-1]
+                    if r in ("10", "T"): r = "0"
+                    return self._EvalCard(r, s)
+                return None
+            # normalize rank "10"/"T" to "0" (frontend does this too)
+            rr = str(rank).upper()
+            if rr in ("10", "T"): rr = "0"
+            ss = str(suit).upper()[0]
+            return self._EvalCard(rr, ss)
+
+        # String payload (legacy)
+        if isinstance(c, str):
+            t = c.strip().upper()
+            if len(t) < 2:
+                return None
+            s = t[-1]
+            r = t[:-1]
+            if r in ("10", "T"): r = "0"
+            return self._EvalCard(r, s)
+
+        # Unknown type
+        return None
 
     # ---------------- Dealing & phase transitions ----------------
     def _deal_from_deck(self, state: dict, n: int):
@@ -456,7 +486,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _to_showdown(self, state: dict):
         state["current_round"] = "showdown"
 
-        # --- Build evaluator inputs
+        # --- Build evaluator inputs (tolerant to strings/dicts)
         board_eval = [self._mk_eval_card(c) for c in (state.get("board_cards") or [])]
         board_eval = [c for c in board_eval if c]
 

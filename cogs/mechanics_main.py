@@ -19,6 +19,7 @@ HAND_RANKINGS = {
 def get_rank_value(rank: str) -> int:
     if rank.isdigit(): return 10 if rank == '0' else int(rank)
     return {'J': 11, 'Q': 12, 'K': 13, 'A': 14}.get(rank, 0)
+
 def evaluate_poker_hand(cards):
     def rank_value(card): return get_rank_value(card.rank)
     def is_straight(ranks):
@@ -54,14 +55,14 @@ def evaluate_poker_hand(cards):
 # ---------------- Round & Timer Configuration ----------------
 ROUND_ORDER = [
     "pre-game",
-    "pre_flop",  # betting
-    "flop",      # reveal 3 -> then pre_turn betting
-    "pre_turn",  # betting
-    "turn",      # reveal 1 -> then pre_river betting
-    "pre_river", # betting
-    "river",     # reveal 1 -> then pre_showdown betting
+    "pre_flop",     # betting
+    "flop",         # reveal 3 -> then pre_turn betting
+    "pre_turn",     # betting
+    "turn",         # reveal 1 -> then pre_river betting
+    "pre_river",    # betting
+    "river",        # reveal 1 -> then pre_showdown betting
     "pre_showdown", # betting
-    "showdown",  # reveal all / compute results
+    "showdown",     # reveal all / compute results
     "post_showdown" # winners shown, then go to pre_flop (skip pre-game)
 ]
 
@@ -160,14 +161,53 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         finally:
             if conn: conn.close()
 
-    async def broadcast_game_state(self, room_id: str, state: dict):
+    # ---------------- Partitioned broadcast helpers ----------------
+    def _mark_dirty(self, state: dict):
+        state["__rev"] = int(state.get("__rev") or 0) + 1
+
+    def _has_timers(self, state: dict):
+        in_bet = state.get("current_round") in {"pre_flop", "pre_turn", "pre_river", "pre_showdown"}
+        has_action_deadline = isinstance(state.get("action_deadline_epoch"), int)
+        pre = state.get("current_round") == "pre-game" and state.get("pre_flop_timer_start_time")
+        postable = state.get("round_timer_start") and state.get("round_timer_secs")
+        return bool((in_bet and has_action_deadline) or pre or postable)
+
+    async def _broadcast_state(self, room_id: str, state: dict):
         bucket = self.bot.ws_rooms.get(room_id, set())
         if not bucket: return
-        envelope = {"game_state": state, "server_ts": int(time.time())}
+        envelope = {
+            "type": "state",
+            "game_state": state,
+            "server_ts": int(time.time()),
+        }
         msg = json.dumps(envelope)
         for ws in list(bucket):
             try: await ws.send_str(msg)
             except: self.unregister_ws_connection(ws)
+
+    async def _broadcast_tick(self, room_id: str, state: dict):
+        bucket = self.bot.ws_rooms.get(room_id, set())
+        if not bucket: return
+        payload = {
+            "type": "tick",
+            "server_ts": int(time.time()),
+            "current_round": state.get("current_round"),
+            "action_deadline_epoch": state.get("action_deadline_epoch"),
+            "pre_flop_timer_start_time": state.get("pre_flop_timer_start_time"),
+            "round_timer_start": state.get("round_timer_start"),
+            "round_timer_secs": state.get("round_timer_secs"),
+            "current_bettor": state.get("current_bettor"),
+            "pot": state.get("pot"),
+            "__rev": state.get("__rev", 0),
+        }
+        msg = json.dumps(payload)
+        for ws in list(bucket):
+            try: await ws.send_str(msg)
+            except: self.unregister_ws_connection(ws)
+
+    def _add_room_active(self, room_id: str):
+        rid = self._normalize_room_id(room_id)
+        self.rooms_with_active_timers.add(rid)
 
     # ---------------- State defaults & evaluators ----------------
     def _ensure_defaults(self, state: dict) -> dict:
@@ -182,6 +222,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state.setdefault("round_timer_secs", None)
         state.setdefault("action_deadline_epoch", None)
         state.setdefault("initial_countdown_triggered", False)
+        state.setdefault("__rev", 0)  # revision for change tracking
         return state
 
     def _ensure_betting_defaults(self, state: dict) -> dict:
@@ -271,19 +312,22 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             state["action_timer_start"] = None
             state["action_timer_secs"] = None
             state["action_deadline_epoch"] = None
+            self._mark_dirty(state)
             return
         i = (state.get("action_index", 0) + 1)
         if i >= n:
-            # End of orbit -> round complete
+            # End of orbit -> round complete (no current bettor)
             state["current_bettor"] = None
             state["action_index"] = n
             state["action_timer_start"] = None
             state["action_timer_secs"] = None
             state["action_deadline_epoch"] = None
+            self._mark_dirty(state)
             return
         state["action_index"] = i
         state["current_bettor"] = order[i]
         self._start_action_timer(state)
+        self._mark_dirty(state)
 
     # ---------------- Dealing & phase transitions ----------------
     def _deal_from_deck(self, state: dict, n: int):
@@ -325,6 +369,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state["current_round"] = "pre_flop"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
+        self._mark_dirty(state)
 
     async def _to_flop(self, state: dict):
         # Reveal 3 community cards
@@ -333,6 +378,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state["current_round"] = "pre_turn"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
+        self._mark_dirty(state)
 
     async def _to_turn(self, state: dict):
         # Reveal 1 card
@@ -341,6 +387,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state["current_round"] = "pre_river"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
+        self._mark_dirty(state)
 
     async def _to_river(self, state: dict):
         # Reveal 1 card
@@ -349,20 +396,23 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state["current_round"] = "pre_showdown"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
+        self._mark_dirty(state)
 
     async def _to_pre_showdown(self, state: dict):
         state["current_round"] = "pre_showdown"
         self._ensure_betting_defaults(state)
         self._build_action_order(state)
+        self._mark_dirty(state)
 
     async def _to_showdown(self, state: dict):
         state["current_round"] = "showdown"
         # TODO: evaluate players vs dealer; populate winners & payouts
         self._start_phase_timer(state, POST_SHOWDOWN_WAIT_SECS)
+        self._mark_dirty(state)
 
     async def _to_post_showdown(self, state: dict):
         state["current_round"] = "post_showdown"
-        # winners continue to display; timer already started
+        self._mark_dirty(state)
 
     async def _finish_betting_round_and_advance(self, state: dict):
         # If only one player remains active, jump to showdown
@@ -387,15 +437,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             return
 
         for room_id in list(self.rooms_with_active_timers):
+            rid = self._normalize_room_id(room_id)
             try:
-                state = await self._load_game_state(room_id)
+                state = await self._load_game_state(rid)
                 if not state:
-                    self.rooms_with_active_timers.discard(room_id)
+                    # No persisted state yet; continue polling
                     continue
 
                 self._ensure_defaults(state)
                 self._ensure_betting_defaults(state)
 
+                before_rev = int(state.get("__rev") or 0)
                 phase = state.get("current_round", "pre-game")
 
                 # Pre-game: wait 60s from first seat
@@ -417,6 +469,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                                 if str(p.get("discord_id")) == str(pid):
                                     p["is_folded"] = True
                                     p["in_hand"] = False
+                                    self._mark_dirty(state)
                                     break
                             if self._active_player_count(state) <= 1:
                                 await self._finish_betting_round_and_advance(state)
@@ -431,16 +484,24 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     if self._timer_expired(state):
                         await self._to_pre_flop(state)
 
-                # Persist + broadcast
-                await self._save_game_state(room_id, state)
-                await self.broadcast_game_state(room_id, state)
+                # Persist/broadcast only if structurally changed
+                after_rev = int(state.get("__rev") or 0)
+                changed = (after_rev != before_rev)
 
-                # Keep polling once a room is active
-                self.rooms_with_active_timers.add(room_id)
+                if changed:
+                    await self._save_game_state(rid, state)
+                    await self._broadcast_state(rid, state)
+                else:
+                    # No structural change; send lightweight tick if timers are visible
+                    if self._has_timers(state):
+                        await self._broadcast_tick(rid, state)
+
+                # Keep polling this room
+                self._add_room_active(rid)
 
             except Exception as e:
-                logger.error(f"[TIMER TASK] Error checking room '{room_id}': {e}", exc_info=True)
-                self.rooms_with_active_timers.discard(room_id)
+                logger.error(f"[TIMER TASK] Error checking room '{rid}': {e}", exc_info=True)
+                self.rooms_with_active_timers.discard(rid)
 
     @check_game_timers.before_loop
     async def before_check_game_timers(self):
@@ -459,6 +520,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             self._ensure_defaults(state)
             self._ensure_betting_defaults(state)
 
+            before_rev = int(state.get("__rev") or 0)
+
             state['guild_id'] = data.get('guild_id')
             state['channel_id'] = data.get('channel_id')
 
@@ -466,51 +529,46 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             t0 = state.get('pre_flop_timer_start_time')
             if state.get('current_round') == 'pre-game' and t0 and time.time() >= t0 + PRE_GAME_WAIT_SECS:
                 await self._to_pre_flop(state)
-                self.rooms_with_active_timers.add(room_id)
+                self._add_room_active(room_id)
 
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or data.get('sender_id'))
                 if not seat_id or not player_id:
-                    # Still save/broadcast current state
-                    await self._save_game_state(room_id, state)
-                    await self.broadcast_game_state(room_id, state)
-                    return
+                    # No structural change
+                    pass
+                else:
+                    # Already seated? ignore
+                    if any(str(p.get('discord_id')) == player_id for p in state['players']):
+                        pass
+                    # Seat free?
+                    elif any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
+                        pass
+                    else:
+                        is_mid_hand = state.get('current_round') not in ('pre-game', 'post_showdown')
+                        state['players'].append({
+                            'discord_id': player_id,
+                            'name': pdata.get('name', 'Player'),
+                            'seat_id': seat_id,
+                            'avatar_url': pdata.get('avatar_url'),
+                            'total_chips': 1000,
+                            'hand': [],
+                            'bet': 0,
+                            'is_folded': False,
+                            'is_spectating': bool(is_mid_hand),
+                            'in_hand': not bool(is_mid_hand),
+                        })
+                        self._mark_dirty(state)
 
-                # Already seated? ignore
-                if any(str(p.get('discord_id')) == player_id for p in state['players']):
-                    await self._save_game_state(room_id, state)
-                    await self.broadcast_game_state(room_id, state)
-                    return
-
-                # Seat free?
-                if any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
-                    await self._save_game_state(room_id, state)
-                    await self.broadcast_game_state(room_id, state)
-                    return
-
-                is_mid_hand = state.get('current_round') not in ('pre-game', 'post_showdown')
-                state['players'].append({
-                    'discord_id': player_id,
-                    'name': pdata.get('name', 'Player'),
-                    'seat_id': seat_id,
-                    'avatar_url': pdata.get('avatar_url'),
-                    'total_chips': 1000,
-                    'hand': [],
-                    'bet': 0,
-                    'is_folded': False,
-                    'is_spectating': bool(is_mid_hand),
-                    'in_hand': not bool(is_mid_hand),
-                })
-
-                # First eligible sitter: start pre-game countdown
-                if len([p for p in state['players'] if not p.get('is_spectating')]) == 1 \
-                    and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
-                    state['pre_flop_timer_start_time'] = time.time()
-                    state['initial_countdown_triggered'] = True
-                    self.rooms_with_active_timers.add(room_id)
-                    logger.info(f"First player sat. Room '{room_id}' added to active timer checks.")
+                        # First eligible sitter: start pre-game countdown
+                        if len([p for p in state['players'] if not p.get('is_spectating')]) == 1 \
+                            and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
+                            state['pre_flop_timer_start_time'] = time.time()
+                            state['initial_countdown_triggered'] = True
+                            self._add_room_active(room_id)
+                            self._mark_dirty(state)
+                            logger.info(f"First player sat. Room '{room_id}' added to active timer checks.")
 
             elif action == 'player_leave':
                 player_id = str(data.get('sender_id') or data.get('discord_id'))
@@ -523,9 +581,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
                         p['is_folded'] = True
                         p['in_hand'] = False
+                        self._mark_dirty(state)
 
                     # Remove them from table entirely (free seat)
                     state['players'] = [q for q in state['players'] if str(q.get('discord_id')) != player_id]
+                    self._mark_dirty(state)
 
                     # If it was their turn, advance immediately (or finish round)
                     if in_betting_round and was_current:
@@ -534,8 +594,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         else:
                             self._advance_bettor_pointer(state)
 
-                # keep timers alive for this room
-                self.rooms_with_active_timers.add(room_id)
+                self._add_room_active(room_id)
 
             elif action == 'fold':
                 player_id = str(data.get('sender_id') or data.get('discord_id'))
@@ -545,12 +604,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     if state.get("current_bettor") == player_id:
                         p['is_folded'] = True
                         p['in_hand'] = False
+                        self._mark_dirty(state)
                         if self._active_player_count(state) <= 1:
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
 
-                self.rooms_with_active_timers.add(room_id)
+                self._add_room_active(room_id)
 
             elif action == 'player_action':
                 # payload: {"move": "check"|"call"|"bet"|"raise"|"fold", "amount": optional}
@@ -564,8 +624,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         if move == "fold":
                             p["is_folded"] = True
                             p["in_hand"] = False
+                            self._mark_dirty(state)
                         elif move in ("check", "call", "bet", "raise"):
-                            # TODO: Add betting logic, pot management, min-raise, etc.
+                            # TODO: pot/bet logic
+                            # Even with placeholder, advancing pointer is a structural change
                             pass
 
                         # When the acting player has finished, advance immediately
@@ -574,7 +636,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         else:
                             self._advance_bettor_pointer(state)
 
-                self.rooms_with_active_timers.add(room_id)
+                self._add_room_active(room_id)
 
             elif action == 'advance_phase':
                 # Optional admin/testing action to force phase movement
@@ -585,18 +647,24 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 elif phase == 'pre_showdown': await self._to_showdown(state)
                 elif phase == 'showdown':     await self._to_post_showdown(state)
                 elif phase == 'post_showdown':await self._to_pre_flop(state)
-
-                self.rooms_with_active_timers.add(room_id)
+                self._add_room_active(room_id)
 
             elif action is not None:
-                # Unknown but non-null action: ignore (still save/broadcast)
-                self.rooms_with_active_timers.add(room_id)
+                # Unknown but non-null action: still keep timers alive
+                self._add_room_active(room_id)
             else:
                 # No action at all — nothing to do
                 return
 
-            await self._save_game_state(room_id, state)
-            await self.broadcast_game_state(room_id, state)
+            # Save/broadcast only if structurally changed
+            after_rev = int(state.get("__rev") or 0)
+            if after_rev != before_rev:
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+            else:
+                # No structural mutation; do not write state, no redraw broadcast
+                # If there are active timers, a tick will be sent by the loop
+                pass
 
         except Exception as e:
             logger.error(f"Error in handle_websocket_game_action ('{action}'): {e}", exc_info=True)

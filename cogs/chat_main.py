@@ -134,27 +134,53 @@ class ChatMain(commands.Cog):
     async def _serene_post(self, data: dict) -> str | None:
         """
         POST to Serene bot and return plain text response, or None on error.
+        Adds detailed logging for diagnostics.
         """
+        # Log outgoing request payload
+        try:
+            logger.info("[Serene] POST -> %s | data=%s", SERENE_BOT_URL, data)
+        except Exception:
+            pass
+
         try:
             async with self.http_session.post(SERENE_BOT_URL, data=data) as resp:
-                if resp.status != 200:
-                    logger.warning("Serene bot HTTP %s for data=%s", resp.status, data)
+                status = resp.status
+                try:
+                    text = await resp.text()
+                except Exception as e_read:
+                    logger.error("[Serene] HTTP %s read error: %s", status, e_read)
                     return None
-                return await resp.text()
+
+                # Normalize body for logs
+                body = text if isinstance(text, str) else (text or "")
+                body_preview = body[:300].replace("\n", "\\n")
+                logger.info("[Serene] HTTP %s <- body_len=%s preview=\"%s%s\"",
+                            status, len(body), body_preview, "…" if len(body) > 300 else "")
+
+                if status != 200:
+                    logger.warning("[Serene] Non-200 response (status=%s), discarding.", status)
+                    return None
+
+                if not body.strip():
+                    logger.info("[Serene] Empty or whitespace-only body returned.")
+                    return None
+
+                return body
         except asyncio.TimeoutError:
-            logger.warning("Serene bot request timed out for data=%s", data)
+            logger.warning("[Serene] Request timed out for data=%s", data)
             return None
         except aiohttp.ClientError as e:
-            logger.warning("Serene bot client error: %s", e)
+            logger.warning("[Serene] Client error: %s", e)
             return None
         except Exception:
-            logger.exception("Unexpected error posting to Serene bot.")
+            logger.exception("[Serene] Unexpected error posting to Serene bot.")
             return None
 
     async def _serene_start(self, room_id: str, display_name: str):
         """
         Trigger Serene's 'start' and broadcast her reply if any.
         """
+        logger.info("[Serene] START triggered by %s in room %s", display_name, room_id)
         reply = await self._serene_post({"start": "true", "player": display_name})
         if reply:
             payload = {
@@ -166,13 +192,18 @@ class ChatMain(commands.Cog):
                 "botId": "serene",        # NEW
                 "timestamp": int(time.time()),
             }
+            logger.info("[Serene] Broadcasting START reply to room %s (len=%d)", room_id, len(reply))
             await self._broadcast_room_json(room_id, payload)
+        else:
+            logger.info("[Serene] START produced no reply for room %s", room_id)
 
     async def _serene_question(self, room_id: str, display_name: str, question_raw: str):
         """
         Send a question to Serene (HTML-escaped) and broadcast her reply if any.
         """
         safe_q = html.escape(question_raw or "", quote=True)
+        logger.info("[Serene] QUESTION from %s in room %s: raw=\"%s\" safe=\"%s\"",
+                    display_name, room_id, (question_raw or "")[:200], safe_q[:200])
         reply = await self._serene_post({"question": safe_q, "player": display_name})
         if reply:
             payload = {
@@ -184,7 +215,10 @@ class ChatMain(commands.Cog):
                 "botId": "serene",        # NEW
                 "timestamp": int(time.time()),
             }
+            logger.info("[Serene] Broadcasting QUESTION reply to room %s (len=%d)", room_id, len(reply))
             await self._broadcast_room_json(room_id, payload)
+        else:
+            logger.info("[Serene] QUESTION produced no reply for room %s", room_id)
 
     # -------------------------
     # WebSocket handler
@@ -289,12 +323,14 @@ class ChatMain(commands.Cog):
 
                         # If awaiting a question from this client, treat THIS message as the question
                         if ws in self._awaiting_serene_question:
+                            logger.info("[Serene] Socket is awaiting question -> sending question now.")
                             # Clear first to avoid re-entrancy issues
                             self._awaiting_serene_question.discard(ws)
                             asyncio.create_task(self._serene_question(room_id, display_name, message_text))
 
                         # If this message includes the word 'serene', trigger start and arm next message as question
                         if SERENE_WORD_RE.search(lowered):
+                            logger.info("[Serene] Keyword detected in room %s by %s. Arming next message as question and calling START.", room_id, display_name)
                             self._awaiting_serene_question.add(ws)
                             asyncio.create_task(self._serene_start(room_id, display_name))
 

@@ -12,7 +12,7 @@ import aiohttp
 import time
 import re
 from typing import List, Optional, Tuple
-import html  # <-- NEW: for HTML-escaping when sending Serene questions
+import html  # <-- for HTML-escaping when sending Serene questions
 
 # Load env vars
 load_dotenv()
@@ -655,11 +655,64 @@ async def health(_):
 async def game_was_probe(_):
     return web.Response(text="game_was endpoint is here; use WebSocket upgrade.", status=426)
 
-# ===================== SERENE INTEGRATION HELPERS (NEW) =====================
+# ===================== SERENE INTEGRATION HELPERS (UPDATED) =====================
 
-# Config for Serene
+# Config for Serene (GET-based to match PHP)
 SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
 SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
+HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)
+
+# Image/GIF detection
+IMG_EXT_RE = r"(?:gif|png|jpe?g|webp)"
+IMAGE_URL_RE = re.compile(rf'^\s*(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)\s*$', re.IGNORECASE)
+IMAGE_URL_IN_TEXT_RE = re.compile(rf'(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)', re.IGNORECASE)
+IMG_TAG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+DATA_URL_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
+
+def _extract_image_from_text(text: str) -> Optional[str]:
+    """Return an image/gif src if present (URL, data: URL, or <img src=...>)."""
+    if not text:
+        return None
+    m = IMAGE_URL_RE.match(text.strip())
+    if m:
+        return m.group(1)
+    m2 = IMAGE_URL_IN_TEXT_RE.search(text)
+    if m2:
+        return m2.group(1)
+    m3 = IMG_TAG_SRC_RE.search(text)
+    if m3:
+        return m3.group(1)
+    if DATA_URL_RE.match(text.strip()):
+        return text.strip()
+    return None
+
+def _build_message_payload(room_id: str, display_name: str, message_text: str,
+                           sender_type: str = "user", bot_id: Optional[str] = None) -> dict:
+    """Build a chat payload; wrap images as <img class="chat-gif">, set isImage/imageUrl."""
+    img_src = _extract_image_from_text(message_text or "")
+    if img_src:
+        wrapped = f'<img class="chat-gif" src="{html.escape(img_src, quote=True)}" />'
+        payload = {
+            "type": "new_message",
+            "room_id": room_id,
+            "displayName": display_name,
+            "message": wrapped,
+            "isImage": True,
+            "imageUrl": img_src,
+        }
+    else:
+        payload = {
+            "type": "new_message",
+            "room_id": room_id,
+            "displayName": display_name,
+            "message": message_text,
+            "isImage": False,
+        }
+    if sender_type == "bot":
+        payload["senderType"] = "bot"
+        if bot_id:
+            payload["botId"] = bot_id
+    return payload
 
 # Shared HTTP client for Serene calls
 _serene_http_session: Optional[aiohttp.ClientSession] = None
@@ -670,33 +723,35 @@ def _get_serene_http() -> aiohttp.ClientSession:
         _serene_http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
     return _serene_http_session
 
-async def _serene_post(data: dict) -> Optional[str]:
+async def _serene_get(params: dict) -> Optional[str]:
     """
-    POST to Serene and return response text, or None on error / empty / 'false'.
+    GET to Serene and return response text, or None on error / empty / 'false'.
+    Matches PHP expectations of $_GET[...] checks.
     """
     try:
         session = _get_serene_http()
-        async with session.post(SERENE_BOT_URL, data=data) as resp:
-            if resp.status != 200:
-                logger.warning("Serene HTTP %s for data=%s", resp.status, data)
+        async with session.get(SERENE_BOT_URL, params=params) as resp:
+            try:
+                txt = (await resp.text()).strip()
+            except Exception as e_read:
+                logger.error("[Serene] HTTP %s read error: %s", resp.status, e_read)
                 return None
-            txt = (await resp.text()).strip()
-            if not txt or txt.lower() == "false":
+            if resp.status != 200 or not txt or txt.lower() == "false":
                 return None
             return txt
     except asyncio.TimeoutError:
-        logger.warning("Serene request timed out: %s", data)
+        logger.warning("Serene GET timed out: %s", params)
         return None
     except aiohttp.ClientError as e:
         logger.warning("Serene client error: %s", e)
         return None
     except Exception:
-        logger.exception("Unexpected error posting to Serene")
+        logger.exception("Unexpected error in Serene GET")
         return None
 
-async def _broadcast_room_json_str(room_id: str, payload: dict):
+async def _broadcast_room_json(room_id: str, payload: dict):
     """
-    Broadcast JSON (string) to all clients in chat room. Safe if room disappears.
+    Broadcast dict JSON to the room (uses send_str). Cleans up dead sockets.
     """
     try:
         room = bot.chat_ws_rooms.get(room_id) or set()
@@ -712,34 +767,37 @@ async def _broadcast_room_json_str(room_id: str, payload: dict):
     except Exception:
         logger.exception("Broadcast error for room %s", room_id)
 
+async def _delayed_serene_message(room_id: str, message_text: str):
+    """
+    Humanize Serene: wait 2s then send; wrap image if needed.
+    """
+    try:
+        await asyncio.sleep(2.0)
+    except Exception:
+        pass
+    payload = _build_message_payload(room_id, "Serene", message_text, sender_type="bot", bot_id="serene")
+    await _broadcast_room_json(room_id, payload)
+
 async def _serene_start(room_id: str, display_name: str):
-    reply = await _serene_post({"start": "true", "player": display_name})
+    reply = await _serene_get({"start": "true", "player": display_name})
     if reply:
-        payload = {
-            "type": "new_message",
-            "displayName": "Serene",
-            "message": reply,
-            "room_id": room_id,
-            "senderType": "bot",
-            "botId": "serene",
-        }
-        await _broadcast_room_json_str(room_id, payload)
+        asyncio.create_task(_delayed_serene_message(room_id, reply))
 
 async def _serene_question(room_id: str, display_name: str, question_raw: str):
     safe_q = html.escape(question_raw or "", quote=True)
-    reply = await _serene_post({"question": safe_q, "player": display_name})
+    reply = await _serene_get({"question": safe_q, "player": display_name})
     if reply:
-        payload = {
-            "type": "new_message",
-            "displayName": "Serene",
-            "message": reply,
-            "room_id": room_id,
-            "senderType": "bot",
-            "botId": "serene",
-        }
-        await _broadcast_room_json_str(room_id, payload)
+        asyncio.create_task(_delayed_serene_message(room_id, reply))
 
-# ---------------------- CHAT WS: /chat_ws (current + Serene) ----------------------
+async def _serene_hail(room_id: str, display_name: str, hail_phrase: str):
+    """
+    Handle 'hail serene' phrase: GET with hail=<matched phrase>&player=<display name>
+    """
+    reply = await _serene_get({"hail": hail_phrase, "player": display_name})
+    if reply:
+        asyncio.create_task(_delayed_serene_message(room_id, reply))
+
+# ---------------------- CHAT WS: /chat_ws (current + Serene + images) ----------------------
 async def chat_websocket_handler(request):
     """
     Handles chat WebSocket connections for game lobbies and rooms.
@@ -749,22 +807,24 @@ async def chat_websocket_handler(request):
       • broadcast user_joined / user_left
       • rebroadcast every user message as type="new_message"
 
-    Adds Serene:
-      • If a message contains the word 'serene' (case-insensitive), post {start:true, player}
+    Adds Serene & images:
+      • If a message contains 'serene' (case-insensitive), GET {start:true, player}
         and mark the NEXT message from that same socket as the Serene question.
-      • That next message is posted as {question:<html-escaped>, player}.
-      • Serene replies are broadcast with senderType="bot", botId="serene".
+      • That next message is GET {question:<html-escaped>, player}.
+      • 'hail serene' sends GET {hail:'hail serene', player:<name>} (no start/question).
+      • Serene replies are delayed by ~2s and include image wrapping.
+      • Normal user messages are inspected: if they contain an image/gif (URL/data URL/<img>),
+        they are wrapped in <img class="chat-gif" ...> and sent with isImage/imageUrl.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
 
-    # Log once the upgrade succeeded – helpful in deployment logs
     logger.info("✅ [/chat_ws] WebSocket upgraded successfully from %s", request.remote)
 
     room_id = None
     display_name = None
 
-    # Track whether this specific socket's next message is a Serene question
+    # Track whether this socket's next message is a Serene question
     awaiting_serene_question = False
 
     try:
@@ -791,9 +851,9 @@ async def chat_websocket_handler(request):
             "displayName": display_name,
             "room_id": room_id
         }
-        await _broadcast_room_json_str(room_id, join_message)
+        await _broadcast_room_json(room_id, join_message)
 
-        # 4. Listen for and broadcast messages (now with Serene)
+        # 4. Listen for and broadcast messages (now with Serene & image handling)
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
                 # Parse incoming JSON
@@ -804,23 +864,23 @@ async def chat_websocket_handler(request):
 
                 if 'message' in data:
                     user_text = str(data['message'])
+                    lowered = user_text.lower()
 
-                    # (A) Broadcast user's message as-is (existing behavior)
-                    broadcast_message = {
-                        "type": "new_message",
-                        "displayName": display_name,
-                        "message": user_text,
-                        "room_id": room_id
-                    }
-                    await _broadcast_room_json_str(room_id, broadcast_message)
+                    # (A) Broadcast user's message (with image/gif detection)
+                    user_payload = _build_message_payload(room_id, display_name, user_text, sender_type="user")
+                    await _broadcast_room_json(room_id, user_payload)
 
                     # (B) Serene: if awaiting a question from this socket, post it
                     if awaiting_serene_question:
                         awaiting_serene_question = False  # clear first to avoid re-entrancy
                         asyncio.create_task(_serene_question(room_id, display_name, user_text))
 
-                    # (C) Serene: trigger start if message mentions 'serene', and arm next msg as question
-                    if SERENE_WORD_RE.search(user_text or ""):
+                    # (C) Serene: check "hail serene" first (does NOT also trigger start/question)
+                    m_hail = HAIL_SERENE_RE.search(lowered)
+                    if m_hail:
+                        asyncio.create_task(_serene_hail(room_id, display_name, m_hail.group(0)))
+                    # (D) Else: generic 'serene' keyword -> trigger start and arm next message as question
+                    elif SERENE_WORD_RE.search(lowered):
                         awaiting_serene_question = True
                         asyncio.create_task(_serene_start(room_id, display_name))
 
@@ -846,10 +906,9 @@ async def chat_websocket_handler(request):
                     "room_id": room_id
                 }
                 if room_id in bot.chat_ws_rooms:
-                    await _broadcast_room_json_str(room_id, leave_message)
+                    await _broadcast_room_json(room_id, leave_message)
         finally:
             return ws
-
 
 # ---------------------- GAME WS: /game_was (robust + loud logs) ----------------------
 async def game_was_handler(request):

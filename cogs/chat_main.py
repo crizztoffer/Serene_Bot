@@ -8,7 +8,7 @@ import re
 import discord
 from discord.ext import commands
 import html  # for HTML-escaping the question text
-from typing import Optional
+from typing import Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +20,13 @@ SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
 SERENE_DISPLAY_NAME = "Serene"
 SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
 HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # detect "hail serene"
+
+# Image/GIF detection
+IMG_EXT_RE = r"(?:gif|png|jpe?g|webp)"
+IMAGE_URL_RE = re.compile(rf'^\s*(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)\s*$', re.IGNORECASE)
+IMAGE_URL_IN_TEXT_RE = re.compile(rf'(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)', re.IGNORECASE)
+IMG_TAG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
+DATA_URL_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
 
 # 0.5x..2.0x speed by integer 50..200
 MIN_SPEED_PCT = 50
@@ -112,6 +119,79 @@ class ChatMain(commands.Cog):
                 logger.warning("Could not send payload to a client in room %s.", room_id)
 
     # -------------------------
+    # Image helpers
+    # -------------------------
+
+    def _extract_image_from_text(self, text: str) -> Optional[str]:
+        """Return an image/gif source if present (URL, data: URL, or <img src=...>)."""
+        if not text:
+            return None
+
+        # Exact image URL line
+        m = IMAGE_URL_RE.match(text.strip())
+        if m:
+            return m.group(1)
+
+        # Any image URL within text
+        m2 = IMAGE_URL_IN_TEXT_RE.search(text)
+        if m2:
+            return m2.group(1)
+
+        # <img src="...">
+        m3 = IMG_TAG_SRC_RE.search(text)
+        if m3:
+            return m3.group(1)
+
+        # data URL
+        if DATA_URL_RE.match(text.strip()):
+            return text.strip()
+
+        return None
+
+    def _build_message_payload(
+        self,
+        room_id: str,
+        display_name: str,
+        message_text: str,
+        sender_type: str = "user",
+        bot_id: Optional[str] = None
+    ) -> dict:
+        """
+        Build a chat payload. If message contains an image/gif, wrap and flag it.
+        sender_type: "user" or "bot"
+        bot_id: e.g., "serene" if sender_type == "bot"
+        """
+        img_src = self._extract_image_from_text(message_text or "")
+        if img_src:
+            # Send standardized <img> wrapper and also provide imageUrl + isImage flag
+            wrapped_html = f'<img class="chat-gif" src="{html.escape(img_src, quote=True)}" />'
+            payload = {
+                "type": "new_message",
+                "room_id": room_id,
+                "displayName": display_name,
+                "message": wrapped_html,     # HTML-safe wrapper
+                "isImage": True,
+                "imageUrl": img_src,         # raw src for frontend logic if needed
+                "timestamp": int(time.time()),
+            }
+        else:
+            payload = {
+                "type": "new_message",
+                "room_id": room_id,
+                "displayName": display_name,
+                "message": message_text,
+                "isImage": False,
+                "timestamp": int(time.time()),
+            }
+
+        if sender_type == "bot":
+            payload["senderType"] = "bot"
+            if bot_id:
+                payload["botId"] = bot_id
+
+        return payload
+
+    # -------------------------
     # Serene helpers
     # -------------------------
 
@@ -161,20 +241,19 @@ class ChatMain(commands.Cog):
     async def _delayed_broadcast_serene(self, room_id: str, message: str):
         """
         Apply a human-like delay before broadcasting Serene's message.
+        Wrap as <img class="chat-gif"> if it looks like an image/GIF.
         """
         try:
             await asyncio.sleep(2.0)  # 2-second humanized delay
         except Exception:
             pass
-        payload = {
-            "type": "new_message",
-            "room_id": room_id,
-            "displayName": SERENE_DISPLAY_NAME,
-            "message": message,
-            "senderType": "bot",
-            "botId": "serene",
-            "timestamp": int(time.time()),
-        }
+        payload = self._build_message_payload(
+            room_id=room_id,
+            display_name=SERENE_DISPLAY_NAME,
+            message_text=message,
+            sender_type="bot",
+            bot_id="serene",
+        )
         await self._broadcast_room_json(room_id, payload)
 
     async def _serene_start(self, room_id: str, display_name: str):
@@ -199,7 +278,7 @@ class ChatMain(commands.Cog):
         else:
             logger.info("[Serene] QUESTION produced no reply for room %s", room_id)
 
-    async def _serene_hail(self, room_id: str, display_name: str, hail_phrase: str):  # <— pass the matched phrase
+    async def _serene_hail(self, room_id: str, display_name: str, hail_phrase: str):
         """
         Handle 'hail serene' phrase: GET with hail=<matched phrase>&player=<display name>
         The PHP lowercases and uses this string in getHails(...).
@@ -364,15 +443,15 @@ class ChatMain(commands.Cog):
                                     pass
 
                         else:
-                            # Normal text (no sound trigger): broadcast exactly what they typed
-                            chat_message = {
-                                "type": "new_message",
-                                "room_id": room_id,
-                                "displayName": display_name,
-                                "message": message_text,
-                                "timestamp": int(time.time()),
-                            }
-                            await self._broadcast_room_json(room_id, chat_message)
+                            # Normal text (no sound trigger):
+                            # If user message contains image/gif, flag and wrap it
+                            user_payload = self._build_message_payload(
+                                room_id=room_id,
+                                display_name=display_name,
+                                message_text=message_text,
+                                sender_type="user"
+                            )
+                            await self._broadcast_room_json(room_id, user_payload)
 
                 elif msg.type == web.WSMsgType.PING or msg.type == web.WSMsgType.PONG:
                     continue

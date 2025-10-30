@@ -19,7 +19,7 @@ SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
 SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
 SERENE_DISPLAY_NAME = "Serene"
 SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
-HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # NEW
+HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # detect "hail serene"
 
 # 0.5x..2.0x speed by integer 50..200
 MIN_SPEED_PCT = 50
@@ -38,8 +38,7 @@ class ChatMain(commands.Cog):
         # Track which client’s next message should be treated as a Serene question
         self._awaiting_serene_question = set()
 
-        # HTTP client session
-        # Give Serene a slightly longer timeout just in case
+        # HTTP client session (slightly longer timeout for Serene)
         self.http_timeout = aiohttp.ClientTimeout(total=5)
         self.http_session = aiohttp.ClientSession(timeout=self.http_timeout)
 
@@ -164,7 +163,7 @@ class ChatMain(commands.Cog):
         Apply a human-like delay before broadcasting Serene's message.
         """
         try:
-            await asyncio.sleep(2.0)  # NEW: 2-second humanized delay
+            await asyncio.sleep(2.0)  # 2-second humanized delay
         except Exception:
             pass
         payload = {
@@ -188,7 +187,7 @@ class ChatMain(commands.Cog):
             logger.info("[Serene] START produced no reply for room %s", room_id)
 
     async def _serene_question(self, room_id: str, display_name: str, question_raw: str):
-        # Keep the question HTML-safe (your earlier requirement)
+        # Keep the question HTML-safe
         safe_q = html.escape(question_raw or "", quote=True)
         logger.info("[Serene] QUESTION from %s in room %s: raw=\"%s\" safe=\"%s\"",
                     display_name, room_id, (question_raw or "")[:200], safe_q[:200])
@@ -200,12 +199,14 @@ class ChatMain(commands.Cog):
         else:
             logger.info("[Serene] QUESTION produced no reply for room %s", room_id)
 
-    async def _serene_hail(self, room_id: str, display_name: str):  # NEW
+    async def _serene_hail(self, room_id: str, display_name: str, hail_phrase: str):  # <— pass the matched phrase
         """
-        Handle 'hail serene' phrase: GET with hail=true&player=<display name>
+        Handle 'hail serene' phrase: GET with hail=<matched phrase>&player=<display name>
+        The PHP lowercases and uses this string in getHails(...).
         """
-        logger.info("[Serene] HAIL triggered by %s in room %s", display_name, room_id)
-        reply = await self._serene_request_get({"hail": "true", "player": display_name})
+        logger.info("[Serene] HAIL triggered by %s in room %s | hail_phrase=\"%s\"",
+                    display_name, room_id, hail_phrase)
+        reply = await self._serene_request_get({"hail": hail_phrase, "player": display_name})
         if reply:
             logger.info("[Serene] Broadcasting HAIL reply to room %s (len=%d) after delay", room_id, len(reply))
             await self._delayed_broadcast_serene(room_id, reply)
@@ -307,9 +308,11 @@ class ChatMain(commands.Cog):
                             asyncio.create_task(self._serene_question(room_id, display_name, message_text))
 
                         # First: handle explicit 'hail serene' (and do NOT also trigger start/question)
-                        if HAIL_SERENE_RE.search(lowered):
+                        m_hail = HAIL_SERENE_RE.search(lowered)
+                        if m_hail:
+                            hail_phrase = m_hail.group(0)  # e.g., "hail serene"
                             logger.info("[Serene] 'hail serene' detected in room %s by %s.", room_id, display_name)
-                            asyncio.create_task(self._serene_hail(room_id, display_name))
+                            asyncio.create_task(self._serene_hail(room_id, display_name, hail_phrase))
 
                         # Else: generic 'serene' keyword -> trigger start and arm next message as question
                         elif SERENE_WORD_RE.search(lowered):

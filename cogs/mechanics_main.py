@@ -8,9 +8,6 @@ import os
 
 from discord.ext import commands, tasks
 
-# If you plan to hit a PHP HTTP endpoint for payouts, uncomment:
-# import aiohttp
-
 from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
@@ -80,12 +77,6 @@ ACTION_SECS = 60
 BETTING_ROUNDS = {"pre_flop", "pre_turn", "pre_river", "pre_showdown"}
 
 # ---------------- Minimums by game_mode ----------------
-# Frontend mapping:
-# mode 1: 5 / 10 / 25
-# mode 2: 10 / 25 / 100
-# mode 3: 25 / 100 / 250
-# mode 4: 100 / 250 / 500
-# We'll use the first value as the table's min bet/raise.
 MODE_MIN_BET = {
     "1": 5,
     "2": 10,
@@ -229,9 +220,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             except: self.unregister_ws_connection(ws)
 
     def _build_ui_hint_for_current_bettor(self, state: dict) -> dict:
-        """
-        Compute what the frontend should show on buttons for the actor.
-        """
         actor = state.get("current_bettor")
         min_bet = int(state.get("min_bet") or 0)
         current_bet = int(state.get("current_bet") or 0)
@@ -249,7 +237,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             "can_check": bool(can_check),
             "call_amount": int(call_amount),
             "min_bet": int(min_bet),
-            "min_raise": int(min_bet),   # simple rule: min_raise == min_bet
+            "min_raise": int(min_bet),
             "current_bet": int(current_bet),
         }
 
@@ -267,7 +255,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             "current_bettor": state.get("current_bettor"),
             "pot": state.get("pot"),
             "__rev": state.get("__rev", 0),
-            # NEW: button hint for the actor
             "ui_for_current_bettor": self._build_ui_hint_for_current_bettor(state),
         }
         msg = json.dumps(payload)
@@ -288,27 +275,24 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state.setdefault("board_cards", [])
         state.setdefault("dealer_hand", [])
         state.setdefault("deck", [])
-        state.setdefault("round_timer_start", None)   # generic phase timer
+        state.setdefault("round_timer_start", None)
         state.setdefault("round_timer_secs", None)
         state.setdefault("action_deadline_epoch", None)
         state.setdefault("initial_countdown_triggered", False)
-        state.setdefault("__rev", 0)                  # revision for change tracking
+        state.setdefault("__rev", 0)
         state.setdefault("last_evaluation", None)
-
-        # NEW: betting round state
-        state.setdefault("current_bet", 0)            # highest committed bet this betting round
-        state.setdefault("min_bet", MODE_MIN_BET["1"])# room min bet (populated from DB on first touch)
-        # Optional: pending payouts after showdown
+        state.setdefault("current_bet", 0)
+        state.setdefault("min_bet", MODE_MIN_BET["1"])
         state.setdefault("pending_payouts", None)
         return state
 
     def _ensure_betting_defaults(self, state: dict) -> dict:
-        state.setdefault("action_order", [])           # list[str] of discord_ids
-        state.setdefault("action_index", 0)            # current index into action_order
-        state.setdefault("current_bettor", None)       # discord_id
-        state.setdefault("action_timer_start", None)   # epoch seconds
-        state.setdefault("action_timer_secs", None)    # seconds
-        state.setdefault("action_deadline_epoch", None)# epoch seconds (for frontend)
+        state.setdefault("action_order", [])
+        state.setdefault("action_index", 0)
+        state.setdefault("current_bettor", None)
+        state.setdefault("action_timer_start", None)
+        state.setdefault("action_timer_secs", None)
+        state.setdefault("action_deadline_epoch", None)
         return state
 
     def _reset_betting_round_numbers(self, state: dict):
@@ -399,7 +383,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             return
         i = (state.get("action_index", 0) + 1)
         if i >= n:
-            # End of orbit -> round complete (no current bettor)
             state["current_bettor"] = None
             state["action_index"] = n
             state["action_timer_start"] = None
@@ -439,9 +422,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         state["last_evaluation"] = None
 
-        # betting round numeric reset
         self._reset_betting_round_numbers(state)
-
         self._mark_dirty(state)
         return True
 
@@ -500,7 +481,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     async def _to_pre_flop(self, state: dict):
         logger.info(f"Transition -> pre_flop for room '{state.get('room_id')}'")
-        state["last_evaluation"] = None  # clear old winners for new hand
+        state["last_evaluation"] = None
 
         deck = Deck(); deck.shuffle()
         state["deck"] = deck.to_output_format()
@@ -631,14 +612,20 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             for pid in player_winners:
                 payouts[pid] = payouts.get(pid, 0) + share
             remainder = pot - share * len(player_winners)
-            # give remainder to first winner deterministically
             if remainder and player_winners:
                 payouts[player_winners[0]] += remainder
 
         state["pending_payouts"] = {
             "total_pot": pot,
             "payouts": payouts,   # {discord_id: amount}
+            # "credited": False  # added on execution
         }
+
+        # ---- CREDIT WINNERS IMMEDIATELY (so UI refresh during showdown sees it)
+        try:
+            await self._execute_payouts(state)
+        except Exception as e:
+            logger.error(f"Payout failure at showdown: {e}", exc_info=True)
 
         # Start visible timer before moving to post_showdown
         self._start_phase_timer(state, POST_SHOWDOWN_WAIT_SECS)
@@ -647,11 +634,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _to_post_showdown(self, state: dict):
         state["current_round"] = "post_showdown"
 
-        # Execute payouts once when entering post_showdown
-        try:
-            await self._execute_payouts(state)
-        except Exception as e:
-            logger.error(f"Payout failure: {e}", exc_info=True)
+        # If, for any reason, payouts weren't done at showdown, do them now (idempotent)
+        if not (state.get("pending_payouts") or {}).get("credited"):
+            try:
+                await self._execute_payouts(state)
+            except Exception as e:
+                logger.error(f"Payout failure: {e}", exc_info=True)
 
         # Reset pot after payouts
         state["pot"] = 0
@@ -680,9 +668,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return int(state.get("min_bet") or MODE_MIN_BET["1"])
 
     def _apply_contribution(self, state: dict, p: dict, contributed: int):
-        """
-        Add contributed chips from player p into their per-round bet and into the pot.
-        """
         added = max(0, int(contributed or 0))
         if added <= 0: return
         p["bet"] = int(p.get("bet") or 0) + added
@@ -696,14 +681,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         return int(state.get("current_bet") or 0) == 0 and int(amount) >= self._room_min_bet(state)
 
     def _can_raise(self, state: dict, p: dict, amount_delta: int) -> bool:
-        # Simple rule: any raise must add at least min_bet more than current_bet of others
         return int(state.get("current_bet") or 0) > 0 and int(amount_delta) >= self._room_min_bet(state)
 
     def _end_of_betting_orbit(self, state: dict) -> bool:
-        """
-        Basic end condition used by your existing orbit logic:
-        once we reach the end of action_order, we let the timer loop advance the phase.
-        """
         return state.get("current_bettor") is None
 
     # ---------------- Timer loop ----------------
@@ -726,7 +706,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 if not state.get("min_bet"):
                     cfg = await self._load_room_config(rid)
                     state["min_bet"] = int(cfg["min_bet"])
-                    # also keep guild/channel if missing
                     state.setdefault("guild_id", cfg.get("guild_id"))
                     state.setdefault("channel_id", cfg.get("channel_id"))
                     self._mark_dirty(state)
@@ -750,10 +729,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 # Betting rounds: enforce per-player auto timer
                 elif phase in BETTING_ROUNDS:
                     if not state.get("current_bettor"):
-                        # End of orbit -> advance phase immediately
                         await self._finish_betting_round_and_advance(state)
                     else:
-                        # If timer expired, auto-fold and advance
                         if self._action_timer_expired(state):
                             pid = state["current_bettor"]
                             for p in state["players"]:
@@ -783,7 +760,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     await self._save_game_state(rid, state)
                     await self._broadcast_state(rid, state)
                 else:
-                    # No structural change; send lightweight tick if timers are visible
                     if self._has_timers(state):
                         await self._broadcast_tick(rid, state)
 
@@ -837,10 +813,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or data.get('sender_id'))
                 if seat_id and player_id:
-                    # Already seated? ignore
                     if any(str(p.get('discord_id')) == player_id for p in state['players']):
                         pass
-                    # Seat free?
                     elif any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
                         pass
                     else:
@@ -875,20 +849,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     in_betting_round = state.get("current_round") in BETTING_ROUNDS
                     was_current = (state.get("current_bettor") == player_id)
 
-                    # If mid-hand, fold/forfeit
                     if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
                         p['is_folded'] = True
                         p['in_hand'] = False
                         self._mark_dirty(state)
 
-                    # Remove them from table entirely (free seat)
                     state['players'] = [q for q in state['players'] if str(q.get('discord_id')) != player_id]
                     self._mark_dirty(state)
 
-                    # If table now empty, force pre_game immediately
-                    self._force_pre_game_if_empty_seats(state)
+                    if self._force_pre_game_if_empty_seats(state):
+                        pass
 
-                    # If it was their turn, advance immediately (or finish round)
                     if in_betting_round and was_current and state.get("current_round") in BETTING_ROUNDS:
                         if self._active_player_count(state) == 0:
                             await self._finish_betting_round_and_advance(state)
@@ -901,7 +872,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 player_id = str(data.get('sender_id') or data.get('discord_id'))
                 p = self._find_player(state, player_id)
                 if p and p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') in BETTING_ROUNDS:
-                    # Only the current bettor can act (server-side enforcement)
                     if state.get("current_bettor") == player_id:
                         p['is_folded'] = True
                         p['in_hand'] = False
@@ -914,7 +884,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 self._add_room_active(room_id)
 
             elif action == 'player_action':
-                # payload: {"move": "check"|"call"|"bet"|"raise"|"fold", "amount": optional}
                 move = (data.get("move") or "").lower()
                 actor = str(data.get("sender_id") or data.get("discord_id"))
                 phase = state.get("current_round")
@@ -925,11 +894,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         min_bet = self._room_min_bet(state)
                         current_bet = int(state.get("current_bet") or 0)
                         p_bet = int(p.get("bet") or 0)
-                        amount = int(data.get("amount") or 0)  # amount of NEW chips the actor already withdrew client-side
+                        amount = int(data.get("amount") or 0)  # NEW chips the actor already withdrew client-side
 
                         if move == "check":
                             if self._can_check(state, p):
-                                # nothing added
                                 pass
                             else:
                                 logger.debug("Illegal CHECK attempted; requires call.")
@@ -938,14 +906,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         elif move == "call":
                             needed = max(0, current_bet - p_bet)
                             if needed > 0:
-                                # Accept up to 'amount' but require it meets 'needed' in this simple engine
                                 if amount < needed:
                                     logger.debug("Insufficient CALL contribution; ignoring.")
                                     return
                                 self._apply_contribution(state, p, needed)
 
                         elif move == "bet":
-                            # Only if no bet yet this round
                             if not self._can_bet(state, amount):
                                 logger.debug("Illegal BET (either bet exists or below min).")
                                 return
@@ -953,20 +919,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             state["current_bet"] = int(p.get("bet") or 0)
 
                         elif move == "raise":
-                            # Must add at least min_bet more than current_bet of others
-                            delta = amount  # client sends the extra chips they are adding now
+                            delta = amount
                             if not self._can_raise(state, p, delta):
                                 logger.debug("Illegal RAISE (below min raise or no bet to raise).")
                                 return
                             self._apply_contribution(state, p, delta)
-                            # After raise, the actor's total bet becomes the new current_bet
                             state["current_bet"] = int(p.get("bet") or 0)
 
                         elif move == "fold":
                             p["is_folded"] = True
                             p["in_hand"] = False
 
-                        # When the acting player has finished, advance immediately
                         if self._active_player_count(state) == 0:
                             await self._finish_betting_round_and_advance(state)
                         else:
@@ -977,7 +940,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 self._add_room_active(room_id)
 
             elif action == 'advance_phase':
-                # Optional admin/testing action to force phase movement
                 phase = state.get('current_round')
                 if phase == 'pre_flop':       await self._to_flop(state)
                 elif phase == 'pre_turn':     await self._to_turn(state)
@@ -988,20 +950,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 self._add_room_active(room_id)
 
             elif action is not None:
-                # Unknown but non-null action: still keep timers alive
                 self._add_room_active(room_id)
             else:
-                # No action at all — nothing to do
                 return
 
-            # Save/broadcast only if structurally changed
             after_rev = int(state.get("__rev") or 0)
             if after_rev != before_rev:
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
-            else:
-                # No structural mutation; if timers are active, ticks will go via loop
-                pass
 
         except Exception as e:
             logger.error(f"Error in handle_websocket_game_action ('{action}'): {e}", exc_info=True)
@@ -1009,12 +965,18 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     # ---------------- Payouts ----------------
     async def _execute_payouts(self, state: dict):
         """
-        Credit winners their shares. This does not debit anyone (they were already debited client-side via withdraw).
-        Implement the actual crediting in _credit_kekchipz().
+        Credit winners their shares (idempotent via 'credited' flag).
         """
         info = state.get("pending_payouts") or {}
-        payouts = info.get("payouts") or {}
+        if info.get("credited"):
+            return
+
+        payouts = (info.get("payouts") or {})
+        # If no payouts (dealer wins or zero pot), still mark as credited so we don't try again.
         if not payouts:
+            info["credited"] = True
+            state["pending_payouts"] = info
+            self._mark_dirty(state)
             return
 
         guild_id = state.get("guild_id")
@@ -1024,27 +986,42 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             except Exception as e:
                 logger.error(f"Failed to credit {pid} amount={amount}: {e}")
 
+        # mark as done (idempotency for the rest of the hand)
+        info["credited"] = True
+        state["pending_payouts"] = info
+        self._mark_dirty(state)
+
     async def _credit_kekchipz(self, guild_id: str | None, discord_id: str, amount: int):
+        """
+        POST to your PHP credit endpoint. Use form-encoded payload (matches your withdraw endpoint).
+        """
         if amount <= 0:
             return
+
         secret = os.environ.get("BOT_ENTRY", "")
-        payload = {
-            "action": "credit",
-            "guild_id": guild_id or "",
-            "discord_id": discord_id,
-            "amount": amount,
-            # optional:
-            # "note": "poker payout",
-            # "tx_id": f"payout:{state.get('__rev', 0)}:{discord_id}",  # if you add idempotency
-        }
+
+        form = aiohttp.FormData()
+        form.add_field("action", "credit")
+        form.add_field("guild_id", guild_id or "")
+        form.add_field("discord_id", str(discord_id))
+        form.add_field("amount", str(amount))
+
+        headers = {"X-Serene-Auth": secret} if secret else None
+
         async with aiohttp.ClientSession() as session:
             resp = await session.post(
                 "https://serenekeks.com/withdraw_kekchipz.php",
-                json=payload,  # JSON works now (form would also work)
-                headers={"X-Serene-Auth": secret} if secret else None,
+                data=form,
+                headers=headers,
                 timeout=10,
             )
-            data = await resp.json()
+            # Expecting JSON like {"ok": true}
+            try:
+                data = await resp.json(content_type=None)
+            except Exception:
+                text = await resp.text()
+                raise RuntimeError(f"Credit failed: non-JSON response: {text[:256]}")
+
             if not data.get("ok"):
                 raise RuntimeError(f"Credit failed: {data}")
 

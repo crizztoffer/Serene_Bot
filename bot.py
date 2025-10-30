@@ -12,6 +12,7 @@ import aiohttp
 import time
 import re
 from typing import List, Optional, Tuple
+import html  # <-- NEW: for HTML-escaping when sending Serene questions
 
 # Load env vars
 load_dotenv()
@@ -654,10 +655,105 @@ async def health(_):
 async def game_was_probe(_):
     return web.Response(text="game_was endpoint is here; use WebSocket upgrade.", status=426)
 
-# ---------------------- CHAT WS: /chat_ws (current) ----------------------
+# ===================== SERENE INTEGRATION HELPERS (NEW) =====================
+
+# Config for Serene
+SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
+SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
+
+# Shared HTTP client for Serene calls
+_serene_http_session: Optional[aiohttp.ClientSession] = None
+
+def _get_serene_http() -> aiohttp.ClientSession:
+    global _serene_http_session
+    if _serene_http_session is None or _serene_http_session.closed:
+        _serene_http_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5))
+    return _serene_http_session
+
+async def _serene_post(data: dict) -> Optional[str]:
+    """
+    POST to Serene and return response text, or None on error / empty / 'false'.
+    """
+    try:
+        session = _get_serene_http()
+        async with session.post(SERENE_BOT_URL, data=data) as resp:
+            if resp.status != 200:
+                logger.warning("Serene HTTP %s for data=%s", resp.status, data)
+                return None
+            txt = (await resp.text()).strip()
+            if not txt or txt.lower() == "false":
+                return None
+            return txt
+    except asyncio.TimeoutError:
+        logger.warning("Serene request timed out: %s", data)
+        return None
+    except aiohttp.ClientError as e:
+        logger.warning("Serene client error: %s", e)
+        return None
+    except Exception:
+        logger.exception("Unexpected error posting to Serene")
+        return None
+
+async def _broadcast_room_json_str(room_id: str, payload: dict):
+    """
+    Broadcast JSON (string) to all clients in chat room. Safe if room disappears.
+    """
+    try:
+        room = bot.chat_ws_rooms.get(room_id) or set()
+        msg = json.dumps(payload)
+        for client_ws in list(room):
+            try:
+                await client_ws.send_str(msg)
+            except Exception:
+                try:
+                    room.discard(client_ws)
+                except Exception:
+                    pass
+    except Exception:
+        logger.exception("Broadcast error for room %s", room_id)
+
+async def _serene_start(room_id: str, display_name: str):
+    reply = await _serene_post({"start": "true", "player": display_name})
+    if reply:
+        payload = {
+            "type": "new_message",
+            "displayName": "Serene",
+            "message": reply,
+            "room_id": room_id,
+            "senderType": "bot",
+            "botId": "serene",
+        }
+        await _broadcast_room_json_str(room_id, payload)
+
+async def _serene_question(room_id: str, display_name: str, question_raw: str):
+    safe_q = html.escape(question_raw or "", quote=True)
+    reply = await _serene_post({"question": safe_q, "player": display_name})
+    if reply:
+        payload = {
+            "type": "new_message",
+            "displayName": "Serene",
+            "message": reply,
+            "room_id": room_id,
+            "senderType": "bot",
+            "botId": "serene",
+        }
+        await _broadcast_room_json_str(room_id, payload)
+
+# ---------------------- CHAT WS: /chat_ws (current + Serene) ----------------------
 async def chat_websocket_handler(request):
     """
     Handles chat WebSocket connections for game lobbies and rooms.
+
+    Preserves existing behavior:
+      • initial TEXT with {"room_id","displayName"}
+      • broadcast user_joined / user_left
+      • rebroadcast every user message as type="new_message"
+
+    Adds Serene:
+      • If a message contains the word 'serene' (case-insensitive), post {start:true, player}
+        and mark the NEXT message from that same socket as the Serene question.
+      • That next message is posted as {question:<html-escaped>, player}.
+      • Serene replies are broadcast with senderType="bot", botId="serene".
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -668,8 +764,11 @@ async def chat_websocket_handler(request):
     room_id = None
     display_name = None
 
+    # Track whether this specific socket's next message is a Serene question
+    awaiting_serene_question = False
+
     try:
-        # 1. Handle initial registration message
+        # 1. Handle initial registration message (unchanged)
         first_msg_str = await ws.receive_str()
         initial_data = json.loads(first_msg_str)
         room_id = initial_data.get('room_id')
@@ -680,62 +779,76 @@ async def chat_websocket_handler(request):
             await ws.close()
             return ws
 
-        # 2. Add user to the chat room registry
+        # 2. Add user to the chat room registry (unchanged)
         if room_id not in bot.chat_ws_rooms:
             bot.chat_ws_rooms[room_id] = set()
         bot.chat_ws_rooms[room_id].add(ws)
         logger.info(f"'{display_name}' connected to chat room '{room_id}'.")
 
-        # 3. Announce user joining
+        # 3. Announce user joining (unchanged)
         join_message = {
             "type": "user_joined",
             "displayName": display_name,
             "room_id": room_id
         }
-        for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-            await client_ws.send_str(json.dumps(join_message))
+        await _broadcast_room_json_str(room_id, join_message)
 
-        # 4. Listen for and broadcast messages
+        # 4. Listen for and broadcast messages (now with Serene)
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                data = json.loads(msg.data)
+                # Parse incoming JSON
+                try:
+                    data = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+
                 if 'message' in data:
+                    user_text = str(data['message'])
+
+                    # (A) Broadcast user's message as-is (existing behavior)
                     broadcast_message = {
                         "type": "new_message",
                         "displayName": display_name,
-                        "message": data['message'],
+                        "message": user_text,
                         "room_id": room_id
                     }
-                    for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-                        await client_ws.send_str(json.dumps(broadcast_message))
+                    await _broadcast_room_json_str(room_id, broadcast_message)
+
+                    # (B) Serene: if awaiting a question from this socket, post it
+                    if awaiting_serene_question:
+                        awaiting_serene_question = False  # clear first to avoid re-entrancy
+                        asyncio.create_task(_serene_question(room_id, display_name, user_text))
+
+                    # (C) Serene: trigger start if message mentions 'serene', and arm next msg as question
+                    if SERENE_WORD_RE.search(user_text or ""):
+                        awaiting_serene_question = True
+                        asyncio.create_task(_serene_start(room_id, display_name))
+
             elif msg.type == web.WSMsgType.ERROR:
                 logger.error(f"Chat WS error for '{display_name}' in room '{room_id}': {ws.exception()}")
 
     except Exception as e:
         logger.error(f"Chat WS handler error for '{display_name}' in room '{room_id}': {e}", exc_info=True)
     finally:
-        # 5. Handle disconnection
-        if room_id and display_name and ws in bot.chat_ws_rooms.get(room_id, set()):
-            bot.chat_ws_rooms[room_id].remove(ws)
-            if not bot.chat_ws_rooms[room_id]:
-                del bot.chat_ws_rooms[room_id]
+        # 5. Handle disconnection (unchanged)
+        try:
+            if room_id and ws in bot.chat_ws_rooms.get(room_id, set()):
+                bot.chat_ws_rooms[room_id].remove(ws)
+                if not bot.chat_ws_rooms[room_id]:
+                    del bot.chat_ws_rooms[room_id]
 
-            logger.info(f"'{display_name}' disconnected from chat room '{room_id}'.")
+                logger.info(f"'{display_name}' disconnected from chat room '{room_id}'.")
 
-            # Announce user leaving
-            leave_message = {
-                "type": "user_left",
-                "displayName": display_name,
-                "room_id": room_id
-            }
-            if room_id in bot.chat_ws_rooms:
-                for client_ws in bot.chat_ws_rooms.get(room_id, set()):
-                    try:
-                        await client_ws.send_str(json.dumps(leave_message))
-                    except Exception:
-                        pass  # Ignore errors for clients that might have disconnected simultaneously
-
-    return ws
+                # Announce user leaving
+                leave_message = {
+                    "type": "user_left",
+                    "displayName": display_name,
+                    "room_id": room_id
+                }
+                if room_id in bot.chat_ws_rooms:
+                    await _broadcast_room_json_str(room_id, leave_message)
+        finally:
+            return ws
 
 
 # ---------------------- GAME WS: /game_was (robust + loud logs) ----------------------

@@ -19,6 +19,7 @@ SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
 SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
 SERENE_DISPLAY_NAME = "Serene"
 SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
+HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # NEW
 
 # 0.5x..2.0x speed by integer 50..200
 MIN_SPEED_PCT = 50
@@ -158,21 +159,31 @@ class ChatMain(commands.Cog):
             logger.exception("[Serene] Unexpected error on GET request.")
             return None
 
+    async def _delayed_broadcast_serene(self, room_id: str, message: str):
+        """
+        Apply a human-like delay before broadcasting Serene's message.
+        """
+        try:
+            await asyncio.sleep(2.0)  # NEW: 2-second humanized delay
+        except Exception:
+            pass
+        payload = {
+            "type": "new_message",
+            "room_id": room_id,
+            "displayName": SERENE_DISPLAY_NAME,
+            "message": message,
+            "senderType": "bot",
+            "botId": "serene",
+            "timestamp": int(time.time()),
+        }
+        await self._broadcast_room_json(room_id, payload)
+
     async def _serene_start(self, room_id: str, display_name: str):
         logger.info("[Serene] START triggered by %s in room %s", display_name, room_id)
         reply = await self._serene_request_get({"start": "true", "player": display_name})
         if reply:
-            payload = {
-                "type": "new_message",
-                "room_id": room_id,
-                "displayName": SERENE_DISPLAY_NAME,
-                "message": reply,
-                "senderType": "bot",
-                "botId": "serene",
-                "timestamp": int(time.time()),
-            }
-            logger.info("[Serene] Broadcasting START reply to room %s (len=%d)", room_id, len(reply))
-            await self._broadcast_room_json(room_id, payload)
+            logger.info("[Serene] Broadcasting START reply to room %s (len=%d) after delay", room_id, len(reply))
+            await self._delayed_broadcast_serene(room_id, reply)
         else:
             logger.info("[Serene] START produced no reply for room %s", room_id)
 
@@ -184,19 +195,22 @@ class ChatMain(commands.Cog):
 
         reply = await self._serene_request_get({"question": safe_q, "player": display_name})
         if reply:
-            payload = {
-                "type": "new_message",
-                "room_id": room_id,
-                "displayName": SERENE_DISPLAY_NAME,
-                "message": reply,
-                "senderType": "bot",
-                "botId": "serene",
-                "timestamp": int(time.time()),
-            }
-            logger.info("[Serene] Broadcasting QUESTION reply to room %s (len=%d)", room_id, len(reply))
-            await self._broadcast_room_json(room_id, payload)
+            logger.info("[Serene] Broadcasting QUESTION reply to room %s (len=%d) after delay", room_id, len(reply))
+            await self._delayed_broadcast_serene(room_id, reply)
         else:
             logger.info("[Serene] QUESTION produced no reply for room %s", room_id)
+
+    async def _serene_hail(self, room_id: str, display_name: str):  # NEW
+        """
+        Handle 'hail serene' phrase: GET with hail=true&player=<display name>
+        """
+        logger.info("[Serene] HAIL triggered by %s in room %s", display_name, room_id)
+        reply = await self._serene_request_get({"hail": "true", "player": display_name})
+        if reply:
+            logger.info("[Serene] Broadcasting HAIL reply to room %s (len=%d) after delay", room_id, len(reply))
+            await self._delayed_broadcast_serene(room_id, reply)
+        else:
+            logger.info("[Serene] HAIL produced no reply for room %s", room_id)
 
     # -------------------------
     # WebSocket handler
@@ -292,8 +306,13 @@ class ChatMain(commands.Cog):
                             self._awaiting_serene_question.discard(ws)
                             asyncio.create_task(self._serene_question(room_id, display_name, message_text))
 
-                        # If this message includes the word 'serene', trigger start and arm next message as question
-                        if SERENE_WORD_RE.search(lowered):
+                        # First: handle explicit 'hail serene' (and do NOT also trigger start/question)
+                        if HAIL_SERENE_RE.search(lowered):
+                            logger.info("[Serene] 'hail serene' detected in room %s by %s.", room_id, display_name)
+                            asyncio.create_task(self._serene_hail(room_id, display_name))
+
+                        # Else: generic 'serene' keyword -> trigger start and arm next message as question
+                        elif SERENE_WORD_RE.search(lowered):
                             logger.info("[Serene] Keyword detected in room %s by %s. Arming next message as question and calling START.", room_id, display_name)
                             self._awaiting_serene_question.add(ws)
                             asyncio.create_task(self._serene_start(room_id, display_name))

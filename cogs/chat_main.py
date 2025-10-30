@@ -7,16 +7,23 @@ import aiohttp
 import re
 import discord
 from discord.ext import commands
+import html  # NEW: for HTML-escaping the question text
 
 logger = logging.getLogger(__name__)
 
 SOUND_NAME_RE = re.compile(r'^\s*([A-Za-z0-9_-]{1,64})(?:\s+(\d{2,3}))?\s*$')
 SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
 
+# Serene config
+SERENE_BOT_URL = "https://serenekeks.com/serene_bot.php"
+SERENE_DISPLAY_NAME = "Serene"
+SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
+
 # 0.5x..2.0x speed by integer 50..200
 MIN_SPEED_PCT = 50
 MAX_SPEED_PCT = 200
 DEFAULT_RATE = 1.0
+
 
 class ChatMain(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -26,7 +33,11 @@ class ChatMain(commands.Cog):
         if not hasattr(self.bot, "chat_ws_rooms"):
             self.bot.chat_ws_rooms = {}
 
-        # Create an HTTP client session for HEAD checks
+        # Track which client’s next message should be treated as a Serene question
+        # We use the ws object identity as the key.
+        self._awaiting_serene_question = set()  # NEW
+
+        # Create an HTTP client session for HEAD checks and Serene posts
         self.http_timeout = aiohttp.ClientTimeout(total=3)
         self.http_session = aiohttp.ClientSession(timeout=self.http_timeout)
 
@@ -115,6 +126,65 @@ class ChatMain(commands.Cog):
                 await client_ws.send_json(payload)
             except (ConnectionResetError, RuntimeError):
                 logger.warning("Could not send payload to a client in room %s.", room_id)
+
+    # -------------------------
+    # Serene helpers (NEW)
+    # -------------------------
+
+    async def _serene_post(self, data: dict) -> str | None:
+        """
+        POST to Serene bot and return plain text response, or None on error.
+        """
+        try:
+            async with self.http_session.post(SERENE_BOT_URL, data=data) as resp:
+                if resp.status != 200:
+                    logger.warning("Serene bot HTTP %s for data=%s", resp.status, data)
+                    return None
+                return await resp.text()
+        except asyncio.TimeoutError:
+            logger.warning("Serene bot request timed out for data=%s", data)
+            return None
+        except aiohttp.ClientError as e:
+            logger.warning("Serene bot client error: %s", e)
+            return None
+        except Exception:
+            logger.exception("Unexpected error posting to Serene bot.")
+            return None
+
+    async def _serene_start(self, room_id: str, display_name: str):
+        """
+        Trigger Serene's 'start' and broadcast her reply if any.
+        """
+        reply = await self._serene_post({"start": "true", "player": display_name})
+        if reply:
+            payload = {
+                "type": "new_message",
+                "room_id": room_id,
+                "displayName": SERENE_DISPLAY_NAME,
+                "message": reply,
+                "senderType": "bot",      # NEW: identify Serene on the frontend
+                "botId": "serene",        # NEW
+                "timestamp": int(time.time()),
+            }
+            await self._broadcast_room_json(room_id, payload)
+
+    async def _serene_question(self, room_id: str, display_name: str, question_raw: str):
+        """
+        Send a question to Serene (HTML-escaped) and broadcast her reply if any.
+        """
+        safe_q = html.escape(question_raw or "", quote=True)
+        reply = await self._serene_post({"question": safe_q, "player": display_name})
+        if reply:
+            payload = {
+                "type": "new_message",
+                "room_id": room_id,
+                "displayName": SERENE_DISPLAY_NAME,
+                "message": reply,
+                "senderType": "bot",      # NEW
+                "botId": "serene",        # NEW
+                "timestamp": int(time.time()),
+            }
+            await self._broadcast_room_json(room_id, payload)
 
     # -------------------------
     # WebSocket handler
@@ -211,6 +281,26 @@ class ChatMain(commands.Cog):
                     if message_text:
                         logger.info(f"Chat message from '{display_name}' in room {room_id}: {message_text}")
 
+                        # -------------------------
+                        # Serene logic (NEW)
+                        # -------------------------
+
+                        lowered = message_text.lower()
+
+                        # If awaiting a question from this client, treat THIS message as the question
+                        if ws in self._awaiting_serene_question:
+                            # Clear first to avoid re-entrancy issues
+                            self._awaiting_serene_question.discard(ws)
+                            asyncio.create_task(self._serene_question(room_id, display_name, message_text))
+
+                        # If this message includes the word 'serene', trigger start and arm next message as question
+                        if SERENE_WORD_RE.search(lowered):
+                            self._awaiting_serene_question.add(ws)
+                            asyncio.create_task(self._serene_start(room_id, display_name))
+
+                        # -------------------------
+                        # Sound trigger flow (original behavior preserved)
+                        # -------------------------
                         parsed = self._parse_sound_command(message_text)
 
                         if parsed:
@@ -242,7 +332,6 @@ class ChatMain(commands.Cog):
                                 await self._broadcast_room_json(room_id, sound_payload)
                             else:
                                 # Optional: send a private notice back to the sender only
-                                # Comment out if you prefer silence on missing files
                                 try:
                                     await ws.send_json({
                                         "type": "system_notice",
@@ -254,7 +343,7 @@ class ChatMain(commands.Cog):
                                     pass
 
                         else:
-                            # Normal text (no sound trigger)
+                            # Normal text (no sound trigger): broadcast exactly what they typed
                             chat_message = {
                                 "type": "new_message",
                                 "room_id": room_id,
@@ -292,6 +381,9 @@ class ChatMain(commands.Cog):
                 if room_id and room_id in self.bot.chat_ws_rooms:
                     if ws in self.bot.chat_ws_rooms[room_id]:
                         self.bot.chat_ws_rooms[room_id].remove(ws)
+
+                    # Ensure no stale question flag for this socket
+                    self._awaiting_serene_question.discard(ws)
 
                     logger.info(
                         f"Chat client '{display_name}' disconnected from room {room_id}. "

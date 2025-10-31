@@ -963,6 +963,12 @@ async def chat_websocket_handler(request):
             try:
                 initial_data = json.loads(first_msg_str)
             except json.JSONDecodeError:
+                # allow a bare "ping" before registration to keep the client 'alive'
+                if isinstance(first_msg_str, str) and first_msg_str.strip().lower() == "ping":
+                    try:
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
+                    except Exception:
+                        pass
                 logger.warning(f"[/chat_ws] malformed initial JSON, waiting for next TEXT")
                 next_msg = await ws.receive()
                 if next_msg.type == web.WSMsgType.TEXT:
@@ -976,16 +982,33 @@ async def chat_websocket_handler(request):
         display_name = initial_data.get('displayName')
 
         if not room_id or not display_name:
-            # Keep socket open; wait for a proper registration frame
             logger.warning(f"[/chat_ws] missing room_id/displayName in initial JSON; waiting for valid registration")
             while not (room_id and display_name):
                 msg = await ws.receive()
                 if msg.type != web.WSMsgType.TEXT:
                     continue
+        
+                # respond to a bare "ping" while we await proper registration
+                if isinstance(msg.data, str) and msg.data.strip().lower() == "ping":
+                    try:
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
+                    except Exception:
+                        pass
+                    continue
+        
                 try:
                     jd = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
+        
+                # also support JSON {"type":"ping"} during this phase
+                if jd.get("type") == "ping":
+                    try:
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
+                    except Exception:
+                        pass
+                    continue
+        
                 room_id = room_id or jd.get('room_id')
                 display_name = display_name or jd.get('displayName')
 
@@ -1016,11 +1039,26 @@ async def chat_websocket_handler(request):
             msg = await ws.receive()
 
             if msg.type == web.WSMsgType.TEXT:
-                # Parse incoming JSON (ignore bad JSON rather than closing)
+                # 1) handle a raw "ping" string (not JSON)
+                if isinstance(msg.data, str) and msg.data.strip().lower() == "ping":
+                    try:
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
+                    except Exception:
+                        pass
+                    continue
+            
+                # 2) parse JSON (and reply to {"type":"ping"})
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     logger.debug("[/chat_ws] ignoring malformed JSON frame")
+                    continue
+            
+                if data.get("type") == "ping":
+                    try:
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
+                    except Exception:
+                        pass
                     continue
 
                 # >>> NEW: Room rebind protocol (no 'message', has 'room_id')

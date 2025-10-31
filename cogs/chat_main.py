@@ -238,30 +238,29 @@ class ChatMain(commands.Cog):
         except Exception:
             return None
 
-    async def _fetch_gif_url_fallback(self, query: str) -> Optional[str]:
-        """
-        Fallback to your PHP helper at serenekeks.com/crawl.php.
-        We’ll try both ?q= and ?query= and extract either a direct URL or <img src>.
-        """
-        base = "https://serenekeks.com/crawl.php"
-        for param_name in ("q", "query"):
-            try:
-                async with self.http_session.get(base, params={param_name: query}, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        continue
-                    txt = await resp.text()
-                    # Extract <img src="..."> first
-                    m_img = IMG_TAG_SRC_RE.search(txt)
-                    if m_img:
-                        return m_img.group(1)
-                    # Or any gif-like URL in the body
-                    m_url = IMAGE_URL_IN_TEXT_RE.search(txt)
-                    if m_url:
-                        return m_url.group(1)
-            except Exception as e:
-                logger.warning("crawl.php fallback failed (%s): %s", param_name, e)
-                continue
-        return None
+    async def _fetch_gif_url_fallback(query: str) -> Optional[str]:
+        """Fallback to your crawler page with the correct params (kw, total, api)."""
+        if not TENOR_API_KEY:
+            return None
+    
+        params = {
+            "kw": query,          # matches crawl.php expectation
+            "total": 25,          # any reasonable positive int
+            "api": TENOR_API_KEY  # pass your Tenor key through
+        }
+    
+        session = _get_serene_http()
+        try:
+            async with session.get("https://serenekeks.com/crawl.php", params=params, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                body = (await resp.text()).strip()
+                # crawl.php echoes a single URL; validate and return
+                if IMAGE_URL_RE.match(body) or IMAGE_URL_IN_TEXT_RE.search(body):
+                    return body
+                return None
+        except Exception:
+            return None
 
     async def _handle_gif_command(self, room_id: str, display_name: str, raw_text: str) -> bool:
         """

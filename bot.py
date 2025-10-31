@@ -30,6 +30,10 @@ GAME_WEBHOOK_URL = os.getenv("GAME_WEBHOOK_URL", "https://serenekeks.com/game_up
 # Auth token used by your admin page to talk to the bot
 BOT_ENTRY = os.getenv("BOT_ENTRY")
 
+# Tenor GIF API
+TENOR_API_KEY = os.getenv("TENOR_API_KEY")
+TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
+
 BOT_PREFIX = "!"
 
 intents = discord.Intents.default()
@@ -749,6 +753,66 @@ async def _serene_get(params: dict) -> Optional[str]:
         logger.exception("Unexpected error in Serene GET")
         return None
 
+# --- Tenor GIF helpers ---
+
+async def _fetch_gif_url_from_tenor(query: str) -> Optional[str]:
+    """Return a GIF URL from Tenor for the query, or None if not found/error."""
+    if not TENOR_API_KEY:
+        return None
+
+    params = {
+        "q": query,
+        "key": TENOR_API_KEY,
+        "limit": 1,
+        "media_filter": "gif",
+        "random": "true",
+    }
+    try:
+        session = _get_serene_http()
+        async with session.get(TENOR_ENDPOINT, params=params, allow_redirects=True) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except Exception:
+        return None
+
+    try:
+        results = data.get("results") or []
+        if not results:
+            return None
+        r0 = results[0]
+        fmts = r0.get("media_formats") or {}
+        # Prefer true GIFs, then smaller renditions
+        for key in ("gif", "mediumgif", "tinygif"):
+            fmt = fmts.get(key)
+            if fmt and "url" in fmt:
+                return fmt["url"]
+        # Fallback to Tenor page URL if no direct media URL
+        return r0.get("url")
+    except Exception:
+        return None
+
+async def _fetch_gif_url_fallback(query: str) -> Optional[str]:
+    """Fallback to your crawler page if Tenor yields nothing."""
+    base = "https://serenekeks.com/crawl.php"
+    session = _get_serene_http()
+    for param in ("q", "query"):
+        try:
+            async with session.get(base, params={param: query}, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    continue
+                body = await resp.text()
+            # Try to pull a src from an <img>, else any image-like URL on the page
+            m = IMG_TAG_SRC_RE.search(body)
+            if m:
+                return m.group(1)
+            m2 = IMAGE_URL_IN_TEXT_RE.search(body)
+            if m2:
+                return m2.group(1)
+        except Exception:
+            continue
+    return None
+
 # --- UPDATED broadcaster: gentle on transient errors ---
 async def _broadcast_room_json(room_id: str, payload: dict):
     """
@@ -818,6 +882,7 @@ async def chat_websocket_handler(request):
       • Robust handshake (wait until first valid TEXT JSON).
       • No hard-close on malformed frames – keep listening.
       • Serene start/question/hail flows and image wrapping preserved.
+      • NEW: 'gif …' command handled server-side (first token must be 'gif').
     """
     # Heartbeat pings every 25s; 16MB frames for big data URLs
     ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=16 * 1024 * 1024, autoping=True)
@@ -912,6 +977,29 @@ async def chat_websocket_handler(request):
 
                 if 'message' in data:
                     user_text = str(data['message'])
+
+                    # --- GIF COMMAND: only if FIRST token is exactly "gif" ---
+                    parts = (user_text or "").strip().split(None, 1)
+                    if parts and parts[0].lower() == "gif":
+                        query = parts[1].strip() if len(parts) > 1 else ""
+                        if query:
+                            url = await _fetch_gif_url_from_tenor(query)
+                            if not url:
+                                url = await _fetch_gif_url_fallback(query)
+
+                            if url:
+                                # Reuse wrapper so frontend renders as <img class="chat-gif"> and sets isImage=true
+                                payload = _build_message_payload(room_id, display_name, url, sender_type="user")
+                                await _broadcast_room_json(room_id, payload)
+                            else:
+                                await _broadcast_room_json(room_id, {
+                                    "type": "system_notice",
+                                    "room_id": room_id,
+                                    "message": f"No GIF found for “{query}”.",
+                                })
+                        # IMPORTANT: do not fall through (prevents echo and Serene triggers)
+                        continue
+
                     lowered = user_text.lower()
 
                     # Broadcast user message (with image/gif detection)

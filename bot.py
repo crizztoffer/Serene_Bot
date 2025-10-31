@@ -843,6 +843,41 @@ async def _broadcast_room_json(room_id: str, payload: dict):
     except Exception:
         logger.exception("Broadcast error for room %s", room_id)
 
+# >>> NEW: helper to pretty-name rooms in notices
+def _pretty_room(name_or_id: Optional[str]) -> str:
+    if not name_or_id:
+        return "the lobby"
+    s = str(name_or_id).strip()
+    if s.lower() == "lobby":
+        return "the lobby"
+    return s  # if frontend sends human name, we’ll use it; else it's an id
+
+# >>> NEW: helper to broadcast cross-room presence notices
+async def _broadcast_cross_room_presence(old_room: Optional[str], new_room: str, display_name: str,
+                                        from_name: Optional[str] = None, to_name: Optional[str] = None):
+    """
+    Send authoritative system_notice lines so EVERYONE sees moves:
+      • In old_room (if any): "<name> left {from_name} → {to_name}."
+      • In new_room:          "<name> entered {to_name}."
+    """
+    pretty_from = _pretty_room(from_name or old_room)
+    pretty_to = _pretty_room(to_name or new_room)
+
+    try:
+        if old_room:
+            await _broadcast_room_json(old_room, {
+                "type": "system_notice",
+                "room_id": old_room,
+                "message": f"{display_name} left {pretty_from} → {pretty_to}.",
+            })
+        await _broadcast_room_json(new_room, {
+            "type": "system_notice",
+            "room_id": new_room,
+            "message": f"{display_name} entered {pretty_to}.",
+        })
+    except Exception:
+        logger.exception("Error broadcasting cross-room presence notice")
+
 async def _delayed_serene_message(room_id: str, message_text: str):
     """
     Humanize Serene: wait 2s then send; wrap image if needed.
@@ -877,14 +912,20 @@ async def _serene_hail(room_id: str, display_name: str, hail_phrase: str):
 async def chat_websocket_handler(request):
     """
     Persistent chat WebSocket with:
-      • Heartbeats to keep proxies/NATs happy.
-      • Large max_msg_size for pasted images (data URLs).
-      • Robust handshake (wait until first valid TEXT JSON).
-      • No hard-close on malformed frames – keep listening.
-      • Serene start/question/hail flows and image wrapping preserved.
-      • NEW: 'gif …' command handled server-side (first token must be 'gif').
+      • Robust handshake.
+      • Image/GIF wrapping and Serene flows.
+      • GIF command: 'gif ...'
+      • >>> NEW: Seamless room rebind + cross-room presence system notices.
+        - Client may send a frame with {"room_id":"<new_room>", "displayName":"<name>"} (no 'message') to switch.
+        - Optionally include {"from_name":"Lobby","to_name":"Texas Hold 'Em – Table 17"} for prettier notices.
+        - Server will:
+            a) Move this socket from old bucket to new bucket.
+            b) Broadcast "user_left" in old room and "user_joined" in new room.
+            c) Broadcast system_notice in both places:
+               • Old room: "<name> left {from} → {to}."
+               • New room: "<name> entered {to}."
+               • If new room == 'lobby', pretty text is "the lobby".
     """
-    # Heartbeat pings every 25s; 16MB frames for big data URLs
     ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=16 * 1024 * 1024, autoping=True)
     try:
         ok = await ws.prepare(request)
@@ -900,16 +941,14 @@ async def chat_websocket_handler(request):
     awaiting_serene_question = False
 
     try:
-        # --- Robust initial handshake: wait for TEXT JSON with room_id + displayName ---
+        # --- Initial registration (wait for first valid TEXT JSON) ---
         first_msg_str = None
         while True:
             msg = await ws.receive()
             if msg.type == web.WSMsgType.TEXT:
                 first_msg_str = msg.data
                 break
-            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
-                continue
-            elif msg.type == web.WSMsgType.BINARY:
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG, web.WSMsgType.BINARY):
                 continue
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
                 logger.info("[/chat_ws] client closed before initial TEXT; returning")
@@ -956,12 +995,21 @@ async def chat_websocket_handler(request):
         bot.chat_ws_rooms[room_id].add(ws)
         logger.info(f"'{display_name}' connected to chat room '{room_id}'.")
 
-        # Announce join
+        # Announce join + >>> NEW: friendly "entered ..." system notice on first join
         await _broadcast_room_json(room_id, {
             "type": "user_joined",
             "displayName": display_name,
             "room_id": room_id
         })
+        try:
+            # Only send the entry system line for the first registration
+            await _broadcast_room_json(room_id, {
+                "type": "system_notice",
+                "room_id": room_id,
+                "message": f"{display_name} entered {_pretty_room(room_id)}."
+            })
+        except Exception:
+            pass
 
         # --- Main receive loop ---
         while True:
@@ -973,6 +1021,56 @@ async def chat_websocket_handler(request):
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     logger.debug("[/chat_ws] ignoring malformed JSON frame")
+                    continue
+
+                # >>> NEW: Room rebind protocol (no 'message', has 'room_id')
+                if 'room_id' in data and 'message' not in data:
+                    new_room = str(data.get('room_id') or '').strip()
+                    if new_room and new_room != room_id:
+                        old_room = room_id
+                        from_name = data.get('from_name')  # optional pretty labels sent by frontend
+                        to_name = data.get('to_name')
+
+                        # Move this socket between buckets
+                        try:
+                            # remove from old bucket
+                            try:
+                                if old_room in bot.chat_ws_rooms:
+                                    bot.chat_ws_rooms[old_room].discard(ws)
+                                    if not bot.chat_ws_rooms[old_room]:
+                                        del bot.chat_ws_rooms[old_room]
+                            except Exception:
+                                pass
+
+                            # add to new bucket
+                            if new_room not in bot.chat_ws_rooms:
+                                bot.chat_ws_rooms[new_room] = set()
+                            bot.chat_ws_rooms[new_room].add(ws)
+
+                            # Broadcast presence to both rooms
+                            await _broadcast_room_json(old_room, {
+                                "type": "user_left",
+                                "displayName": display_name,
+                                "room_id": old_room
+                            })
+                            await _broadcast_room_json(new_room, {
+                                "type": "user_joined",
+                                "displayName": display_name,
+                                "room_id": new_room
+                            })
+
+                            # >>> NEW: Authoritative system notice lines visible to EVERYONE
+                            await _broadcast_cross_room_presence(old_room, new_room, display_name,
+                                                                 from_name=from_name, to_name=to_name)
+
+                            # Update room_id
+                            room_id = new_room
+                            logger.info(f"[/chat_ws] {display_name} re-bound to room '{room_id}'")
+
+                        except Exception as e:
+                            logger.error(f"[/chat_ws] error during room rebind for {display_name}: {e}", exc_info=True)
+
+                    # either way, don’t treat this as a chat message
                     continue
 
                 if 'message' in data:

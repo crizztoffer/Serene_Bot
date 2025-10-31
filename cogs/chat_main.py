@@ -26,12 +26,9 @@ HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # detect "hail
 # -------------------------
 # Media detection (images + video) — robust to query strings
 # -------------------------
-# Keep tag/attribute extractors
 IMG_TAG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
 DATA_URL_IMAGE_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
 DATA_URL_VIDEO_RE = re.compile(r'^data:video/(?:webm|mp4);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
-
-# Permissive URL grabber (no extension check here); we classify after parsing
 URL_IN_TEXT_RE = re.compile(r'(https?://[^\s"\'<>]+)', re.IGNORECASE)
 
 IMAGE_EXTS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
@@ -51,7 +48,7 @@ class ChatMain(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-        # Ensure the rooms registry exists and that 'lobby' is always present/persistent
+        # Ensure the rooms registry exists and lobby persists
         if not hasattr(self.bot, "chat_ws_rooms"):
             self.bot.chat_ws_rooms = {}
         self.bot.chat_ws_rooms.setdefault("lobby", set())
@@ -216,6 +213,7 @@ class ChatMain(commands.Cog):
         bot_id: e.g., "serene" if sender_type == "bot"
         """
         media = self._extract_media_from_text(message_text or "")
+        ts = int(time.time())
         if media:
             kind, src = media
             if kind == "image":
@@ -224,13 +222,12 @@ class ChatMain(commands.Cog):
                     "type": "new_message",
                     "room_id": room_id,
                     "displayName": display_name,
-                    "message": wrapped_html,     # HTML-safe wrapper
+                    "message": wrapped_html,
                     "isImage": True,
-                    "imageUrl": src,             # raw src for frontend logic if needed
-                    "timestamp": int(time.time()),
+                    "imageUrl": src,
+                    "timestamp": ts,
                 }
             else:  # video
-                # infer MIME; default to webm
                 mime = "video/webm" if src.lower().endswith(".webm") else "video/mp4"
                 wrapped_html = (
                     f'<video class="chat-video" controls playsinline preload="metadata">'
@@ -243,7 +240,7 @@ class ChatMain(commands.Cog):
                     "message": wrapped_html,
                     "isVideo": True,
                     "videoUrl": src,
-                    "timestamp": int(time.time()),
+                    "timestamp": ts,
                 }
         else:
             payload = {
@@ -252,7 +249,7 @@ class ChatMain(commands.Cog):
                 "displayName": display_name,
                 "message": message_text,
                 "isImage": False,
-                "timestamp": int(time.time()),
+                "timestamp": ts,
             }
 
         if sender_type == "bot":
@@ -263,11 +260,10 @@ class ChatMain(commands.Cog):
         return payload
 
     # -------------------------
-    # GIF helpers (unchanged API; now benefits from unified media handling)
+    # GIF helpers
     # -------------------------
 
     async def _fetch_gif_url_from_tenor(self, query: str) -> Optional[str]:
-        """Get a single GIF URL from Tenor v2."""
         if not TENOR_API_KEY:
             return None
         params = {
@@ -301,23 +297,15 @@ class ChatMain(commands.Cog):
             return None
 
     async def _fetch_gif_url_fallback(self, query: str) -> Optional[str]:
-        """Fallback to your crawler page with the correct params (kw, total, api)."""
         if not TENOR_API_KEY:
             return None
 
-        params = {
-            "kw": query,
-            "total": 25,
-            "api": TENOR_API_KEY
-        }
-
-        # Reuse existing session
+        params = {"kw": query, "total": 25, "api": TENOR_API_KEY}
         try:
             async with self.http_session.get("https://serenekeks.com/crawl.php", params=params, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None
                 body = (await resp.text()).strip()
-                # Extract any URL and validate it's an image
                 m = URL_IN_TEXT_RE.search(body)
                 if not m:
                     return None
@@ -330,23 +318,18 @@ class ChatMain(commands.Cog):
             return None
 
     async def _handle_gif_command(self, room_id: str, display_name: str, raw_text: str) -> bool:
-        """
-        Return True if handled.
-        Only triggers when the FIRST token is exactly 'gif' and a query follows.
-        """
+        """Return True if handled. Triggers when FIRST token is 'gif' and a query follows."""
         if not raw_text:
             return False
         parts = raw_text.strip().split(None, 1)
         if not parts or parts[0].lower() != "gif":
             return False
         if len(parts) == 1 or not parts[1].strip():
-            # No search terms => treat as not handled
             return False
 
         query = parts[1].strip()
         logger.info("GIF command by %s in %s | query=%r", display_name, room_id, query)
 
-        # Try Tenor, then fallback
         url = await self._fetch_gif_url_from_tenor(query)
         if not url:
             url = await self._fetch_gif_url_fallback(query)
@@ -355,11 +338,12 @@ class ChatMain(commands.Cog):
             payload = self._build_message_payload(
                 room_id=room_id,
                 display_name=display_name,
-                message_text=url,  # will be wrapped as <img> or <video> automatically
+                message_text=url,
                 sender_type="user"
             )
             await self._broadcast_room_json(room_id, payload)
         else:
+            # Silently do nothing if no GIF found? Keep a soft notice if you like:
             try:
                 await self._broadcast_room_json(room_id, {
                     "type": "system_notice",
@@ -377,10 +361,6 @@ class ChatMain(commands.Cog):
     # -------------------------
 
     async def _serene_request_get(self, params: dict) -> Optional[str]:
-        """
-        Call Serene using GET (matches PHP: $_GET[...] checks).
-        Logs URL, status, and a preview of the body.
-        """
         try:
             logger.info("[Serene] GET -> %s | params=%s", SERENE_BOT_URL, params)
         except Exception:
@@ -420,12 +400,8 @@ class ChatMain(commands.Cog):
             return None
 
     async def _delayed_broadcast_serene(self, room_id: str, message: str):
-        """
-        Apply a human-like delay before broadcasting Serene's message.
-        Wrap as <img>/<video> if it looks like media.
-        """
         try:
-            await asyncio.sleep(2.0)  # 2-second humanized delay
+            await asyncio.sleep(2.0)  # humanized delay
         except Exception:
             pass
         payload = self._build_message_payload(
@@ -441,37 +417,20 @@ class ChatMain(commands.Cog):
         logger.info("[Serene] START triggered by %s in room %s", display_name, room_id)
         reply = await self._serene_request_get({"start": "true", "player": display_name})
         if reply:
-            logger.info("[Serene] Broadcasting START reply to room %s (len=%d) after delay", room_id, len(reply))
             await self._delayed_broadcast_serene(room_id, reply)
-        else:
-            logger.info("[Serene] START produced no reply for room %s", room_id)
 
     async def _serene_question(self, room_id: str, display_name: str, question_raw: str):
-        # Keep the question HTML-safe
         safe_q = html.escape(question_raw or "", quote=True)
-        logger.info("[Serene] QUESTION from %s in room %s: raw=\"%s\" safe=\"%s\"",
-                    display_name, room_id, (question_raw or "")[:200], safe_q[:200])
-
+        logger.info("[Serene] QUESTION from %s in room %s", display_name, room_id)
         reply = await self._serene_request_get({"question": safe_q, "player": display_name})
         if reply:
-            logger.info("[Serene] Broadcasting QUESTION reply to room %s (len=%d) after delay", room_id, len(reply))
             await self._delayed_broadcast_serene(room_id, reply)
-        else:
-            logger.info("[Serene] QUESTION produced no reply for room %s", room_id)
 
     async def _serene_hail(self, room_id: str, display_name: str, hail_phrase: str):
-        """
-        Handle 'hail serene' phrase: GET with hail=<matched phrase>&player=<display name>
-        The PHP lowercases and uses this string in getHails(...).
-        """
-        logger.info("[Serene] HAIL triggered by %s in room %s | hail_phrase=\"%s\"",
-                    display_name, room_id, hail_phrase)
+        logger.info("[Serene] HAIL by %s in room %s | %r", display_name, room_id, hail_phrase)
         reply = await self._serene_request_get({"hail": hail_phrase, "player": display_name})
         if reply:
-            logger.info("[Serene] Broadcasting HAIL reply to room %s (len=%d) after delay", room_id, len(reply))
             await self._delayed_broadcast_serene(room_id, reply)
-        else:
-            logger.info("[Serene] HAIL produced no reply for room %s", room_id)
 
     # -------------------------
     # WebSocket handler
@@ -507,7 +466,7 @@ class ChatMain(commands.Cog):
                     await ws.close()
                     return ws
 
-            # Parse the initial JSON
+            # Parse initial JSON
             try:
                 initial_data = json.loads(first_msg_str)
             except json.JSONDecodeError:
@@ -525,7 +484,7 @@ class ChatMain(commands.Cog):
                 await ws.close()
                 return ws
 
-            # Ensure lobby bucket is always present
+            # Ensure lobby bucket persists
             self.bot.chat_ws_rooms.setdefault("lobby", set())
 
             # Register the WebSocket to the chat room
@@ -559,90 +518,64 @@ class ChatMain(commands.Cog):
                     if message_text:
                         logger.info(f"Chat message from '{display_name}' in room {room_id}: {message_text}")
 
-                        # -------------------------
                         # GIF command (FIRST TOKEN MUST BE 'gif')
-                        # -------------------------
                         if await self._handle_gif_command(room_id, display_name, message_text):
-                            # If handled as GIF, skip the rest (don’t double-post original text)
                             continue
 
-                        # -------------------------
                         # Serene logic
-                        # -------------------------
                         lowered = message_text.lower()
 
                         # If awaiting a question from this client, treat THIS message as the question
                         if ws in self._awaiting_serene_question:
-                            logger.info("[Serene] Socket is awaiting question -> sending question now.")
                             self._awaiting_serene_question.discard(ws)
                             asyncio.create_task(self._serene_question(room_id, display_name, message_text))
 
-                        # First: handle explicit 'hail serene' (and do NOT also trigger start/question)
+                        # 'hail serene' first
                         m_hail = HAIL_SERENE_RE.search(lowered)
                         if m_hail:
-                            hail_phrase = m_hail.group(0)  # e.g., "hail serene"
-                            logger.info("[Serene] 'hail serene' detected in room %s by %s.", room_id, display_name)
-                            asyncio.create_task(self._serene_hail(room_id, display_name, hail_phrase))
-
-                        # Else: generic 'serene' keyword -> trigger start and arm next message as question
+                            asyncio.create_task(self._serene_hail(room_id, display_name, m_hail.group(0)))
+                        # keyword 'serene' → start + arm next
                         elif SERENE_WORD_RE.search(lowered):
-                            logger.info("[Serene] Keyword detected in room %s by %s. Arming next message as question and calling START.", room_id, display_name)
                             self._awaiting_serene_question.add(ws)
                             asyncio.create_task(self._serene_start(room_id, display_name))
 
-                        # -------------------------
-                        # Sound trigger flow (original behavior preserved)
-                        # -------------------------
+                        # Sound trigger flow:
                         parsed = self._parse_sound_command(message_text)
-
                         if parsed:
-                            # Sound trigger: show ONLY the name in chat, then play sound if file exists
                             name, rate, visible_text = parsed
-
-                            # 1) Broadcast the "visible" chat message (name only)
-                            chat_message = {
-                                "type": "new_message",
-                                "room_id": room_id,
-                                "displayName": display_name,
-                                "message": visible_text,
-                                "timestamp": int(time.time()),
-                            }
-                            await self._broadcast_room_json(room_id, chat_message)
-
-                            # 2) Verify sound exists; if so, broadcast play_sound
                             url = self._sound_url(name)
+                            # **Only treat as sound if the .ogg exists**
                             if await self._sound_exists(url):
-                                sound_payload = {
+                                tsn = int(time.time())
+                                # 1) show the name in chat
+                                await self._broadcast_room_json(room_id, {
+                                    "type": "new_message",
+                                    "room_id": room_id,
+                                    "displayName": display_name,
+                                    "message": visible_text,
+                                    "timestamp": tsn,
+                                })
+                                # 2) play it
+                                await self._broadcast_room_json(room_id, {
                                     "type": "play_sound",
                                     "room_id": room_id,
                                     "displayName": display_name,
                                     "name": name,
                                     "url": url,
                                     "rate": rate,  # 0.5..2.0
-                                    "timestamp": int(time.time()),
-                                }
-                                await self._broadcast_room_json(room_id, sound_payload)
-                            else:
-                                try:
-                                    await ws.send_json({
-                                        "type": "system_notice",
-                                        "room_id": room_id,
-                                        "message": f"Sound '{name}' not found.",
-                                        "timestamp": int(time.time()),
-                                    })
-                                except Exception:
-                                    pass
+                                    "timestamp": tsn,
+                                })
+                                continue
+                            # If it doesn't exist, fall through to normal text (NO error notice)
 
-                        else:
-                            # Normal text (no sound trigger):
-                            # If user message contains media, flag and wrap it
-                            user_payload = self._build_message_payload(
-                                room_id=room_id,
-                                display_name=display_name,
-                                message_text=message_text,
-                                sender_type="user"
-                            )
-                            await self._broadcast_room_json(room_id, user_payload)
+                        # Normal text (and media auto-wrap)
+                        user_payload = self._build_message_payload(
+                            room_id=room_id,
+                            display_name=display_name,
+                            message_text=message_text,
+                            sender_type="user"
+                        )
+                        await self._broadcast_room_json(room_id, user_payload)
 
                 elif msg.type == web.WSMsgType.PING or msg.type == web.WSMsgType.PONG:
                     continue

@@ -749,21 +749,33 @@ async def _serene_get(params: dict) -> Optional[str]:
         logger.exception("Unexpected error in Serene GET")
         return None
 
+# --- UPDATED broadcaster: gentle on transient errors ---
 async def _broadcast_room_json(room_id: str, payload: dict):
     """
-    Broadcast dict JSON to the room (uses send_str). Cleans up dead sockets.
+    Broadcast dict JSON to the room (uses send_str). Avoids hard-removing sockets on transient errors.
     """
     try:
         room = bot.chat_ws_rooms.get(room_id) or set()
         msg = json.dumps(payload)
+        dead = []
         for client_ws in list(room):
             try:
+                if client_ws.closed:
+                    dead.append(client_ws)
+                    continue
                 await client_ws.send_str(msg)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"[chat_ws] send_str error (room={room_id}): {e}")
                 try:
-                    room.discard(client_ws)
+                    if client_ws.closed:
+                        dead.append(client_ws)
                 except Exception:
                     pass
+        for ws in dead:
+            try:
+                room.discard(ws)
+            except Exception:
+                pass
     except Exception:
         logger.exception("Broadcast error for room %s", room_id)
 
@@ -797,116 +809,161 @@ async def _serene_hail(room_id: str, display_name: str, hail_phrase: str):
     if reply:
         asyncio.create_task(_delayed_serene_message(room_id, reply))
 
-# ---------------------- CHAT WS: /chat_ws (current + Serene + images) ----------------------
+# ---------------------- CHAT WS: /chat_ws (persistent, robust) ----------------------
 async def chat_websocket_handler(request):
     """
-    Handles chat WebSocket connections for game lobbies and rooms.
-
-    Preserves existing behavior:
-      • initial TEXT with {"room_id","displayName"}
-      • broadcast user_joined / user_left
-      • rebroadcast every user message as type="new_message"
-
-    Adds Serene & images:
-      • If a message contains 'serene' (case-insensitive), GET {start:true, player}
-        and mark the NEXT message from that same socket as the Serene question.
-      • That next message is GET {question:<html-escaped>, player}.
-      • 'hail serene' sends GET {hail:'hail serene', player:<name>} (no start/question).
-      • Serene replies are delayed by ~2s and include image wrapping.
-      • Normal user messages are inspected: if they contain an image/gif (URL/data URL/<img>),
-        they are wrapped in <img class="chat-gif" ...> and sent with isImage/imageUrl.
+    Persistent chat WebSocket with:
+      • Heartbeats to keep proxies/NATs happy.
+      • Large max_msg_size for pasted images (data URLs).
+      • Robust handshake (wait until first valid TEXT JSON).
+      • No hard-close on malformed frames – keep listening.
+      • Serene start/question/hail flows and image wrapping preserved.
     """
-    ws = web.WebSocketResponse()
-    await ws.prepare(request)
-
-    logger.info("✅ [/chat_ws] WebSocket upgraded successfully from %s", request.remote)
+    # Heartbeat pings every 25s; 16MB frames for big data URLs
+    ws = web.WebSocketResponse(heartbeat=25.0, max_msg_size=16 * 1024 * 1024, autoping=True)
+    try:
+        ok = await ws.prepare(request)
+        if not ok:
+            return ws
+        logger.info("✅ [/chat_ws] WebSocket upgraded successfully from %s", request.remote)
+    except Exception as e:
+        logger.error(f"[/chat_ws] prepare() failed: {e}", exc_info=True)
+        return web.Response(text="Upgrade failed", status=400)
 
     room_id = None
     display_name = None
-
-    # Track whether this socket's next message is a Serene question
     awaiting_serene_question = False
 
     try:
-        # 1. Handle initial registration message (unchanged)
-        first_msg_str = await ws.receive_str()
-        initial_data = json.loads(first_msg_str)
+        # --- Robust initial handshake: wait for TEXT JSON with room_id + displayName ---
+        first_msg_str = None
+        while True:
+            msg = await ws.receive()
+            if msg.type == web.WSMsgType.TEXT:
+                first_msg_str = msg.data
+                break
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
+                continue
+            elif msg.type == web.WSMsgType.BINARY:
+                continue
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info("[/chat_ws] client closed before initial TEXT; returning")
+                return ws
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.warning(f"[/chat_ws] WS error before handshake: {ws.exception()}")
+                continue
+
+        # Parse initial JSON (if malformed, keep waiting until a valid TEXT JSON arrives)
+        initial_data = None
+        while True:
+            try:
+                initial_data = json.loads(first_msg_str)
+            except json.JSONDecodeError:
+                logger.warning(f"[/chat_ws] malformed initial JSON, waiting for next TEXT")
+                next_msg = await ws.receive()
+                if next_msg.type == web.WSMsgType.TEXT:
+                    first_msg_str = next_msg.data
+                    continue
+                else:
+                    continue
+            break
+
         room_id = initial_data.get('room_id')
         display_name = initial_data.get('displayName')
 
         if not room_id or not display_name:
-            logger.error(f"Chat WS initial frame missing room_id or displayName: {initial_data}")
-            await ws.close()
-            return ws
+            # Keep socket open; wait for a proper registration frame
+            logger.warning(f"[/chat_ws] missing room_id/displayName in initial JSON; waiting for valid registration")
+            while not (room_id and display_name):
+                msg = await ws.receive()
+                if msg.type != web.WSMsgType.TEXT:
+                    continue
+                try:
+                    jd = json.loads(msg.data)
+                except json.JSONDecodeError:
+                    continue
+                room_id = room_id or jd.get('room_id')
+                display_name = display_name or jd.get('displayName')
 
-        # 2. Add user to the chat room registry (unchanged)
+        # Register in-memory
         if room_id not in bot.chat_ws_rooms:
             bot.chat_ws_rooms[room_id] = set()
         bot.chat_ws_rooms[room_id].add(ws)
         logger.info(f"'{display_name}' connected to chat room '{room_id}'.")
 
-        # 3. Announce user joining (unchanged)
-        join_message = {
+        # Announce join
+        await _broadcast_room_json(room_id, {
             "type": "user_joined",
             "displayName": display_name,
             "room_id": room_id
-        }
-        await _broadcast_room_json(room_id, join_message)
+        })
 
-        # 4. Listen for and broadcast messages (now with Serene & image handling)
-        async for msg in ws:
+        # --- Main receive loop ---
+        while True:
+            msg = await ws.receive()
+
             if msg.type == web.WSMsgType.TEXT:
-                # Parse incoming JSON
+                # Parse incoming JSON (ignore bad JSON rather than closing)
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
+                    logger.debug("[/chat_ws] ignoring malformed JSON frame")
                     continue
 
                 if 'message' in data:
                     user_text = str(data['message'])
                     lowered = user_text.lower()
 
-                    # (A) Broadcast user's message (with image/gif detection)
+                    # Broadcast user message (with image/gif detection)
                     user_payload = _build_message_payload(room_id, display_name, user_text, sender_type="user")
                     await _broadcast_room_json(room_id, user_payload)
 
-                    # (B) Serene: if awaiting a question from this socket, post it
+                    # Serene flows
                     if awaiting_serene_question:
-                        awaiting_serene_question = False  # clear first to avoid re-entrancy
+                        awaiting_serene_question = False
                         asyncio.create_task(_serene_question(room_id, display_name, user_text))
 
-                    # (C) Serene: check "hail serene" first (does NOT also trigger start/question)
                     m_hail = HAIL_SERENE_RE.search(lowered)
                     if m_hail:
                         asyncio.create_task(_serene_hail(room_id, display_name, m_hail.group(0)))
-                    # (D) Else: generic 'serene' keyword -> trigger start and arm next message as question
                     elif SERENE_WORD_RE.search(lowered):
                         awaiting_serene_question = True
                         asyncio.create_task(_serene_start(room_id, display_name))
 
-            elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"Chat WS error for '{display_name}' in room '{room_id}': {ws.exception()}")
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
+                continue
 
+            elif msg.type == web.WSMsgType.BINARY:
+                logger.debug("[/chat_ws] ignoring binary frame")
+                continue
+
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info(f"[/chat_ws] client is closing for '{display_name}' in '{room_id}'")
+                break
+
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.warning(f"[/chat_ws] WS error in loop: {ws.exception()}")
+                continue
+
+    except asyncio.CancelledError:
+        logger.info(f"[/chat_ws] cancelled for {display_name} in {room_id}")
     except Exception as e:
-        logger.error(f"Chat WS handler error for '{display_name}' in room '{room_id}': {e}", exc_info=True)
+        logger.error(f"[/chat_ws] handler error for '{display_name}' in '{room_id}': {e}", exc_info=True)
     finally:
-        # 5. Handle disconnection (unchanged)
+        # Gentle unregister (don’t send a leave event if the room bucket is gone)
         try:
             if room_id and ws in bot.chat_ws_rooms.get(room_id, set()):
-                bot.chat_ws_rooms[room_id].remove(ws)
+                bot.chat_ws_rooms[room_id].discard(ws)
                 if not bot.chat_ws_rooms[room_id]:
                     del bot.chat_ws_rooms[room_id]
 
                 logger.info(f"'{display_name}' disconnected from chat room '{room_id}'.")
-
-                # Announce user leaving
-                leave_message = {
-                    "type": "user_left",
-                    "displayName": display_name,
-                    "room_id": room_id
-                }
                 if room_id in bot.chat_ws_rooms:
-                    await _broadcast_room_json(room_id, leave_message)
+                    await _broadcast_room_json(room_id, {
+                        "type": "user_left",
+                        "displayName": display_name,
+                        "room_id": room_id
+                    })
         finally:
             return ws
 

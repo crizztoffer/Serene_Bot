@@ -122,7 +122,7 @@ class ChatMain(commands.Cog):
         # Old room notice
         if old_room:
             if str(old_room).lower() == "lobby":
-                # Moving out of lobby (optional line; can keep this subtle or omit)
+                # Moving out of lobby (optional)
                 await self._broadcast_room_json(old_room, {
                     "type": "system_notice",
                     "room_id": old_room,
@@ -610,6 +610,18 @@ class ChatMain(commands.Cog):
                         logger.debug("Ignoring malformed JSON frame in room %s.", room_id)
                         continue
 
+                    # --- App-level ping/pong to keep idle sockets fresh ---
+                    if data.get("type") == "ping":
+                        try:
+                            await ws.send_json({
+                                "type": "pong",
+                                "ts": data.get("ts") or int(time.time() * 1000),
+                                "room_id": room_id,
+                            })
+                        except Exception:
+                            pass
+                        continue  # not a chat message
+
                     # --- Room rebind protocol (NO 'message', HAS 'room_id') ---
                     if 'room_id' in data and 'message' not in data:
                         new_room = str(data.get('room_id') or '').strip()
@@ -757,16 +769,6 @@ class ChatMain(commands.Cog):
                                     "timestamp": tsn,
                                 })
                                 continue
-                            # If it doesn't exist, fall through to normal text (quietly)
-                            # If you want the old "Sound 'x' not found." notice, uncomment:
-                            # else:
-                            #     await self._broadcast_room_json(room_id, {
-                            #         "type": "system_notice",
-                            #         "room_id": room_id,
-                            #         "message": f"Sound '{name}' not found.",
-                            #         "timestamp": int(time.time()),
-                            #     })
-                            #     continue
 
                         # Normal message (supports media wrapping)
                         user_payload = self._build_message_payload(

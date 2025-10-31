@@ -94,7 +94,7 @@ class ChatMain(commands.Cog):
         return name, rate, visible_text
 
     def _sound_url(self, name: str) -> str:
-        return f"{SOUND_BASE_URL}/{name}.ogg}"
+        return f"{SOUND_BASE_URL}/{name}.ogg"
 
     async def _sound_exists(self, url: str) -> bool:
         try:
@@ -197,7 +197,7 @@ class ChatMain(commands.Cog):
         return payload
 
     # -------------------------
-    # GIF helpers (FIXED)
+    # GIF helpers (NEW)
     # -------------------------
 
     async def _fetch_gif_url_from_tenor(self, query: str) -> Optional[str]:
@@ -225,36 +225,33 @@ class ChatMain(commands.Cog):
             if not results:
                 return None
             r0 = results[0]
+            # Try common fields
+            # Prefer medium/large sizes when possible
             media_formats = r0.get("media_formats") or {}
-            # Prefer these formats if present
+            # Tenor v2 formats often include "gif", "mediumgif", "tinygif"
             for key in ("gif", "mediumgif", "tinygif"):
                 fmt = media_formats.get(key)
                 if fmt and "url" in fmt:
                     return fmt["url"]
+            # Fallback to r0.url if present
             return r0.get("url")
         except Exception:
             return None
 
-    async def _fetch_gif_url_fallback(self, query: str) -> Optional[str]:
-        """
-        Fallback to your crawler page with the correct params (kw, total, api).
-        Must be an instance method (has `self`) and use `self.http_session`.
-        """
+    async def _fetch_gif_url_fallback(query: str) -> Optional[str]:
+        """Fallback to your crawler page with the correct params (kw, total, api)."""
         if not TENOR_API_KEY:
             return None
-
+    
         params = {
-            "kw": query,           # matches crawl.php expectation
-            "total": 25,           # reasonable positive int
-            "api": TENOR_API_KEY,  # pass your Tenor key through
+            "kw": query,          # matches crawl.php expectation
+            "total": 25,          # any reasonable positive int
+            "api": TENOR_API_KEY  # pass your Tenor key through
         }
-
+    
+        session = _get_serene_http()
         try:
-            async with self.http_session.get(
-                "https://serenekeks.com/crawl.php",
-                params=params,
-                allow_redirects=True
-            ) as resp:
+            async with session.get("https://serenekeks.com/crawl.php", params=params, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None
                 body = (await resp.text()).strip()
@@ -262,8 +259,7 @@ class ChatMain(commands.Cog):
                 if IMAGE_URL_RE.match(body) or IMAGE_URL_IN_TEXT_RE.search(body):
                     return body
                 return None
-        except Exception as e:
-            logger.warning("crawl.php fallback failed: %s", e)
+        except Exception:
             return None
 
     async def _handle_gif_command(self, room_id: str, display_name: str, raw_text: str) -> bool:
@@ -277,12 +273,13 @@ class ChatMain(commands.Cog):
         if not parts or parts[0].lower() != "gif":
             return False
         if len(parts) == 1 or not parts[1].strip():
+            # No search terms => treat as not handled
             return False
 
         query = parts[1].strip()
         logger.info("GIF command by %s in %s | query=%r", display_name, room_id, query)
 
-        # Try Tenor, then fallback to crawl.php
+        # Try Tenor, then fallback
         url = await self._fetch_gif_url_from_tenor(query)
         if not url:
             url = await self._fetch_gif_url_fallback(query)
@@ -296,12 +293,16 @@ class ChatMain(commands.Cog):
             )
             await self._broadcast_room_json(room_id, payload)
         else:
-            await self._broadcast_room_json(room_id, {
-                "type": "system_notice",
-                "room_id": room_id,
-                "message": f"No GIF found for “{query}”.",
-                "timestamp": int(time.time()),
-            })
+            try:
+                await self._broadcast_room_json(room_id, {
+                    "type": "system_notice",
+                    "room_id": room_id,
+                    "message": f"No GIF found for “{query}”.",
+                    "timestamp": int(time.time()),
+                })
+            except Exception:
+                pass
+
         return True
 
     # -------------------------

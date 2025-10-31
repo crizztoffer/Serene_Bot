@@ -122,7 +122,7 @@ class ChatMain(commands.Cog):
         # Old room notice
         if old_room:
             if str(old_room).lower() == "lobby":
-                # Moving out of lobby (optional)
+                # Moving out of lobby (optional line; can keep this subtle or omit)
                 await self._broadcast_room_json(old_room, {
                     "type": "system_notice",
                     "room_id": old_room,
@@ -539,6 +539,9 @@ class ChatMain(commands.Cog):
                     initial_data = json.loads(first_msg_str)
                     break
                 except json.JSONDecodeError:
+                    # Allow a bare "ping" even before valid JSON registration
+                    if isinstance(first_msg_str, str) and first_msg_str.strip().lower() == "ping":
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
                     logger.warning("Malformed initial JSON; awaiting next TEXT frame for registration.")
                     nxt = await ws.receive()
                     if nxt.type == web.WSMsgType.TEXT:
@@ -555,6 +558,10 @@ class ChatMain(commands.Cog):
                 while not (room_id and display_name):
                     next_msg = await ws.receive()
                     if next_msg.type != web.WSMsgType.TEXT:
+                        continue
+                    # handle bare ping while waiting for valid registration
+                    if next_msg.data.strip().lower() == "ping":
+                        await ws.send_json({"type": "pong", "ts": int(time.time())})
                         continue
                     try:
                         jd = json.loads(next_msg.data)
@@ -603,24 +610,28 @@ class ChatMain(commands.Cog):
             # Listen for subsequent messages
             async for msg in ws:
                 if msg.type == web.WSMsgType.TEXT:
-                    # Parse JSON (ignore malformed frames)
+                    # --- Handle raw "ping" frames even if they aren't JSON ---
+                    if isinstance(msg.data, str) and msg.data.strip().lower() == "ping":
+                        try:
+                            await ws.send_json({"type": "pong", "ts": int(time.time())})
+                        except Exception:
+                            pass
+                        continue
+
+                    # Parse JSON (ignore malformed frames, but reply to 'ping' texts handled above)
                     try:
                         data = json.loads(msg.data)
                     except json.JSONDecodeError:
                         logger.debug("Ignoring malformed JSON frame in room %s.", room_id)
                         continue
 
-                    # --- App-level ping/pong to keep idle sockets fresh ---
+                    # >>> IDLE KEEPALIVE FIX: app-level ping/pong
                     if data.get("type") == "ping":
                         try:
-                            await ws.send_json({
-                                "type": "pong",
-                                "ts": data.get("ts") or int(time.time() * 1000),
-                                "room_id": room_id,
-                            })
+                            await ws.send_json({"type": "pong", "ts": int(time.time())})
                         except Exception:
                             pass
-                        continue  # not a chat message
+                        continue
 
                     # --- Room rebind protocol (NO 'message', HAS 'room_id') ---
                     if 'room_id' in data and 'message' not in data:
@@ -769,6 +780,7 @@ class ChatMain(commands.Cog):
                                     "timestamp": tsn,
                                 })
                                 continue
+                            # If it doesn't exist, fall through to normal text
 
                         # Normal message (supports media wrapping)
                         user_payload = self._build_message_payload(

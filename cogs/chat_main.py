@@ -1,3 +1,4 @@
+import os
 import json
 import time
 import asyncio
@@ -32,6 +33,10 @@ DATA_URL_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/
 MIN_SPEED_PCT = 50
 MAX_SPEED_PCT = 200
 DEFAULT_RATE = 1.0
+
+# Tenor
+TENOR_API_KEY = os.getenv("TENOR_API_KEY")
+TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
 
 
 class ChatMain(commands.Cog):
@@ -190,6 +195,116 @@ class ChatMain(commands.Cog):
                 payload["botId"] = bot_id
 
         return payload
+
+    # -------------------------
+    # GIF helpers (NEW)
+    # -------------------------
+
+    async def _fetch_gif_url_from_tenor(self, query: str) -> Optional[str]:
+        """Get a single GIF URL from Tenor v2."""
+        if not TENOR_API_KEY:
+            return None
+        params = {
+            "q": query,
+            "key": TENOR_API_KEY,
+            "limit": 1,
+            "media_filter": "gif",
+            "random": "true",
+        }
+        try:
+            async with self.http_session.get(TENOR_ENDPOINT, params=params, allow_redirects=True) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.warning("Tenor request failed: %s", e)
+            return None
+
+        try:
+            results = data.get("results") or []
+            if not results:
+                return None
+            r0 = results[0]
+            # Try common fields
+            # Prefer medium/large sizes when possible
+            media_formats = r0.get("media_formats") or {}
+            # Tenor v2 formats often include "gif", "mediumgif", "tinygif"
+            for key in ("gif", "mediumgif", "tinygif"):
+                fmt = media_formats.get(key)
+                if fmt and "url" in fmt:
+                    return fmt["url"]
+            # Fallback to r0.url if present
+            return r0.get("url")
+        except Exception:
+            return None
+
+    async def _fetch_gif_url_fallback(self, query: str) -> Optional[str]:
+        """
+        Fallback to your PHP helper at serenekeks.com/crawl.php.
+        We’ll try both ?q= and ?query= and extract either a direct URL or <img src>.
+        """
+        base = "https://serenekeks.com/crawl.php"
+        for param_name in ("q", "query"):
+            try:
+                async with self.http_session.get(base, params={param_name: query}, allow_redirects=True) as resp:
+                    if resp.status != 200:
+                        continue
+                    txt = await resp.text()
+                    # Extract <img src="..."> first
+                    m_img = IMG_TAG_SRC_RE.search(txt)
+                    if m_img:
+                        return m_img.group(1)
+                    # Or any gif-like URL in the body
+                    m_url = IMAGE_URL_IN_TEXT_RE.search(txt)
+                    if m_url:
+                        return m_url.group(1)
+            except Exception as e:
+                logger.warning("crawl.php fallback failed (%s): %s", param_name, e)
+                continue
+        return None
+
+    async def _handle_gif_command(self, room_id: str, display_name: str, raw_text: str) -> bool:
+        """
+        Return True if handled.
+        Only triggers when the FIRST token is exactly 'gif' and a query follows.
+        """
+        if not raw_text:
+            return False
+        parts = raw_text.strip().split(None, 1)
+        if not parts or parts[0].lower() != "gif":
+            return False
+        if len(parts) == 1 or not parts[1].strip():
+            # No search terms => treat as not handled
+            return False
+
+        query = parts[1].strip()
+        logger.info("GIF command by %s in %s | query=%r", display_name, room_id, query)
+
+        # Try Tenor, then fallback
+        url = await self._fetch_gif_url_from_tenor(query)
+        if not url:
+            url = await self._fetch_gif_url_fallback(query)
+
+        if url:
+            payload = self._build_message_payload(
+                room_id=room_id,
+                display_name=display_name,
+                message_text=url,  # will be wrapped as <img class="chat-gif"...>
+                sender_type="user"
+            )
+            await self._broadcast_room_json(room_id, payload)
+        else:
+            try:
+                await self._broadcast_room_json(room_id, {
+                    "type": "system_notice",
+                    "room_id": room_id,
+                    "message": f"No GIF found for “{query}”.",
+                    "timestamp": int(time.time()),
+                })
+            except Exception:
+                pass
+
+        return True
 
     # -------------------------
     # Serene helpers
@@ -374,6 +489,13 @@ class ChatMain(commands.Cog):
                     message_text = data.get("message")
                     if message_text:
                         logger.info(f"Chat message from '{display_name}' in room {room_id}: {message_text}")
+
+                        # -------------------------
+                        # GIF command (FIRST TOKEN MUST BE 'gif')
+                        # -------------------------
+                        if await self._handle_gif_command(room_id, display_name, message_text):
+                            # If handled as GIF, skip the rest (don’t double-post original text)
+                            continue
 
                         # -------------------------
                         # Serene logic

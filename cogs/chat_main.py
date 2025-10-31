@@ -10,6 +10,7 @@ import discord
 from discord.ext import commands
 import html  # for HTML-escaping the question text
 from typing import Optional, Tuple
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +23,19 @@ SERENE_DISPLAY_NAME = "Serene"
 SERENE_WORD_RE = re.compile(r"\bserene\b", re.IGNORECASE)
 HAIL_SERENE_RE = re.compile(r"\bhail\s+serene\b", re.IGNORECASE)  # detect "hail serene"
 
-# Image/GIF detection
-IMG_EXT_RE = r"(?:gif|png|jpe?g|webp)"
-IMAGE_URL_RE = re.compile(rf'^\s*(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)\s*$', re.IGNORECASE)
-IMAGE_URL_IN_TEXT_RE = re.compile(rf'(https?://[^\s"\'<>]+?\.(?:{IMG_EXT_RE})(?:\?[^\s"\'<>]*)?)', re.IGNORECASE)
+# -------------------------
+# Media detection (images + video) — robust to query strings
+# -------------------------
+# Keep tag/attribute extractors
 IMG_TAG_SRC_RE = re.compile(r'<img[^>]+src=["\']([^"\']+)["\']', re.IGNORECASE)
-DATA_URL_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
+DATA_URL_IMAGE_RE = re.compile(r'^data:image/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
+DATA_URL_VIDEO_RE = re.compile(r'^data:video/(?:webm|mp4);base64,[A-Za-z0-9+/=\s]+$', re.IGNORECASE)
+
+# Permissive URL grabber (no extension check here); we classify after parsing
+URL_IN_TEXT_RE = re.compile(r'(https?://[^\s"\'<>]+)', re.IGNORECASE)
+
+IMAGE_EXTS = {".gif", ".png", ".jpg", ".jpeg", ".webp"}
+VIDEO_EXTS = {".webm", ".mp4"}
 
 # 0.5x..2.0x speed by integer 50..200
 MIN_SPEED_PCT = 50
@@ -124,32 +132,72 @@ class ChatMain(commands.Cog):
                 logger.warning("Could not send payload to a client in room %s.", room_id)
 
     # -------------------------
-    # Image helpers
+    # Media helpers (image/video)
     # -------------------------
 
-    def _extract_image_from_text(self, text: str) -> Optional[str]:
-        """Return an image/gif source if present (URL, data: URL, or <img src=...>)."""
+    def _classify_media_url(self, url: str) -> Optional[Tuple[str, str]]:
+        """Return ("image"|"video", original_url) if it looks like media.
+        Accept query strings / fragments and only check the path's extension.
+        """
+        if not url:
+            return None
+
+        low = url.lower()
+        if not (low.startswith("http://") or low.startswith("https://") or low.startswith("data:image/") or low.startswith("data:video/")):
+            return None
+
+        # Data URLs
+        if DATA_URL_IMAGE_RE.match(url):
+            return ("image", url)
+        if DATA_URL_VIDEO_RE.match(url):
+            return ("video", url)
+
+        # http(s): check extension of path only
+        parts = urlsplit(url)
+        path = parts.path or ""
+        ext = os.path.splitext(path.lower())[1]
+        if ext in IMAGE_EXTS:
+            return ("image", url)
+        if ext in VIDEO_EXTS:
+            return ("video", url)
+        return None
+
+    def _extract_media_from_text(self, text: str) -> Optional[Tuple[str, str]]:
+        """Return (kind, src) where kind in {image, video} if present in text.
+        Handles bare URLs (with query/fragment), URLs embedded in text, <img src>, and data: URLs.
+        """
         if not text:
             return None
 
-        # Exact image URL line
-        m = IMAGE_URL_RE.match(text.strip())
+        s = text.strip()
+
+        # Exact URL line
+        m = URL_IN_TEXT_RE.fullmatch(s)
         if m:
-            return m.group(1)
+            classified = self._classify_media_url(m.group(1))
+            if classified:
+                return classified
 
-        # Any image URL within text
-        m2 = IMAGE_URL_IN_TEXT_RE.search(text)
+        # URL inside text
+        m2 = URL_IN_TEXT_RE.search(text)
         if m2:
-            return m2.group(1)
+            classified = self._classify_media_url(m2.group(1))
+            if classified:
+                return classified
 
-        # <img src="...">
+        # <img src="..."> (restrict to http/https/data)
         m3 = IMG_TAG_SRC_RE.search(text)
         if m3:
-            return m3.group(1)
+            src = m3.group(1)
+            classified = self._classify_media_url(src)
+            if classified:
+                return classified
 
-        # data URL
-        if DATA_URL_RE.match(text.strip()):
-            return text.strip()
+        # data: URLs (already handled by classifier, but support whole-line data)
+        if DATA_URL_IMAGE_RE.match(s):
+            return ("image", s)
+        if DATA_URL_VIDEO_RE.match(s):
+            return ("video", s)
 
         return None
 
@@ -162,23 +210,40 @@ class ChatMain(commands.Cog):
         bot_id: Optional[str] = None
     ) -> dict:
         """
-        Build a chat payload. If message contains an image/gif, wrap and flag it.
+        Build a chat payload. If message contains media, wrap/flag it.
         sender_type: "user" or "bot"
         bot_id: e.g., "serene" if sender_type == "bot"
         """
-        img_src = self._extract_image_from_text(message_text or "")
-        if img_src:
-            # Send standardized <img> wrapper and also provide imageUrl + isImage flag
-            wrapped_html = f'<img class="chat-gif" src="{html.escape(img_src, quote=True)}" />'
-            payload = {
-                "type": "new_message",
-                "room_id": room_id,
-                "displayName": display_name,
-                "message": wrapped_html,     # HTML-safe wrapper
-                "isImage": True,
-                "imageUrl": img_src,         # raw src for frontend logic if needed
-                "timestamp": int(time.time()),
-            }
+        media = self._extract_media_from_text(message_text or "")
+        if media:
+            kind, src = media
+            if kind == "image":
+                wrapped_html = f'<img class="chat-gif" src="{html.escape(src, quote=True)}" />'
+                payload = {
+                    "type": "new_message",
+                    "room_id": room_id,
+                    "displayName": display_name,
+                    "message": wrapped_html,     # HTML-safe wrapper
+                    "isImage": True,
+                    "imageUrl": src,             # raw src for frontend logic if needed
+                    "timestamp": int(time.time()),
+                }
+            else:  # video
+                # infer MIME; default to webm
+                mime = "video/webm" if src.lower().endswith(".webm") else "video/mp4"
+                wrapped_html = (
+                    f'<video class="chat-video" controls playsinline preload="metadata">'
+                    f'<source src="{html.escape(src, quote=True)}" type="{mime}"></video>'
+                )
+                payload = {
+                    "type": "new_message",
+                    "room_id": room_id,
+                    "displayName": display_name,
+                    "message": wrapped_html,
+                    "isVideo": True,
+                    "videoUrl": src,
+                    "timestamp": int(time.time()),
+                }
         else:
             payload = {
                 "type": "new_message",
@@ -197,7 +262,7 @@ class ChatMain(commands.Cog):
         return payload
 
     # -------------------------
-    # GIF helpers (NEW)
+    # GIF helpers (unchanged API; now benefits from unified media handling)
     # -------------------------
 
     async def _fetch_gif_url_from_tenor(self, query: str) -> Optional[str]:
@@ -225,39 +290,40 @@ class ChatMain(commands.Cog):
             if not results:
                 return None
             r0 = results[0]
-            # Try common fields
-            # Prefer medium/large sizes when possible
             media_formats = r0.get("media_formats") or {}
-            # Tenor v2 formats often include "gif", "mediumgif", "tinygif"
             for key in ("gif", "mediumgif", "tinygif"):
                 fmt = media_formats.get(key)
                 if fmt and "url" in fmt:
                     return fmt["url"]
-            # Fallback to r0.url if present
             return r0.get("url")
         except Exception:
             return None
 
-    async def _fetch_gif_url_fallback(query: str) -> Optional[str]:
+    async def _fetch_gif_url_fallback(self, query: str) -> Optional[str]:
         """Fallback to your crawler page with the correct params (kw, total, api)."""
         if not TENOR_API_KEY:
             return None
-    
+
         params = {
-            "kw": query,          # matches crawl.php expectation
-            "total": 25,          # any reasonable positive int
-            "api": TENOR_API_KEY  # pass your Tenor key through
+            "kw": query,
+            "total": 25,
+            "api": TENOR_API_KEY
         }
-    
-        session = _get_serene_http()
+
+        # Reuse existing session
         try:
-            async with session.get("https://serenekeks.com/crawl.php", params=params, allow_redirects=True) as resp:
+            async with self.http_session.get("https://serenekeks.com/crawl.php", params=params, allow_redirects=True) as resp:
                 if resp.status != 200:
                     return None
                 body = (await resp.text()).strip()
-                # crawl.php echoes a single URL; validate and return
-                if IMAGE_URL_RE.match(body) or IMAGE_URL_IN_TEXT_RE.search(body):
-                    return body
+                # Extract any URL and validate it's an image
+                m = URL_IN_TEXT_RE.search(body)
+                if not m:
+                    return None
+                candidate = m.group(1)
+                classified = self._classify_media_url(candidate)
+                if classified and classified[0] == "image":
+                    return candidate
                 return None
         except Exception:
             return None
@@ -288,7 +354,7 @@ class ChatMain(commands.Cog):
             payload = self._build_message_payload(
                 room_id=room_id,
                 display_name=display_name,
-                message_text=url,  # will be wrapped as <img class="chat-gif"...>
+                message_text=url,  # will be wrapped as <img> or <video> automatically
                 sender_type="user"
             )
             await self._broadcast_room_json(room_id, payload)
@@ -355,7 +421,7 @@ class ChatMain(commands.Cog):
     async def _delayed_broadcast_serene(self, room_id: str, message: str):
         """
         Apply a human-like delay before broadcasting Serene's message.
-        Wrap as <img class="chat-gif"> if it looks like an image/GIF.
+        Wrap as <img>/<video> if it looks like media.
         """
         try:
             await asyncio.sleep(2.0)  # 2-second humanized delay
@@ -565,7 +631,7 @@ class ChatMain(commands.Cog):
 
                         else:
                             # Normal text (no sound trigger):
-                            # If user message contains image/gif, flag and wrap it
+                            # If user message contains media, flag and wrap it
                             user_payload = self._build_message_payload(
                                 room_id=room_id,
                                 display_name=display_name,

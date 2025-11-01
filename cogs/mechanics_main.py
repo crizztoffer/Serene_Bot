@@ -212,6 +212,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         envelope = {
             "type": "state",
             "game_state": state,
+            "room_id": room_id,
             "server_ts": int(time.time()),
         }
         msg = json.dumps(envelope)
@@ -246,6 +247,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not bucket: return
         payload = {
             "type": "tick",
+            "room_id": room_id,
             "server_ts": int(time.time()),
             "current_round": state.get("current_round"),
             "action_deadline_epoch": state.get("action_deadline_epoch"),

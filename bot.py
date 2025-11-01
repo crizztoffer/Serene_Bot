@@ -13,6 +13,7 @@ import time
 import re
 from typing import List, Optional, Tuple
 import html  # <-- for HTML-escaping when sending Serene questions
+import urllib.parse  # <-- NEW: for parsing sendBeacon text payloads
 
 # Load env vars
 load_dotenv()
@@ -987,7 +988,7 @@ async def chat_websocket_handler(request):
                 msg = await ws.receive()
                 if msg.type != web.WSMsgType.TEXT:
                     continue
-        
+
                 # respond to a bare "ping" while we await proper registration
                 if isinstance(msg.data, str) and msg.data.strip().lower() == "ping":
                     try:
@@ -995,12 +996,12 @@ async def chat_websocket_handler(request):
                     except Exception:
                         pass
                     continue
-        
+
                 try:
                     jd = json.loads(msg.data)
                 except json.JSONDecodeError:
                     continue
-        
+
                 # also support JSON {"type":"ping"} during this phase
                 if jd.get("type") == "ping":
                     try:
@@ -1008,7 +1009,7 @@ async def chat_websocket_handler(request):
                     except Exception:
                         pass
                     continue
-        
+
                 room_id = room_id or jd.get('room_id')
                 display_name = display_name or jd.get('displayName')
 
@@ -1046,14 +1047,14 @@ async def chat_websocket_handler(request):
                     except Exception:
                         pass
                     continue
-            
+
                 # 2) parse JSON (and reply to {"type":"ping"})
                 try:
                     data = json.loads(msg.data)
                 except json.JSONDecodeError:
                     logger.debug("[/chat_ws] ignoring malformed JSON frame")
                     continue
-            
+
                 if data.get("type") == "ping":
                     try:
                         await ws.send_json({"type": "pong", "ts": int(time.time())})
@@ -1268,7 +1269,7 @@ async def game_was_handler(request):
                 await ws.send_str(json.dumps({"status": "error", "message": "Room id invalid."}))
                 await ws.close()
                 return ws
-        
+
         # --- NEW BLOCK: Proactively send the current game state to the new client ---
         if mechanics_cog:
             try:
@@ -1276,7 +1277,7 @@ async def game_was_handler(request):
                 state = await mechanics_cog._load_game_state(room_id)
                 if state:
                     # Construct the same envelope the broadcast function uses
-                    envelope = {"game_state": state, "server_ts": int(time.time())}
+                    envelope = {"game_state": state, "room_id": room_id, "server_ts": int(time.time())}
                     # Send the state directly to the newly connected client
                     await ws.send_str(json.dumps(envelope))
                     logger.info(f"Sent initial game_state for room '{room_id}' to new client {sender_id}.")
@@ -1306,19 +1307,108 @@ async def game_was_handler(request):
                             await mechanics_cog.handle_websocket_game_action(data)
                         except Exception as e:
                             logger.error(f"[/game_was] Dispatch error for action={data.get('action')} r={room_id}: {e}", exc_info=True)
-            
+
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
                 logger.info(f"[/game_was] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
                 break
-    
+
     except Exception as e:
         logger.error(f"[/game_was] Handler error for room {room_id}: {e}", exc_info=True)
-    
+
     finally:
         # --- 6) Cleanup ---
         if registered_in_bucket and mechanics_cog:
             mechanics_cog.unregister_ws_connection(ws)
         return ws
+
+# ---------------------- (NEW) Tiny HTTP endpoint for sendBeacon leaves ----------------------
+
+async def _read_post_any(request: web.Request) -> dict:
+    """
+    Read POST body robustly for sendBeacon:
+      - application/json
+      - application/x-www-form-urlencoded or multipart/form-data
+      - text/plain  (URLSearchParams string)
+    Returns a flat dict[str, str].
+    """
+    try:
+        ctype = (request.headers.get("Content-Type") or "").lower()
+        if "application/json" in ctype:
+            data = await request.json()
+            return dict(data or {})
+        if "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
+            form = await request.post()
+            return {k: str(v) for k, v in form.items()}
+        # fall back: text/plain (or unknown) — try querystring parsing
+        txt = await request.text()
+        try:
+            pairs = urllib.parse.parse_qsl(txt, keep_blank_values=True)
+            return {k: v for k, v in pairs}
+        except Exception:
+            return {}
+    except Exception:
+        return {}
+
+async def game_leave_handler(request: web.Request):
+    """
+    POST /game/leave  (CORS)
+    Lightweight, idempotent endpoint for navigator.sendBeacon when a game page is torn down.
+
+    Expected fields (best-effort):
+      - room_id        : str   (required to broadcast)
+      - display_name   : str   (optional; defaults to 'Player')
+      - from_name      : str   (optional pretty name, e.g., 'Table 12')
+      - to_name        : str   (optional pretty name; commonly 'the lobby')
+      - reason         : str   (optional, e.g., 'swap-fragment' | 'back-to-lobby' | 'perform-leave')
+
+    Behavior:
+      - If room_id provided, emits:
+          • {"type":"user_left"} to that room
+          • {"type":"system_notice"} "X left {from_name}." (or "X left {from} → {to}." if to_name present)
+      - Always returns 204 (no body) on success.
+      - Never throws on malformed payloads (best-effort).
+    """
+    try:
+        data = await _read_post_any(request)
+        room_id = str(data.get("room_id") or "").strip()
+        display_name = (data.get("display_name") or "Player").strip()
+        from_name = (data.get("from_name") or room_id or "lobby").strip()
+        to_name = (data.get("to_name") or "").strip()
+        reason = (data.get("reason") or "").strip()
+
+        if not room_id:
+            # Nothing to broadcast; still return success for beacon friendliness
+            return web.Response(status=204, headers=CORS_HEADERS)
+
+        # Broadcast a leave event and a friendly system line
+        try:
+            await _broadcast_room_json(room_id, {
+                "type": "user_left",
+                "displayName": display_name,
+                "room_id": room_id
+            })
+            pretty_from = _pretty_room(from_name or room_id)
+            if to_name:
+                pretty_to = _pretty_room(to_name)
+                notice = f"{display_name} left {pretty_from} → {pretty_to}."
+            else:
+                notice = f"{display_name} left {pretty_from}."
+            if reason:
+                # keep it subtle; useful for diagnostics
+                notice += f" ({reason})"
+            await _broadcast_room_json(room_id, {
+                "type": "system_notice",
+                "room_id": room_id,
+                "message": notice
+            })
+        except Exception as e:
+            logger.warning(f"/game/leave broadcast error: {e}")
+
+        return web.Response(status=204, headers=CORS_HEADERS)
+    except Exception as e:
+        logger.error(f"/game/leave error: {e}", exc_info=True)
+        # Still be graceful for beacons
+        return web.Response(status=204, headers=CORS_HEADERS)
 
 # ---------------------- AVATAR WS: /avatar_ws ----------------------
 
@@ -1584,6 +1674,12 @@ async def start_web_server():
 
     bot.web_app.router.add_post('/settings_saved', settings_saved_handler)
     logger.info("🛠️  Registered POST route: /settings_saved")
+
+    # NEW: CORS + POST for tiny leave endpoint
+    bot.web_app.router.add_options('/game/leave', cors_preflight_handler)
+    logger.info("🛠️  Registered OPTIONS route: /game/leave")
+    bot.web_app.router.add_post('/game/leave', game_leave_handler)
+    logger.info("🛠️  Registered POST route: /game/leave")
 
     # Health & probe
     bot.web_app.router.add_get('/healthz', health)

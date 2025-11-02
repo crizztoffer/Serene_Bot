@@ -1390,7 +1390,7 @@ async def game_leave_handler(request: web.Request):
             pretty_from = _pretty_room(from_name or room_id)
             if to_name:
                 pretty_to = _pretty_room(to_name)
-                notice = f"{display_name} left {pretty_from} → {pretty_to}."
+                notice = f"{display_name} left {pretty_from}"
             else:
                 notice = f"{display_name} left {pretty_from}."
             if reason:

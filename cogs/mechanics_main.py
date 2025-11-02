@@ -240,19 +240,27 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         )
 
     async def _load_game_state(self, room_id: str) -> dict | None:
+        """
+        Loads the JSON state if present. If the row exists but game_state is NULL/invalid,
+        return a default empty state so timers can still manage/delete the row.
+        Returns None only when the row doesn't exist.
+        """
         conn = None
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT game_state FROM bot_game_rooms WHERE room_id = %s", (room_id,))
                 row = await cursor.fetchone()
-                if row and row.get('game_state'):
+                if row is None:
+                    return None  # no row
+                raw = row.get('game_state')
+                if raw:
                     try:
-                        return json.loads(row['game_state'])
+                        return json.loads(raw)
                     except Exception:
-                        logger.warning(f"Bad JSON game_state for room {room_id}, resetting.")
-                        return None
-                return None
+                        logger.warning(f"Bad JSON game_state for room {room_id}, using default empty state.")
+                # Row exists but empty/invalid JSON: return default state
+                return {'room_id': room_id, 'current_round': 'pre-game', 'players': [], '__rev': 0}
         finally:
             if conn: conn.close()
 
@@ -552,6 +560,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         t0 = state.get("_empty_since")
         if not t0:
             state["_empty_since"] = now
+            self._mark_dirty(state)  # NEW: persist the first time we notice emptiness
             return False
         if (now - int(t0)) < 2:
             return False
@@ -1076,7 +1085,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             rid = self._normalize_room_id(room_id)
             try:
                 state = await self._load_game_state(rid)
-                if not state:
+                if state is None:
+                    # row truly gone; stop tracking
+                    self.rooms_with_active_timers.discard(rid)
                     continue
 
                 self._ensure_defaults(state)
@@ -1097,12 +1108,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 seated_now = [p for p in state.get("players", []) if p.get("seat_id")]
                 if not seated_now:
                     # ensure we are in a safe pre-game state (debounced)
-                    forced = self._force_pre_game_if_empty_seats(state)
+                    _ = self._force_pre_game_if_empty_seats(state)
 
-                    # If we changed anything by forcing pre-game, persist that
-                    if forced:
-                        await self._save_if_current(rid, state, before_rev)
-                        await self._broadcast_state(rid, state)
+                    # Save if anything changed (including setting _empty_since the first time)
+                    if int(state.get("__rev") or 0) != before_rev:
+                        if await self._save_if_current(rid, state, before_rev):
+                            await self._broadcast_state(rid, state)
+                        # update before_rev for accurate optimistic checks below (not strictly needed since we continue)
+                        before_rev = int(state.get("__rev") or 0)
 
                     # If we've been empty long enough, delete the DB row and stop tracking
                     t0 = state.get("_empty_since")

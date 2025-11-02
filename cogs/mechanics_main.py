@@ -195,6 +195,27 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         finally:
             if conn: conn.close()
 
+    # -------- NEW: optimistic save guard (prevents stale overwrites) --------
+    async def _save_if_current(self, room_id: str, state: dict, expected_rev: int) -> bool:
+        """
+        Save only if the DB's current __rev matches the expected_rev that we loaded.
+        Prevents a timer tick snapshot from overwriting a concurrent player_sit (and vice versa).
+        Returns True iff save occurred.
+        """
+        try:
+            current = await self._load_game_state(room_id)
+        except Exception as e:
+            logger.error(f"[{room_id}] optimistic check load failed: {e}")
+            return False
+
+        db_rev = int((current or {}).get("__rev") or 0)
+        if db_rev != int(expected_rev):
+            logger.info(f"[{room_id}] Skip stale save (db={db_rev}, expected={expected_rev})")
+            return False
+
+        await self._save_game_state(room_id, state)
+        return True
+
     # ---------------- Partitioned broadcast helpers ----------------
     def _mark_dirty(self, state: dict):
         state["__rev"] = int(state.get("__rev") or 0) + 1
@@ -399,10 +420,27 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # ---------------- Helpers for requirements ----------------
     def _force_pre_game_if_empty_seats(self, state: dict) -> bool:
+        """
+        If no players are seated, eventually force a clean 'pre-game' state.
+        Debounced slightly so a single empty snapshot doesn't clobber a concurrent 'sit'.
+        """
         seated = [p for p in state.get("players", []) if p.get("seat_id")]
+
+        now = int(time.time())
         if seated:
+            # Clear debounce marker when someone is seated
+            state.pop("_empty_since", None)
             return False
 
+        # Debounce: require 2s of continuous emptiness before forcing pre-game
+        t0 = state.get("_empty_since")
+        if not t0:
+            state["_empty_since"] = now
+            return False
+        if (now - int(t0)) < 2:
+            return False
+
+        # Actually force pre-game
         state["current_round"] = "pre-game"
         state["board_cards"] = []
         state["dealer_hand"] = []
@@ -423,6 +461,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state["current_bettor"] = None
 
         state["last_evaluation"] = None
+
+        # clear debounce marker
+        state.pop("_empty_since", None)
 
         self._reset_betting_round_numbers(state)
         self._mark_dirty(state)
@@ -807,14 +848,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     state.setdefault("channel_id", cfg.get("channel_id"))
                     self._mark_dirty(state)
 
-                # NEW: if no one is seated, force pre_game and skip further processing
+                # Capture the revision we loaded to protect our saves below
+                before_rev = int(state.get("__rev") or 0)
+
+                # If no one is seated, force pre_game (debounced) and skip further processing
                 if self._force_pre_game_if_empty_seats(state):
-                    await self._save_game_state(rid, state)
-                    await self._broadcast_state(rid, state)
+                    # Only persist if DB still at the revision we loaded
+                    if await self._save_if_current(rid, state, before_rev):
+                        await self._broadcast_state(rid, state)
                     self._add_room_active(rid)
                     continue
 
-                before_rev = int(state.get("__rev") or 0)
                 phase = state.get("current_round", "pre-game")
 
                 # Pre-game: wait 60s from first seat
@@ -854,8 +898,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 changed = (after_rev != before_rev)
 
                 if changed:
-                    await self._save_game_state(rid, state)
-                    await self._broadcast_state(rid, state)
+                    if await self._save_if_current(rid, state, before_rev):
+                        await self._broadcast_state(rid, state)
                 else:
                     if self._has_timers(state):
                         await self._broadcast_tick(rid, state)
@@ -891,9 +935,10 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 state.setdefault("channel_id", cfg.get("channel_id"))
                 self._mark_dirty(state)
 
-            # Immediately enforce pre_game if table is empty
+            # Immediately enforce pre_game if table is empty (debounced inside)
             self._force_pre_game_if_empty_seats(state)
 
+            # Capture the revision we loaded so our save is optimistic
             before_rev = int(state.get("__rev") or 0)
 
             state['guild_id'] = state.get('guild_id') or data.get('guild_id')
@@ -1054,8 +1099,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
             after_rev = int(state.get("__rev") or 0)
             if after_rev != before_rev:
-                await self._save_game_state(room_id, state)
-                await self._broadcast_state(room_id, state)
+                if await self._save_if_current(room_id, state, before_rev):
+                    await self._broadcast_state(room_id, state)
 
         except Exception as e:
             logger.error(f"Error in handle_websocket_game_action ('{action}'): {e}", exc_info=True)

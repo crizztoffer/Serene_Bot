@@ -102,6 +102,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self.rooms_with_active_timers = set()
         self.check_game_timers.start()
 
+        # --- Pending disconnects (grace window) ---
+        # key: (room_id:str, player_id:str) -> deadline_epoch:int
+        self.pending_disconnects = {}
+        self.disconnect_grace_secs = 10
+
     def cog_unload(self):
         self.check_game_timers.cancel()
 
@@ -148,8 +153,32 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not self.bot.ws_rooms[room]:
                 del self.bot.ws_rooms[room]
 
-    async def player_connect(self, *args, **kwargs): return True, ""
-    async def player_disconnect(self, *args, **kwargs): return True, ""
+    # --- Lifecycle hooks used by the WS handler ---
+    async def player_connect(self, room_id: str, sender_id: str):
+        """
+        Clear any pending disconnect for this player if they reconnect within the grace window.
+        """
+        rid = self._normalize_room_id(room_id)
+        key = (rid, str(sender_id))
+        if key in self.pending_disconnects:
+            self.pending_disconnects.pop(key, None)
+            logger.debug(f"[{rid}] Cleared pending disconnect for {sender_id}")
+        # ensure timers are active for this room (ticks drive ticks/timers anyway)
+        self._add_room_active(rid)
+        return True, ""
+
+    async def player_disconnect(self, room_id: str, sender_id: str):
+        """
+        Mark a possible disconnect; timer loop will finalize after grace window if no reconnect.
+        """
+        rid = self._normalize_room_id(room_id)
+        key = (rid, str(sender_id))
+        deadline = int(time.time()) + int(self.disconnect_grace_secs)
+        self.pending_disconnects[key] = deadline
+        logger.debug(f"[{rid}] Marked pending disconnect for {sender_id} until {deadline}")
+        # make sure the timer loop runs even if the room would otherwise be idle
+        self._add_room_active(rid)
+        return True, ""
 
     async def _get_db_connection(self):
         return await aiomysql.connect(
@@ -827,6 +856,25 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     # ---------------- Timer loop ----------------
     @tasks.loop(seconds=1.0)
     async def check_game_timers(self):
+        # Sweep pending disconnects first (across all rooms)
+        if self.pending_disconnects:
+            now = int(time.time())
+            # iterate over a snapshot since we'll mutate the dict
+            for (rid, pid), deadline in list(self.pending_disconnects.items()):
+                if now >= int(deadline):
+                    try:
+                        logger.info(f"[{rid}] Pending disconnect expired for {pid}; invoking player_leave")
+                        await self.handle_websocket_game_action({
+                            "action": "player_leave",
+                            "room_id": rid,
+                            "sender_id": pid
+                        })
+                    except Exception as e:
+                        logger.error(f"[{rid}] Error finalizing disconnect for {pid}: {e}", exc_info=True)
+                    finally:
+                        # remove regardless of outcome to avoid tight loops
+                        self.pending_disconnects.pop((rid, pid), None)
+
         if not self.rooms_with_active_timers:
             return
 

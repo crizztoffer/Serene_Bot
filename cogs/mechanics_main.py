@@ -480,6 +480,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             p["bet"] = 0
             p["is_folded"] = False
             p["in_hand"] = bool(p.get("seat_id"))
+            # NEW: track full-hand contribution for side pots
+            p["total_contributed"] = 0
 
     async def _to_pre_flop(self, state: dict):
         logger.info(f"Transition -> pre_flop for room '{state.get('room_id')}'")
@@ -542,6 +544,60 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self._build_action_order(state)
         self._mark_dirty(state)
 
+    # -------- Side-pot builder --------
+    def _build_side_pots(self, state: dict) -> list[dict]:
+        """
+        Returns a list of pots:
+          [{"amount": int, "eligible": set[str]} ...]
+        Using each player's total_contributed across the hand.
+        Folded players are never eligible but still count toward pot sizing.
+        """
+        # Map id -> contribution
+        contrib = {}
+        elig   = set()
+        for p in state.get("players", []):
+            pid = str(p.get("discord_id"))
+            c   = int(p.get("total_contributed") or 0)
+            if c <= 0:
+                continue
+            contrib[pid] = c
+            if p.get("in_hand") and not p.get("is_folded") and not p.get("is_spectating"):
+                elig.add(pid)
+
+        if not contrib:
+            return []
+
+        # Layer the contributions: sort distinct levels ascending
+        levels = sorted(set(contrib.values()))
+        pots = []
+        prev = 0
+        remaining = set(contrib.keys())
+        for lvl in levels:
+            delta = max(0, lvl - prev)
+            if delta == 0:
+                prev = lvl
+                continue
+            # Who still has >= lvl?
+            layer_players = [pid for pid in remaining if contrib[pid] >= lvl]
+            # For pot sizing we need the count of players who *reached* at least this level
+            count_at_least = len([pid for pid, amt in contrib.items() if amt >= lvl])
+            if count_at_least > 0 and delta > 0:
+                pot_amount = delta * count_at_least
+                pot_eligible = {pid for pid in contrib.keys() if contrib[pid] >= lvl and pid in elig}
+                if pot_amount > 0:
+                    pots.append({"amount": pot_amount, "eligible": pot_eligible})
+            prev = lvl
+
+        # Sanity: sum of pots should equal total pot we tracked
+        # If there's drift (rounding, resets etc.), clamp last pot to match state["pot"]
+        total_from_layers = sum(p["amount"] for p in pots)
+        total_pot = int(state.get("pot") or 0)
+        if total_from_layers != total_pot and pots:
+            diff = total_pot - total_from_layers
+            pots[-1]["amount"] = max(0, pots[-1]["amount"] + diff)
+
+        return pots
+
     async def _to_showdown(self, state: dict):
         state["current_round"] = "showdown"
 
@@ -554,7 +610,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         # Safety: if missing critical cards, emit empty winners payload
         if len(board_eval) < 3 or len(dealer_eval_cards) < 2:
-            state["last_evaluation"] = {"evaluations": [], "dealer_evaluation": None}
+            state["last_evaluation"] = {"evaluations": [], "dealer_evaluation": None, "winner_lines": []}
             self._start_phase_timer(state, POST_SHOWDOWN_WAIT_SECS)
             self._mark_dirty(state)
             return
@@ -562,21 +618,25 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         # Dealer best
         dealer_name, dealer_score = evaluate_poker_hand(dealer_eval_cards + board_eval)
 
+        # Evaluate players (keep score tuples for comparisons)
         eval_rows = []
+        score_by_id = {}   # pid -> (hand_name, score_tuple)
+        name_by_id  = {}
         active_any = False
-        player_winners = []
 
         for p in state.get("players", []):
-            if not p.get("seat_id"):
-                continue
+            pid = str(p.get("discord_id"))
+            name = p.get("name") or "Player"
+            name_by_id[pid] = name
 
             hand = p.get("hand") or []
             if len(hand) < 2:
                 eval_rows.append({
-                    "name": p.get("name") or "Player",
+                    "name": name,
                     "hand_type": "",
                     "is_winner": False,
-                    "discord_id": str(p.get("discord_id"))
+                    "discord_id": pid,
+                    "amount_won": 0
                 })
                 continue
 
@@ -589,38 +649,71 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             else:
                 p_name, p_score = ("", (-1,))
 
-            # Winner iff strictly better than dealer; ties -> dealer wins
-            is_winner = (p_score > dealer_score)
+            score_by_id[pid] = (p_name, p_score)
 
+        # -------- Side pots & payouts --------
+        pots = self._build_side_pots(state)
+        payouts: dict[str, int] = {}
+
+        for pot in pots:
+            amount = int(pot["amount"])
+            eligible = list(pot["eligible"])
+            if amount <= 0 or not eligible:
+                continue
+
+            # Among eligible, compare vs dealer. Ties with dealer lose to dealer.
+            # If NO player beats dealer for this pot, the pot is taken by dealer (i.e., removed from table economy).
+            best_score = None
+            winners = []
+            for pid in eligible:
+                if pid not in score_by_id:
+                    continue
+                _, s = score_by_id[pid]
+                if s > dealer_score:
+                    if (best_score is None) or (s > best_score):
+                        best_score = s
+                        winners = [pid]
+                    elif s == best_score:
+                        winners.append(pid)
+
+            if not winners:
+                # Dealer takes this side pot: nothing credited to players.
+                continue
+
+            # Split this pot among the winners
+            share = amount // len(winners)
+            remainder = amount - share * len(winners)
+            for idx, pid in enumerate(winners):
+                add = share + (1 if idx == 0 and remainder > 0 else 0)
+                payouts[pid] = payouts.get(pid, 0) + add
+
+        # Build last_evaluation + per-row amounts + pretty winner_lines
+        winner_lines = []
+        for pid, (hand_name, _) in score_by_id.items():
+            won = int(payouts.get(pid, 0))
+            is_winner = won > 0
             eval_rows.append({
-                "name": p.get("name") or "Player",
-                "hand_type": p_name,
-                "is_winner": bool(is_winner),
-                "discord_id": str(p.get("discord_id"))
+                "name": name_by_id.get(pid, "Player"),
+                "hand_type": hand_name,
+                "is_winner": is_winner,
+                "discord_id": pid,
+                "amount_won": won
             })
-            if is_winner:
-                player_winners.append(str(p.get("discord_id")))
+        # Compact, human-friendly "Name: $amount" lines
+        for pid, amt in payouts.items():
+            winner_lines.append(f"{name_by_id.get(pid, 'Player')}: ${amt:,}")
 
         state["last_evaluation"] = {
             "evaluations": eval_rows,
-            "dealer_evaluation": {"hand_type": dealer_name} if active_any else None
+            "dealer_evaluation": {"hand_type": dealer_name} if active_any else None,
+            "winner_lines": winner_lines
         }
 
-        # Prepare payouts: split pot among winners; if none, dealer takes pot (no external credit)
-        pot = int(state.get("pot") or 0)
-        payouts = {}
-        if pot > 0 and player_winners:
-            share = pot // len(player_winners)
-            for pid in player_winners:
-                payouts[pid] = payouts.get(pid, 0) + share
-            remainder = pot - share * len(player_winners)
-            if remainder and player_winners:
-                payouts[player_winners[0]] += remainder
-
+        # Persist pending payouts for credit
+        pot_total = int(state.get("pot") or 0)
         state["pending_payouts"] = {
-            "total_pot": pot,
-            "payouts": payouts,   # {discord_id: amount}
-            # "credited": False  # added on execution
+            "total_pot": pot_total,
+            "payouts": {pid: int(amt) for pid, amt in payouts.items()},   # {discord_id: amount}
         }
 
         # ---- CREDIT WINNERS IMMEDIATELY (so UI refresh during showdown sees it)
@@ -673,6 +766,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         added = max(0, int(contributed or 0))
         if added <= 0: return
         p["bet"] = int(p.get("bet") or 0) + added
+        # NEW: track total across the hand for side pots
+        p["total_contributed"] = int(p.get("total_contributed") or 0) + added
         state["pot"] = int(state.get("pot") or 0) + added
         self._mark_dirty(state)
 
@@ -832,6 +927,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             'is_folded': False,
                             'is_spectating': bool(is_mid_hand),
                             'in_hand': not bool(is_mid_hand),
+                            'total_contributed': 0  # NEW
                         })
                         self._mark_dirty(state)
 

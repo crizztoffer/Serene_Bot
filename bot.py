@@ -1285,6 +1285,15 @@ async def game_was_handler(request):
                 logger.error(f"Failed to send initial game state for room '{room_id}': {e}", exc_info=True)
         # --- END NEW BLOCK ---
 
+        # >>> NEW: Call hook to clear pending disconnects and mark presence
+        if mechanics_cog:
+            try:
+                ok, _ = await mechanics_cog.player_connect(room_id=room_id, sender_id=str(sender_id))
+                presence_persisted = bool(ok)
+                logger.debug(f"[/game_was] player_connect returned ok={ok} for sender_id={sender_id} room={room_id}")
+            except Exception as e:
+                logger.error(f"[/game_was] player_connect failed for {sender_id} in {room_id}: {e}", exc_info=True)
+
         # --- 5) Main receive loop: keepalive + DISPATCH GAME ACTIONS ---
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
@@ -1316,6 +1325,17 @@ async def game_was_handler(request):
         logger.error(f"[/game_was] Handler error for room {room_id}: {e}", exc_info=True)
 
     finally:
+        # >>> NEW: mark a pending disconnect (10s grace handled by MechanicsMain)
+        try:
+            if mechanics_cog and room_id and sender_id and presence_persisted:
+                try:
+                    ok, _ = await mechanics_cog.player_disconnect(room_id=room_id, sender_id=str(sender_id))
+                    logger.debug(f"[/game_was] player_disconnect marked (ok={ok}) for {sender_id} in {room_id}")
+                except Exception as e:
+                    logger.error(f"[/game_was] player_disconnect failed for {sender_id} in {room_id}: {e}", exc_info=True)
+        except Exception:
+            pass
+
         # --- 6) Cleanup ---
         if registered_in_bucket and mechanics_cog:
             mechanics_cog.unregister_ws_connection(ws)

@@ -869,7 +869,7 @@ async def _broadcast_cross_room_presence(old_room: Optional[str], new_room: str,
             await _broadcast_room_json(old_room, {
                 "type": "system_notice",
                 "room_id": old_room,
-                "message": f"{display_name} left {pretty_from} → {pretty_to}.",
+                "message": f"{display_name} entered {pretty_to}.",
             })
         await _broadcast_room_json(new_room, {
             "type": "system_notice",

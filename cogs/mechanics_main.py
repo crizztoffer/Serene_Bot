@@ -14,7 +14,6 @@ logger = logging.getLogger(__name__)
 
 # ---------------- Presence / DC grace config ----------------
 DISCONNECT_GRACE_SECS = 10  # after this, a DC'd seated player is removed if not reconnected
-EMPTY_TABLE_DELETE_SECS = 300  # NEW: 5 minutes of empty => delete the table row
 
 # ---------------- Hand Evaluation (unchanged core) ----------------
 HAND_RANKINGS = {
@@ -240,27 +239,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         )
 
     async def _load_game_state(self, room_id: str) -> dict | None:
-        """
-        Loads the JSON state if present. If the row exists but game_state is NULL/invalid,
-        return a default empty state so timers can still manage/delete the row.
-        Returns None only when the row doesn't exist.
-        """
         conn = None
         try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 await cursor.execute("SELECT game_state FROM bot_game_rooms WHERE room_id = %s", (room_id,))
                 row = await cursor.fetchone()
-                if row is None:
-                    return None  # no row
-                raw = row.get('game_state')
-                if raw:
+                if row and row.get('game_state'):
                     try:
-                        return json.loads(raw)
+                        return json.loads(row['game_state'])
                     except Exception:
-                        logger.warning(f"Bad JSON game_state for room {room_id}, using default empty state.")
-                # Row exists but empty/invalid JSON: return default state
-                return {'room_id': room_id, 'current_round': 'pre-game', 'players': [], '__rev': 0}
+                        logger.warning(f"Bad JSON game_state for room {room_id}, resetting.")
+                        return None
+                return None
         finally:
             if conn: conn.close()
 
@@ -281,33 +272,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if conn: await conn.rollback()
             logger.error(f"DB save error for room '{room_id}': {e}", exc_info=True)
             raise
-        finally:
-            if conn: conn.close()
-
-    # -------- NEW: delete room row when stale-empty --------
-    async def _delete_room_row(self, room_id: str) -> bool:
-        """
-        Permanently delete the bot_game_rooms row for this room_id.
-        Returns True if a row was deleted.
-        """
-        conn = None
-        try:
-            conn = await self._get_db_connection()
-            async with conn.cursor() as cursor:
-                rows = await cursor.execute(
-                    "DELETE FROM bot_game_rooms WHERE room_id = %s",
-                    (room_id,)
-                )
-            await conn.commit()
-            if rows:
-                logger.info(f"[{room_id}] Deleted bot_game_rooms row after prolonged emptiness.")
-                return True
-            logger.info(f"[{room_id}] No row deleted (not found).")
-            return False
-        except Exception as e:
-            if conn: await conn.rollback()
-            logger.error(f"[{room_id}] Failed to delete room row: {e}", exc_info=True)
-            return False
         finally:
             if conn: conn.close()
 
@@ -425,8 +389,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state.setdefault("pending_payouts", None)
         # NEW: pending DC map for fallback reap path
         state.setdefault("pending_disconnects", {})  # {discord_id: epoch_deadline}
-        # NEW: empty-room tracking (used for deletion threshold & pre-game forcing debounce)
-        state.setdefault("_empty_since", None)
         return state
 
     def _ensure_betting_defaults(self, state: dict) -> dict:
@@ -543,10 +505,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         If no players are seated, eventually force a clean 'pre-game' state.
         Debounced slightly so a single empty snapshot doesn't clobber a concurrent 'sit'.
-
-        NOTE: We DO NOT clear _empty_since here anymore (so we can measure
-        the 5-minute empty window for DB deletion). It will be cleared only
-        when a player seats.
         """
         seated = [p for p in state.get("players", []) if p.get("seat_id")]
 
@@ -560,7 +518,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         t0 = state.get("_empty_since")
         if not t0:
             state["_empty_since"] = now
-            self._mark_dirty(state)  # NEW: persist the first time we notice emptiness
             return False
         if (now - int(t0)) < 2:
             return False
@@ -587,7 +544,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         state["last_evaluation"] = None
 
-        # DO NOT clear _empty_since here; keep tracking how long we've been empty
+        # clear debounce marker
+        state.pop("_empty_since", None)
 
         self._reset_betting_round_numbers(state)
         self._mark_dirty(state)
@@ -1085,9 +1043,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             rid = self._normalize_room_id(room_id)
             try:
                 state = await self._load_game_state(rid)
-                if state is None:
-                    # row truly gone; stop tracking
-                    self.rooms_with_active_timers.discard(rid)
+                if not state:
                     continue
 
                 self._ensure_defaults(state)
@@ -1104,36 +1060,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 # Capture the revision we loaded to protect our saves below
                 before_rev = int(state.get("__rev") or 0)
 
-                # --------- EMPTY TABLE HANDLING (force pre-game & potential deletion) ---------
-                seated_now = [p for p in state.get("players", []) if p.get("seat_id")]
-                if not seated_now:
-                    # ensure we are in a safe pre-game state (debounced)
-                    _ = self._force_pre_game_if_empty_seats(state)
-
-                    # Save if anything changed (including setting _empty_since the first time)
-                    if int(state.get("__rev") or 0) != before_rev:
-                        if await self._save_if_current(rid, state, before_rev):
-                            await self._broadcast_state(rid, state)
-                        # update before_rev for accurate optimistic checks below (not strictly needed since we continue)
-                        before_rev = int(state.get("__rev") or 0)
-
-                    # If we've been empty long enough, delete the DB row and stop tracking
-                    t0 = state.get("_empty_since")
-                    if t0 and (int(time.time()) - int(t0)) >= EMPTY_TABLE_DELETE_SECS:
-                        deleted = await self._delete_room_row(rid)
-                        # Stop ticking this room regardless
-                        self.rooms_with_active_timers.discard(rid)
-                        # Also drop any WS bucket to avoid future sends
-                        self.bot.ws_rooms.pop(rid, None)
-                        if deleted:
-                            logger.info(f"[{rid}] Room removed due to 5+ minutes with no seated players.")
-                        continue  # move on to next room
-
-                    # Still empty but not yet deletable: we can send ticks if timers exist, then continue
-                    if self._has_timers(state):
-                        await self._broadcast_tick(rid, state)
+                # If no one is seated, force pre_game (debounced) and skip further processing
+                if self._force_pre_game_if_empty_seats(state):
+                    # Only persist if DB still at the revision we loaded
+                    if await self._save_if_current(rid, state, before_rev):
+                        await self._broadcast_state(rid, state)
                     self._add_room_active(rid)
-                    continue  # nothing else to do for empty rooms
+                    continue
 
                 # --- NEW: Authoritative DC reap path (based on WS and _dc_since) ---
                 changed_dc, need_advance_dc = self._reap_players_with_dead_ws(state, rid)
@@ -1266,8 +1199,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             state['players'][-1].pop('_dc_since', None)
                         except Exception:
                             pass
-                        # someone sat -> clear empty tracking
-                        state.pop("_empty_since", None)
                         self._mark_dirty(state)
 
                         # First eligible sitter: start pre-game countdown

@@ -37,6 +37,10 @@ TENOR_ENDPOINT = "https://tenor.googleapis.com/v2/search"
 
 BOT_PREFIX = "!"
 
+# --- Game list / pruning config (NEW) ---
+EMPTY_ROOM_GRACE_SECS = 300   # 5 minutes of no seated players -> delete row
+GAMELIST_POLL_SECS     = 10   # poll interval for gamelist_info websocket
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
@@ -80,6 +84,10 @@ bot.serene_group = serene_group
 # --- WebSocket room registries (game state & chat) ---
 bot.ws_rooms = {}
 bot.chat_ws_rooms = {}
+
+# --- Registry for gamelist_info websocket clients (NEW) ---
+bot.gamelist_ws = set()
+bot._gamelist_last_sig = None  # used to avoid rebroadcasting identical payloads
 
 # --- Online session tracking for kekchipz rewards ---
 # { (guild_id:int, user_id:int): {"start": float_unix, "last_award": float_unix} }
@@ -289,6 +297,281 @@ async def _db_connect_dict():
         autocommit=True,
         cursorclass=aiomysql.cursors.DictCursor
     )
+
+# ---------------- (NEW) GAME LIST + PRUNING HELPERS ----------------
+
+def _state_has_seated_players(gs: dict) -> bool:
+    """
+    'Seated' means player has a non-empty seat_id in game_state['players'].
+    """
+    try:
+        for p in (gs.get("players") or []):
+            if p and str(p.get("seat_id") or "").strip():
+                return True
+        return False
+    except Exception:
+        return False
+
+def _count_players(gs: dict) -> tuple[int, int, int]:
+    """
+    Returns (seated_count, spectators_count, in_hand_count)
+    """
+    seated = spectators = in_hand = 0
+    for p in (gs.get("players") or []):
+        if not isinstance(p, dict):
+            continue
+        if str(p.get("seat_id") or "").strip():
+            seated += 1
+            if p.get("in_hand"):
+                in_hand += 1
+        elif p.get("is_spectating"):
+            spectators += 1
+    return seated, spectators, in_hand
+
+def _stakes_label_for_game_mode(game_mode: str | int) -> str:
+    """
+    Mirror the small mapping used in PHP for display only.
+    """
+    try:
+        gm = int(str(game_mode).strip())
+    except Exception:
+        return ""
+    return {
+        1: "Low ($5 min)",
+        2: "Medium ($25 min)",
+        3: "High ($100 min)",
+        4: "Nosebleed ($250 min)",
+    }.get(gm, "")
+
+async def _summarize_rooms_and_prune() -> tuple[list[dict], list[str]]:
+    """
+    Loads all rooms. For each:
+      - parse game_state JSON
+      - manage '_empty_since' (stamp / clear)
+      - delete if empty for >= EMPTY_ROOM_GRACE_SECS
+    Returns:
+      rooms_summary: [ {room_id, room_name, room_type, game_mode, stakes, seated, spectators, in_hand, current_round} ... ]
+      deleted_ids:   [room_id, ...]
+    """
+    rooms_summary: list[dict] = []
+    deleted_ids: list[str] = []
+
+    if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+        return rooms_summary, deleted_ids
+
+    now = int(time.time())
+    conn = None
+    try:
+        conn = await _db_connect_dict()  # autocommit=True, DictCursor
+        async with conn.cursor() as cursor:
+            await cursor.execute("SELECT room_id, room_name, room_type, initiator, guild_id, channel_id, game_mode, game_state FROM bot_game_rooms")
+            rows = await cursor.fetchall()
+
+        for row in rows:
+            room_id   = str(row.get("room_id") or "").strip()
+            room_name = row.get("room_name") or ""
+            room_type = row.get("room_type") or ""
+            game_mode = row.get("game_mode")
+            stakes    = _stakes_label_for_game_mode(game_mode)
+
+            raw = row.get("game_state")
+            if isinstance(raw, (bytes, bytearray)):
+                try:
+                    raw = raw.decode("utf-8", errors="ignore")
+                except Exception:
+                    raw = None
+
+            try:
+                gs = json.loads(raw) if raw else {}
+                if not isinstance(gs, dict):
+                    gs = {}
+            except Exception:
+                gs = {}
+
+            # deletion eligibility bookkeeping
+            has_seated = _state_has_seated_players(gs)
+            changed_json = False
+
+            if has_seated:
+                if gs.pop("_empty_since", None) is not None:
+                    changed_json = True
+            else:
+                if "players" in gs and isinstance(gs["players"], list):
+                    # stamp first time
+                    if not gs.get("_empty_since"):
+                        gs["_empty_since"] = now
+                        changed_json = True
+                    else:
+                        try:
+                            empty_since = int(gs.get("_empty_since"))
+                        except Exception:
+                            empty_since = now
+                            gs["_empty_since"] = now
+                            changed_json = True
+
+                        if (now - empty_since) >= EMPTY_ROOM_GRACE_SECS:
+                            # Delete row
+                            try:
+                                async with (await _db_connect_dict()).cursor() as cd:
+                                    await cd.execute("DELETE FROM bot_game_rooms WHERE room_id = %s", (room_id,))
+                                try:
+                                    bot.ws_rooms.pop(room_id, None)
+                                    bot.chat_ws_rooms.pop(room_id, None)
+                                except Exception:
+                                    pass
+                                deleted_ids.append(room_id)
+                                logger.info(f"[gamelist] Deleted empty room '{room_id}' (idle >= {EMPTY_ROOM_GRACE_SECS}s)")
+                                # Skip summary since it's deleted
+                                continue
+                            except Exception as e:
+                                logger.error(f"[gamelist] Failed to delete room {room_id}: {e}", exc_info=True)
+
+            # persist JSON if we toggled _empty_since
+            if changed_json:
+                try:
+                    async with (await _db_connect_dict()).cursor() as cu:
+                        await cu.execute(
+                            "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
+                            (json.dumps(gs), room_id)
+                        )
+                except Exception as e:
+                    logger.warning(f"[gamelist] Failed to update game_state for {room_id}: {e}")
+
+            # build summary for broadcast
+            seated, spectators, in_hand = _count_players(gs)
+            summary = {
+                "room_id":   room_id,
+                "room_name": room_name,
+                "room_type": room_type,
+                "game_mode": str(game_mode) if game_mode is not None else None,
+                "stakes":    stakes,
+                "seated":    seated,
+                "spectators": spectators,
+                "in_hand":   in_hand,
+                "current_round": (gs.get("current_round") or "pre-game"),
+            }
+            rooms_summary.append(summary)
+
+    except Exception as e:
+        logger.error(f"_summarize_rooms_and_prune failed: {e}", exc_info=True)
+    finally:
+        try:
+            if conn:
+                conn.close()
+        except Exception:
+            pass
+
+    # Stable order for deterministic client diffs
+    rooms_summary.sort(key=lambda r: (r["room_type"] or "", r["room_name"] or "", r["room_id"] or ""))
+    return rooms_summary, deleted_ids
+
+async def _broadcast_gamelist(payload: dict):
+    """
+    Broadcast to all connected gamelist_info sockets.
+    Best-effort; drops closed sockets gently.
+    """
+    msg = json.dumps(payload)
+    dead = []
+    for ws in list(bot.gamelist_ws):
+        try:
+            if ws.closed:
+                dead.append(ws)
+                continue
+            await ws.send_str(msg)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        try:
+            bot.gamelist_ws.discard(ws)
+        except Exception:
+            pass
+
+# ---------------------- (NEW) GAME LIST WS: /gamelist_info ----------------------
+
+async def gamelist_info_ws_handler(request):
+    """
+    WebSocket that:
+      • Every ~10s (server loop), prunes empty rooms and broadcasts the current list
+      • Sends an immediate snapshot on connect
+      • Accepts {type:"ping"} or raw 'ping' and replies {'type':'pong'}
+    Message format (server -> client):
+      {
+        "type": "gamelist",
+        "ts":   1730560000,
+        "rooms": [ { ... summary ... } ],
+        "deleted": ["room_id_a","room_id_b"]
+      }
+    """
+    ws = web.WebSocketResponse(heartbeat=25.0, autoping=True, max_msg_size=2 * 1024 * 1024)
+    try:
+        ok = await ws.prepare(request)
+        if not ok:
+            return ws
+    except Exception as e:
+        logger.error(f"[/gamelist_info] prepare() failed: {e}", exc_info=True)
+        return web.Response(text="Upgrade failed", status=400)
+
+    try:
+        bot.gamelist_ws.add(ws)
+        # Send an immediate snapshot
+        rooms, deleted = await _summarize_rooms_and_prune()
+        payload = {"type": "gamelist", "ts": int(time.time()), "rooms": rooms, "deleted": deleted}
+        try:
+            await ws.send_str(json.dumps(payload))
+        except Exception:
+            pass
+
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                raw = msg.data
+                if raw.strip().lower() == "ping":
+                    await ws.send_str(json.dumps({"type": "pong", "ts": int(time.time())}))
+                    continue
+                # lenient JSON ping
+                try:
+                    jd = json.loads(raw)
+                    if isinstance(jd, dict) and jd.get("type") == "ping":
+                        await ws.send_str(json.dumps({"type": "pong", "ts": int(time.time())}))
+                        continue
+                except Exception:
+                    pass
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                break
+            else:
+                continue
+    except Exception as e:
+        logger.error(f"[/gamelist_info] handler error: {e}", exc_info=True)
+    finally:
+        try:
+            bot.gamelist_ws.discard(ws)
+        except Exception:
+            pass
+        return ws
+
+@tasks.loop(seconds=GAMELIST_POLL_SECS)
+async def gamelist_refresh_loop():
+    """
+    Every GAMELIST_POLL_SECS:
+      • summarize rooms (and prune empties)
+      • broadcast to connected gamelist clients IF changed
+    """
+    rooms, deleted = await _summarize_rooms_and_prune()
+    # Build a simple signature to avoid re-broadcasting identical lists
+    try:
+        sig = json.dumps(
+            [{"id": r["room_id"], "n": r["room_name"], "t": r["room_type"], "m": r["game_mode"],
+              "s": r["seated"], "sp": r["spectators"], "ih": r["in_hand"], "ph": r["current_round"]} for r in rooms],
+            sort_keys=True
+        )
+    except Exception:
+        sig = str(len(rooms))
+
+    if sig != bot._gamelist_last_sig or deleted:
+        bot._gamelist_last_sig = sig
+        payload = {"type": "gamelist", "ts": int(time.time()), "rooms": rooms, "deleted": deleted}
+        await _broadcast_gamelist(payload)
+
+# ---------------- DB / Settings helpers (existing) ----------------
 
 async def _fetch_quarantine_options(guild_id: str) -> Tuple[Optional[str], Optional[str]]:
     """
@@ -1714,6 +1997,10 @@ async def start_web_server():
     bot.web_app.router.add_get('/avatar_ws', avatar_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /avatar_ws")
 
+    # NEW: Game list websocket (lobby list + pruning)
+    bot.web_app.router.add_get('/gamelist_info', gamelist_info_ws_handler)
+    logger.info("🛠️  Registered WebSocket route: /gamelist_info")
+
     # Log routes again once the server is started and accepting connections
     bot.web_app.on_startup.append(_on_web_started)
 
@@ -1772,6 +2059,14 @@ async def on_ready():
             logger.info("✅ Started award_kekchipz_loop")
     except Exception as e:
         logger.error(f"Failed to start award_kekchipz_loop: {e}")
+
+    # Start gamelist prune/broadcast loop (NEW)
+    try:
+        if not gamelist_refresh_loop.is_running():
+            gamelist_refresh_loop.start()
+            logger.info("✅ Started gamelist_refresh_loop")
+    except Exception as e:
+        logger.error(f"Failed to start gamelist_refresh_loop: {e}")
 
     # Post rules embed if missing (startup)
     conn_on_ready = None

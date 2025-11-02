@@ -490,11 +490,13 @@ async def _broadcast_gamelist(payload: dict):
 
 async def gamelist_info_ws_handler(request):
     """
-    WebSocket that:
-      • Every ~10s (server loop), prunes empty rooms and broadcasts the current list
-      • Sends an immediate snapshot on connect
-      • Accepts {type:"ping"} or raw 'ping' and replies {'type':'pong'}
-    Message format (server -> client):
+    WebSocket that supports:
+      • on connect: immediate snapshot (back-compat) and auto-subscribe to periodic broadcasts
+      • one-shot request:  {"op":"get_rooms"}  -> replies once with {"type":"rooms","rooms":[...],"server_ts":...}
+      • optional subscribe: {"op":"subscribe"} -> replies once with {"type":"rooms",...} (already subscribed)
+      • ping: raw "ping" or {"type":"ping"}    -> replies {"type":"pong","ts":...}
+
+    Periodic server broadcasts (unchanged) are:
       {
         "type": "gamelist",
         "ts":   1730560000,
@@ -512,8 +514,8 @@ async def gamelist_info_ws_handler(request):
         return web.Response(text="Upgrade failed", status=400)
 
     try:
+        # Back-compat: add to broadcast set immediately and send a snapshot
         bot.gamelist_ws.add(ws)
-        # Send an immediate snapshot
         rooms, deleted = await _summarize_rooms_and_prune()
         payload = {"type": "gamelist", "ts": int(time.time()), "rooms": rooms, "deleted": deleted}
         try:
@@ -523,18 +525,53 @@ async def gamelist_info_ws_handler(request):
 
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                raw = msg.data
-                if raw.strip().lower() == "ping":
+                raw = (msg.data or "").strip()
+
+                # simple ping
+                if raw.lower() == "ping":
                     await ws.send_str(json.dumps({"type": "pong", "ts": int(time.time())}))
                     continue
-                # lenient JSON ping
+
+                # try JSON
+                jd = None
                 try:
                     jd = json.loads(raw)
-                    if isinstance(jd, dict) and jd.get("type") == "ping":
+                except json.JSONDecodeError:
+                    jd = None
+
+                if isinstance(jd, dict):
+                    # JSON ping
+                    if jd.get("type") == "ping":
                         await ws.send_str(json.dumps({"type": "pong", "ts": int(time.time())}))
                         continue
-                except Exception:
-                    pass
+
+                    op = jd.get("op")
+                    if op == "get_rooms":
+                        # one-shot snapshot (no side effects)
+                        try:
+                            rooms, _ = await _summarize_rooms_and_prune()
+                            await ws.send_json({"type": "rooms", "rooms": rooms, "server_ts": int(time.time())})
+                        except Exception as e:
+                            logger.warning(f"[gamelist_info] get_rooms send failed: {e}")
+                        continue
+
+                    if op == "subscribe":
+                        # already subscribed by default; just send a fresh snapshot for convenience
+                        try:
+                            rooms, _ = await _summarize_rooms_and_prune()
+                            await ws.send_json({"type": "rooms", "rooms": rooms, "server_ts": int(time.time())})
+                        except Exception:
+                            pass
+                        continue
+
+                    # unknown op -> hint
+                    if op:
+                        await ws.send_json({"type": "error", "error": "unknown_op"})
+                        continue
+
+                # ignore anything else
+                continue
+
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
                 break
             else:
@@ -942,6 +979,25 @@ async def health(_):
 
 async def game_was_probe(_):
     return web.Response(text="game_was endpoint is here; use WebSocket upgrade.", status=426)
+
+# ---------- (NEW) HTTP GET snapshot for game list: /gamelist ----------
+async def gamelist_http_handler(request: web.Request):
+    """
+    GET /gamelist
+    Returns a single JSON containing ALL rooms for first-paint population:
+      {"rooms":[...],"server_ts":<int>}
+    """
+    try:
+        rooms, _deleted = await _summarize_rooms_and_prune()
+        # Simple CORS for cross-origin GET from serene site
+        return web.json_response(
+            {"rooms": rooms, "server_ts": int(time.time())},
+            headers={'Access-Control-Allow-Origin': 'https://serenekeks.com'}
+        )
+    except Exception as e:
+        logger.error(f"/gamelist error: {e}", exc_info=True)
+        return web.json_response({"rooms": [], "server_ts": int(time.time())}, status=200,
+                                 headers={'Access-Control-Allow-Origin': 'https://serenekeks.com'})
 
 # ===================== SERENE INTEGRATION HELPERS (UPDATED) =====================
 
@@ -1997,9 +2053,13 @@ async def start_web_server():
     bot.web_app.router.add_get('/avatar_ws', avatar_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /avatar_ws")
 
-    # NEW: Game list websocket (lobby list + pruning)
+    # NEW: Game list websocket (lobby list + pruning, plus on-demand get_rooms)
     bot.web_app.router.add_get('/gamelist_info', gamelist_info_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /gamelist_info")
+
+    # NEW: HTTP single-shot snapshot for first paint
+    bot.web_app.router.add_get('/gamelist', gamelist_http_handler)
+    logger.info("🛠️  Registered GET route: /gamelist")
 
     # Log routes again once the server is started and accepting connections
     bot.web_app.on_startup.append(_on_web_started)

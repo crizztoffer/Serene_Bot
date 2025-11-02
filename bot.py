@@ -343,11 +343,30 @@ def _stakes_label_for_game_mode(game_mode: str | int) -> str:
         4: "Nosebleed ($250 min)",
     }.get(gm, "")
 
+def _parse_empty_since(val, now: int) -> int:
+    """
+    Robustly parse `_empty_since` from int/float/str; if invalid, return `now`.
+    """
+    try:
+        # int already
+        if isinstance(val, int):
+            return val
+        # float timestamps (just in case)
+        if isinstance(val, float):
+            return int(val)
+        # strings like "1730560000" or "1730560000.0"
+        if isinstance(val, str) and val.strip():
+            f = float(val.strip())
+            return int(f)
+    except Exception:
+        pass
+    return now
+
 async def _summarize_rooms_and_prune() -> tuple[list[dict], list[str]]:
     """
     Loads all rooms. For each:
       - parse game_state JSON
-      - manage '_empty_since' (stamp / clear)
+      - manage '_empty_since' (stamp / clear) EVEN IF 'players' is missing
       - delete if empty for >= EMPTY_ROOM_GRACE_SECS
     Returns:
       rooms_summary: [ {room_id, room_name, room_type, game_mode, stakes, seated, spectators, in_hand, current_round} ... ]
@@ -363,57 +382,61 @@ async def _summarize_rooms_and_prune() -> tuple[list[dict], list[str]]:
     conn = None
     try:
         conn = await _db_connect_dict()  # autocommit=True, DictCursor
+
+        # fetch all rooms once
         async with conn.cursor() as cursor:
             await cursor.execute("SELECT room_id, room_name, room_type, initiator, guild_id, channel_id, game_mode, game_state FROM bot_game_rooms")
             rows = await cursor.fetchall()
 
-        for row in rows:
-            room_id   = str(row.get("room_id") or "").strip()
-            room_name = row.get("room_name") or ""
-            room_type = row.get("room_type") or ""
-            game_mode = row.get("game_mode")
-            stakes    = _stakes_label_for_game_mode(game_mode)
+        # reuse a cursor for updates/deletes inside the loop
+        async with conn.cursor() as rwcur:
+            for row in rows:
+                room_id   = str(row.get("room_id") or "").strip()
+                room_name = row.get("room_name") or ""
+                room_type = row.get("room_type") or ""
+                game_mode = row.get("game_mode")
+                stakes    = _stakes_label_for_game_mode(game_mode)
 
-            raw = row.get("game_state")
-            if isinstance(raw, (bytes, bytearray)):
+                raw = row.get("game_state")
+                if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        raw = raw.decode("utf-8", errors="ignore")
+                    except Exception:
+                        raw = None
+
                 try:
-                    raw = raw.decode("utf-8", errors="ignore")
+                    gs = json.loads(raw) if raw else {}
+                    if not isinstance(gs, dict):
+                        gs = {}
                 except Exception:
-                    raw = None
-
-            try:
-                gs = json.loads(raw) if raw else {}
-                if not isinstance(gs, dict):
                     gs = {}
-            except Exception:
-                gs = {}
 
-            # deletion eligibility bookkeeping
-            has_seated = _state_has_seated_players(gs)
-            changed_json = False
+                # deletion eligibility bookkeeping
+                has_seated = _state_has_seated_players(gs)
+                changed_json = False
 
-            if has_seated:
-                if gs.pop("_empty_since", None) is not None:
-                    changed_json = True
-            else:
-                if "players" in gs and isinstance(gs["players"], list):
-                    # stamp first time
-                    if not gs.get("_empty_since"):
+                if has_seated:
+                    # someone is seated -> clear stamp if present
+                    if gs.pop("_empty_since", None) is not None:
+                        changed_json = True
+                else:
+                    # treat any game with no seated players as "empty", regardless of players key
+                    existing_stamp = gs.get("_empty_since")
+                    if not existing_stamp:
                         gs["_empty_since"] = now
                         changed_json = True
                     else:
-                        try:
-                            empty_since = int(gs.get("_empty_since"))
-                        except Exception:
-                            empty_since = now
-                            gs["_empty_since"] = now
+                        empty_since = _parse_empty_since(existing_stamp, now)
+                        # recover from bad stamp silently
+                        if empty_since != existing_stamp:
+                            gs["_empty_since"] = empty_since
                             changed_json = True
 
                         if (now - empty_since) >= EMPTY_ROOM_GRACE_SECS:
-                            # Delete row
+                            # Delete row (best-effort)
                             try:
-                                async with (await _db_connect_dict()).cursor() as cd:
-                                    await cd.execute("DELETE FROM bot_game_rooms WHERE room_id = %s", (room_id,))
+                                await rwcur.execute("DELETE FROM bot_game_rooms WHERE room_id = %s", (room_id,))
+                                # Also clean in-memory registries
                                 try:
                                     bot.ws_rooms.pop(room_id, None)
                                     bot.chat_ws_rooms.pop(room_id, None)
@@ -426,31 +449,30 @@ async def _summarize_rooms_and_prune() -> tuple[list[dict], list[str]]:
                             except Exception as e:
                                 logger.error(f"[gamelist] Failed to delete room {room_id}: {e}", exc_info=True)
 
-            # persist JSON if we toggled _empty_since
-            if changed_json:
-                try:
-                    async with (await _db_connect_dict()).cursor() as cu:
-                        await cu.execute(
+                # persist JSON if we toggled _empty_since
+                if changed_json:
+                    try:
+                        await rwcur.execute(
                             "UPDATE bot_game_rooms SET game_state = %s WHERE room_id = %s",
                             (json.dumps(gs), room_id)
                         )
-                except Exception as e:
-                    logger.warning(f"[gamelist] Failed to update game_state for {room_id}: {e}")
+                    except Exception as e:
+                        logger.warning(f"[gamelist] Failed to update game_state for {room_id}: {e}")
 
-            # build summary for broadcast
-            seated, spectators, in_hand = _count_players(gs)
-            summary = {
-                "room_id":   room_id,
-                "room_name": room_name,
-                "room_type": room_type,
-                "game_mode": str(game_mode) if game_mode is not None else None,
-                "stakes":    stakes,
-                "seated":    seated,
-                "spectators": spectators,
-                "in_hand":   in_hand,
-                "current_round": (gs.get("current_round") or "pre-game"),
-            }
-            rooms_summary.append(summary)
+                # build summary for broadcast
+                seated, spectators, in_hand = _count_players(gs)
+                summary = {
+                    "room_id":   room_id,
+                    "room_name": room_name,
+                    "room_type": room_type,
+                    "game_mode": str(game_mode) if game_mode is not None else None,
+                    "stakes":    stakes,
+                    "seated":    seated,
+                    "spectators": spectators,
+                    "in_hand":   in_hand,
+                    "current_round": (gs.get("current_round") or "pre-game"),
+                }
+                rooms_summary.append(summary)
 
     except Exception as e:
         logger.error(f"_summarize_rooms_and_prune failed: {e}", exc_info=True)

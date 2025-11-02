@@ -12,6 +12,9 @@ from cogs.utils.game_models import Card, Deck
 
 logger = logging.getLogger(__name__)
 
+# ---------------- Presence / DC grace config ----------------
+DISCONNECT_GRACE_SECS = 10  # after this, a DC'd seated player is removed if not reconnected
+
 # ---------------- Hand Evaluation (unchanged core) ----------------
 HAND_RANKINGS = {
     "High Card": 0, "One Pair": 1, "Two Pair": 2, "Three of a Kind": 3, "Straight": 4,
@@ -74,9 +77,6 @@ POST_SHOWDOWN_WAIT_SECS = 15
 # Per-player action timer (betting rounds)
 ACTION_SECS = 60
 
-# New: pending-disconnect grace window
-DISCONNECT_GRACE_SECS = 10
-
 BETTING_ROUNDS = {"pre_flop", "pre_turn", "pre_river", "pre_showdown"}
 
 # ---------------- Minimums by game_mode ----------------
@@ -90,7 +90,7 @@ MODE_MIN_BET = {
 class MechanicsMain(commands.Cog, name="MechanicsMain"):
     def __init__(self, bot):
         self.bot = bot
-        logger.info("MechanicsMain initialized (with per-player action timers + 10s disconnect grace).")
+        logger.info("MechanicsMain initialized (with per-player action timers + DC grace/reap).")
 
         # DB config
         self.db_user = bot.db_user
@@ -142,7 +142,6 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         rid = self._normalize_room_id(room_id)
         self.bot.ws_rooms.setdefault(rid, set()).add(ws)
         setattr(ws, "_assigned_room", rid)
-        # note: _player_id is set by game_was_handler
         return True
 
     def unregister_ws_connection(self, ws):
@@ -152,67 +151,79 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not self.bot.ws_rooms[room]:
                 del self.bot.ws_rooms[room]
 
-    # -------- NEW: presence hooks called by bot.py --------
-    async def player_connect(self, room_id: str, discord_id: str):
+    # ---- NEW: presence tagging helpers ----
+    def _is_ws_connected(self, room_id: str, player_id: str) -> bool:
         """
-        Mark a player as connected: clear any pending disconnect for them.
+        Returns True if we see a live WS in the room tagged with this player_id.
+        Requires bot.py to set ws._player_id = <sender_id> on /game_was handshake.
         """
         try:
-            room_id = self._normalize_room_id(room_id)
-            state = await self._load_game_state(room_id) or {"room_id": room_id, "current_round": "pre-game", "players": []}
+            for ws in list(self.bot.ws_rooms.get(str(room_id), set())):
+                if getattr(ws, "closed", False):
+                    continue
+                if str(getattr(ws, "_player_id", "")) == str(player_id):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    # ---------------- Connection hooks (now implemented) ----------------
+    async def player_connect(self, room_id: str, discord_id: str):
+        """
+        Mark a player as connected and clear any disconnect stamp.
+        """
+        room_id = self._normalize_room_id(room_id)
+        try:
+            state = await self._load_game_state(room_id) or {'room_id': room_id, 'current_round': 'pre-game', 'players': []}
             self._ensure_defaults(state)
-            self._ensure_betting_defaults(state)
-
-            before_rev = int(state.get("__rev") or 0)
-            pend = state.setdefault("pending_disconnects", {})  # {discord_id: deadline_epoch}
-            if discord_id in pend:
-                del pend[discord_id]
-                self._mark_dirty(state)
-                self._add_room_active(room_id)
-
-            # optional: mark on player object for UI hints
-            p = self._find_player(state, discord_id)
-            if p and p.get("connected") is not True:
+            p = self._find_player(state, str(discord_id))
+            if not p:
+                return True, ""  # not seated yet; nothing to do
+            changed = False
+            if p.get("connected") is not True:
                 p["connected"] = True
+                changed = True
+            if p.pop("_dc_since", None) is not None:
+                changed = True
+            if changed:
                 self._mark_dirty(state)
-
-            if int(state.get("__rev") or 0) != before_rev:
-                if await self._save_if_current(room_id, state, before_rev):
-                    await self._broadcast_state(room_id, state)
+                await self._save_game_state(room_id, state)
         except Exception as e:
-            logger.error(f"player_connect error r={room_id} u={discord_id}: {e}", exc_info=True)
+            logger.error(f"player_connect error [{room_id}/{discord_id}]: {e}", exc_info=True)
+            return False, str(e)
         return True, ""
 
     async def player_disconnect(self, room_id: str, discord_id: str):
         """
-        Start the 10s grace window for this player. Timer loop will reap later if they don't return.
+        Mark a player as disconnected and stamp when that happened.
+        Also seed pending_disconnects for a belt-and-suspenders fallback.
         """
+        room_id = self._normalize_room_id(room_id)
         try:
-            room_id = self._normalize_room_id(room_id)
-            state = await self._load_game_state(room_id) or {"room_id": room_id, "current_round": "pre-game", "players": []}
+            state = await self._load_game_state(room_id) or {'room_id': room_id, 'current_round': 'pre-game', 'players': []}
             self._ensure_defaults(state)
-            self._ensure_betting_defaults(state)
-
-            before_rev = int(state.get("__rev") or 0)
+            p = self._find_player(state, str(discord_id))
+            if not p:
+                return True, ""
+            changed = False
+            if p.get("connected") is not False:
+                p["connected"] = False
+                changed = True
+            if not p.get("_dc_since"):
+                p["_dc_since"] = int(time.time())
+                changed = True
+            # optional pending map as secondary guard
             pend = state.setdefault("pending_disconnects", {})
             deadline = int(time.time()) + DISCONNECT_GRACE_SECS
-            # Only set/update if still seated
-            if self._find_player(state, discord_id):
+            if pend.get(str(discord_id)) != deadline:
                 pend[str(discord_id)] = deadline
+                changed = True
+            if changed:
                 self._mark_dirty(state)
-                self._add_room_active(room_id)
-
-                # optional: flip a connected flag on the player obj for UI
-                p = self._find_player(state, discord_id)
-                if p and p.get("connected") is not False:
-                    p["connected"] = False
-                    self._mark_dirty(state)
-
-            if int(state.get("__rev") or 0) != before_rev:
-                if await self._save_if_current(room_id, state, before_rev):
-                    await self._broadcast_state(room_id, state)
+                await self._save_game_state(room_id, state)
         except Exception as e:
-            logger.error(f"player_disconnect error r={room_id} u={discord_id}: {e}", exc_info=True)
+            logger.error(f"player_disconnect error [{room_id}/{discord_id}]: {e}", exc_info=True)
+            return False, str(e)
         return True, ""
 
     async def _get_db_connection(self):
@@ -261,6 +272,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # -------- NEW: optimistic save guard (prevents stale overwrites) --------
     async def _save_if_current(self, room_id: str, state: dict, expected_rev: int) -> bool:
+        """
+        Save only if the DB's current __rev matches the expected_rev that we loaded.
+        Prevents a timer tick snapshot from overwriting a concurrent player_sit (and vice versa).
+        Returns True iff save occurred.
+        """
         try:
             current = await self._load_game_state(room_id)
         except Exception as e:
@@ -284,9 +300,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         has_action_deadline = isinstance(state.get("action_deadline_epoch"), int)
         pre = state.get("current_round") == "pre-game" and state.get("pre_flop_timer_start_time")
         postable = state.get("round_timer_start") and state.get("round_timer_secs")
-        # NEW: if any pending disconnects exist, keep ticking
-        ped = bool((state.get("pending_disconnects") or {}))
-        return bool((in_bet and has_action_deadline) or pre or postable or ped)
+        return bool((in_bet and has_action_deadline) or pre or postable)
 
     async def _broadcast_state(self, room_id: str, state: dict):
         bucket = self.bot.ws_rooms.get(room_id, set())
@@ -368,8 +382,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         state.setdefault("current_bet", 0)
         state.setdefault("min_bet", MODE_MIN_BET["1"])
         state.setdefault("pending_payouts", None)
-        # NEW: map of discord_id -> deadline_epoch for disconnect grace
-        state.setdefault("pending_disconnects", {})
+        # NEW: pending DC map for fallback reap path
+        state.setdefault("pending_disconnects", {})  # {discord_id: epoch_deadline}
         return state
 
     def _ensure_betting_defaults(self, state: dict) -> dict:
@@ -483,13 +497,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # ---------------- Helpers for requirements ----------------
     def _force_pre_game_if_empty_seats(self, state: dict) -> bool:
+        """
+        If no players are seated, eventually force a clean 'pre-game' state.
+        Debounced slightly so a single empty snapshot doesn't clobber a concurrent 'sit'.
+        """
         seated = [p for p in state.get("players", []) if p.get("seat_id")]
 
         now = int(time.time())
         if seated:
+            # Clear debounce marker when someone is seated
             state.pop("_empty_since", None)
             return False
 
+        # Debounce: require 2s of continuous emptiness before forcing pre-game
         t0 = state.get("_empty_since")
         if not t0:
             state["_empty_since"] = now
@@ -497,12 +517,14 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if (now - int(t0)) < 2:
             return False
 
+        # Actually force pre-game
         state["current_round"] = "pre-game"
         state["board_cards"] = []
         state["dealer_hand"] = []
         state["deck"] = []
         state["pot"] = 0
 
+        # reset timers & betting pointers
         state["round_timer_start"] = None
         state["round_timer_secs"] = None
         state["action_timer_start"] = None
@@ -517,85 +539,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
         state["last_evaluation"] = None
 
+        # clear debounce marker
         state.pop("_empty_since", None)
 
         self._reset_betting_round_numbers(state)
         self._mark_dirty(state)
         return True
-
-    # NEW: check if this player currently has any live WS in the room
-    def _is_ws_connected(self, room_id: str, player_id: str) -> bool:
-        bucket = self.bot.ws_rooms.get(room_id, set())
-        if not bucket:
-            return False
-        pid = str(player_id)
-        for ws in list(bucket):
-            try:
-                if getattr(ws, "_player_id", None) == pid and not ws.closed:
-                    return True
-            except Exception:
-                continue
-        return False
-
-    # NEW: remove player (same semantics as player_leave branch)
-    def _remove_player_by_id(self, state: dict, player_id: str):
-        in_betting_round = state.get("current_round") in BETTING_ROUNDS
-        was_current = (state.get("current_bettor") == player_id)
-
-        p = self._find_player(state, player_id)
-        if p:
-            if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
-                p['is_folded'] = True
-                p['in_hand'] = False
-                self._mark_dirty(state)
-
-        state['players'] = [q for q in state['players'] if str(q.get('discord_id')) != str(player_id)]
-        self._mark_dirty(state)
-
-        if self._force_pre_game_if_empty_seats(state):
-            return
-
-        if in_betting_round and was_current and state.get("current_round") in BETTING_ROUNDS:
-            if self._active_player_count(state) == 0:
-                # advance phase
-                return "advance_phase"
-            else:
-                self._advance_bettor_pointer(state)
-        return None
-
-    # NEW: pending disconnect reaper (called from timer loop)
-    def _reap_pending_disconnects(self, state: dict, room_id: str) -> bool:
-        pend = state.get("pending_disconnects") or {}
-        if not pend:
-            return False
-
-        now = int(time.time())
-        changed = False
-        to_delete = []
-        need_advance = False
-
-        for pid, deadline in list(pend.items()):
-            if now < int(deadline):
-                continue
-            # If the player reconnected, drop the pending
-            if self._is_ws_connected(room_id, pid):
-                to_delete.append(pid)
-                continue
-
-            # Not reconnected by deadline -> finalize leave
-            action = self._remove_player_by_id(state, pid)
-            to_delete.append(pid)
-            changed = True
-            if action == "advance_phase":
-                need_advance = True
-
-        for pid in to_delete:
-            pend.pop(pid, None)
-            changed = True
-
-        # If a betting round lost its current bettor and no active players remain
-        # we finish/advance the round in the timer loop caller (async).
-        return changed, need_advance
 
     class _EvalCard:
         __slots__ = ("rank", "suit")
@@ -649,8 +598,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             p["bet"] = 0
             p["is_folded"] = False
             p["in_hand"] = bool(p.get("seat_id"))
+            # NEW: track full-hand contribution for side pots
             p["total_contributed"] = 0
-            # preserve connected flag if present
 
     async def _to_pre_flop(self, state: dict):
         logger.info(f"Transition -> pre_flop for room '{state.get('room_id')}'")
@@ -664,6 +613,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         self._reset_betting_round_numbers(state)
         self._new_hand_reset_player_flags(state)
 
+        # Deal 2 to each eligible player and 2 to dealer
         for p in self._seated_players_in_hand(state):
             if not p.get("is_spectating"):
                 p["hand"] = [deck.deal_card().to_output_format(), deck.deal_card().to_output_format()]
@@ -714,6 +664,13 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # -------- Side-pot builder --------
     def _build_side_pots(self, state: dict) -> list[dict]:
+        """
+        Returns a list of pots:
+          [{"amount": int, "eligible": set[str]} ...]
+        Using each player's total_contributed across the hand.
+        Folded players are never eligible but still count toward pot sizing.
+        """
+        # Map id -> contribution
         contrib = {}
         elig   = set()
         for p in state.get("players", []):
@@ -728,14 +685,19 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         if not contrib:
             return []
 
+        # Layer the contributions: sort distinct levels ascending
         levels = sorted(set(contrib.values()))
         pots = []
         prev = 0
+        remaining = set(contrib.keys())
         for lvl in levels:
             delta = max(0, lvl - prev)
             if delta == 0:
                 prev = lvl
                 continue
+            # Who still has >= lvl?
+            layer_players = [pid for pid in remaining if contrib[pid] >= lvl]
+            # For pot sizing we need the count of players who *reached* at least this level
             count_at_least = len([pid for pid, amt in contrib.items() if amt >= lvl])
             if count_at_least > 0 and delta > 0:
                 pot_amount = delta * count_at_least
@@ -744,6 +706,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     pots.append({"amount": pot_amount, "eligible": pot_eligible})
             prev = lvl
 
+        # Sanity: sum of pots should equal total pot we tracked
+        # If there's drift (rounding, resets etc.), clamp last pot to match state["pot"]
         total_from_layers = sum(p["amount"] for p in pots)
         total_pot = int(state.get("pot") or 0)
         if total_from_layers != total_pot and pots:
@@ -755,22 +719,26 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
     async def _to_showdown(self, state: dict):
         state["current_round"] = "showdown"
 
+        # --- Build evaluator inputs (tolerant to strings/dicts)
         board_eval = [self._mk_eval_card(c) for c in (state.get("board_cards") or [])]
         board_eval = [c for c in board_eval if c]
 
         dealer_eval_cards = [self._mk_eval_card(c) for c in (state.get("dealer_hand") or [])]
         dealer_eval_cards = [c for c in dealer_eval_cards if c]
 
+        # Safety: if missing critical cards, emit empty winners payload
         if len(board_eval) < 3 or len(dealer_eval_cards) < 2:
             state["last_evaluation"] = {"evaluations": [], "dealer_evaluation": None, "winner_lines": []}
             self._start_phase_timer(state, POST_SHOWDOWN_WAIT_SECS)
             self._mark_dirty(state)
             return
 
+        # Dealer best
         dealer_name, dealer_score = evaluate_poker_hand(dealer_eval_cards + board_eval)
 
+        # Evaluate players (keep score tuples for comparisons)
         eval_rows = []
-        score_by_id = {}
+        score_by_id = {}   # pid -> (hand_name, score_tuple)
         name_by_id  = {}
         active_any = False
 
@@ -801,6 +769,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
             score_by_id[pid] = (p_name, p_score)
 
+        # -------- Side pots & payouts --------
         pots = self._build_side_pots(state)
         payouts: dict[str, int] = {}
 
@@ -810,6 +779,8 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if amount <= 0 or not eligible:
                 continue
 
+            # Among eligible, compare vs dealer. Ties with dealer lose to dealer.
+            # If NO player beats dealer for this pot, the pot is taken by dealer (i.e., removed from table economy).
             best_score = None
             winners = []
             for pid in eligible:
@@ -824,14 +795,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         winners.append(pid)
 
             if not winners:
+                # Dealer takes this side pot: nothing credited to players.
                 continue
 
+            # Split this pot among the winners
             share = amount // len(winners)
             remainder = amount - share * len(winners)
             for idx, pid in enumerate(winners):
                 add = share + (1 if idx == 0 and remainder > 0 else 0)
                 payouts[pid] = payouts.get(pid, 0) + add
 
+        # Build last_evaluation + per-row amounts + pretty winner_lines
         winner_lines = []
         for pid, (hand_name, _) in score_by_id.items():
             won = int(payouts.get(pid, 0))
@@ -843,6 +817,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 "discord_id": pid,
                 "amount_won": won
             })
+        # Compact, human-friendly "Name: $amount" lines
         for pid, amt in payouts.items():
             winner_lines.append(f"{name_by_id.get(pid, 'Player')}: ${amt:,}")
 
@@ -852,35 +827,41 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             "winner_lines": winner_lines
         }
 
+        # Persist pending payouts for credit
         pot_total = int(state.get("pot") or 0)
         state["pending_payouts"] = {
             "total_pot": pot_total,
-            "payouts": {pid: int(amt) for pid, amt in payouts.items()},
+            "payouts": {pid: int(amt) for pid, amt in payouts.items()},   # {discord_id: amount}
         }
 
+        # ---- CREDIT WINNERS IMMEDIATELY (so UI refresh during showdown sees it)
         try:
             await self._execute_payouts(state)
         except Exception as e:
             logger.error(f"Payout failure at showdown: {e}", exc_info=True)
 
+        # Start visible timer before moving to post_showdown
         self._start_phase_timer(state, POST_SHOWDOWN_WAIT_SECS)
         self._mark_dirty(state)
 
     async def _to_post_showdown(self, state: dict):
         state["current_round"] = "post_showdown"
 
+        # If, for any reason, payouts weren't done at showdown, do them now (idempotent)
         if not (state.get("pending_payouts") or {}).get("credited"):
             try:
                 await self._execute_payouts(state)
             except Exception as e:
                 logger.error(f"Payout failure: {e}", exc_info=True)
 
+        # Reset pot after payouts
         state["pot"] = 0
         state["pending_payouts"] = None
 
         self._mark_dirty(state)
 
     async def _finish_betting_round_and_advance(self, state: dict):
+        # Only short-circuit if NO active players remain
         if self._active_player_count(state) == 0:
             await self._to_showdown(state)
             return
@@ -903,6 +884,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         added = max(0, int(contributed or 0))
         if added <= 0: return
         p["bet"] = int(p.get("bet") or 0) + added
+        # NEW: track total across the hand for side pots
         p["total_contributed"] = int(p.get("total_contributed") or 0) + added
         state["pot"] = int(state.get("pot") or 0) + added
         self._mark_dirty(state)
@@ -918,6 +900,112 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     def _end_of_betting_orbit(self, state: dict) -> bool:
         return state.get("current_bettor") is None
+
+    # ---------------- Player removal helpers (used by reap + leave) ----------------
+    def _remove_player_by_id(self, state: dict, player_id: str) -> str:
+        """
+        Remove player from the table, mirroring 'player_leave' semantics.
+        Returns:
+          "advance_phase" if betting round should be finished, else "none".
+        """
+        pid = str(player_id)
+        p = self._find_player(state, pid)
+        if not p:
+            return "none"
+
+        in_betting_round = state.get("current_round") in BETTING_ROUNDS
+        was_current = (state.get("current_bettor") == pid)
+
+        # If they were in hand mid-round, fold them out
+        if p.get('in_hand') and not p.get('is_spectating') and state.get('current_round') not in ('pre-game', 'post_showdown'):
+            p['is_folded'] = True
+            p['in_hand'] = False
+            self._mark_dirty(state)
+
+        # Remove from table
+        state['players'] = [q for q in state['players'] if str(q.get('discord_id')) != pid]
+        self._mark_dirty(state)
+
+        # Force pre-game if no seats
+        self._force_pre_game_if_empty_seats(state)
+
+        # Adjust betting pointer / phase
+        if in_betting_round and was_current and state.get("current_round") in BETTING_ROUNDS:
+            if self._active_player_count(state) == 0:
+                # signal caller to advance phase (async)
+                return "advance_phase"
+            else:
+                self._advance_bettor_pointer(state)
+
+        return "none"
+
+    # ---------------- Disconnect reap helpers ----------------
+    def _reap_players_with_dead_ws(self, state: dict, room_id: str) -> tuple[bool, bool]:
+        """
+        Reap any seated player who lost WS for >= DISCONNECT_GRACE_SECS and hasn't reconnected.
+        Returns (changed, need_advance_phase).
+        """
+        now = int(time.time())
+        changed = False
+        need_advance = False
+
+        for p in list(state.get("players", [])):
+            pid = str(p.get("discord_id") or "")
+            if not pid:
+                continue
+            t0 = p.get("_dc_since")
+            if not t0:
+                continue
+            # if they have any live WS, skip (reconnected)
+            if self._is_ws_connected(room_id, pid):
+                continue
+            if (now - int(t0)) < DISCONNECT_GRACE_SECS:
+                continue
+
+            action = self._remove_player_by_id(state, pid)
+            changed = True
+
+            # clear pending entry (if any)
+            (state.setdefault("pending_disconnects", {})).pop(pid, None)
+
+            if action == "advance_phase":
+                need_advance = True
+
+        return changed, need_advance
+
+    def _reap_pending_disconnects(self, state: dict, room_id: str) -> tuple[bool, bool]:
+        """
+        Secondary safety net: if state.pending_disconnects[pid] deadline has passed
+        and the player still has no live WS, remove them.
+        Returns (changed, need_advance_phase).
+        """
+        pend = dict(state.get("pending_disconnects") or {})
+        if not pend:
+            return False, False
+
+        now = int(time.time())
+        changed = False
+        need_advance = False
+
+        for pid, deadline in list(pend.items()):
+            if now < int(deadline):
+                continue
+            # skip if they have reconnected
+            if self._is_ws_connected(room_id, pid):
+                # they reconnected: drop pending entry
+                state["pending_disconnects"].pop(pid, None)
+                self._mark_dirty(state)
+                changed = True
+                continue
+
+            action = self._remove_player_by_id(state, pid)
+            state["pending_disconnects"].pop(pid, None)
+            self._mark_dirty(state)
+            changed = True
+            if action == "advance_phase":
+                need_advance = True
+
+        return changed, need_advance
 
     # ---------------- Timer loop ----------------
     @tasks.loop(seconds=1.0)
@@ -935,6 +1023,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 self._ensure_defaults(state)
                 self._ensure_betting_defaults(state)
 
+                # Ensure min_bet present (from DB), only once
                 if not state.get("min_bet"):
                     cfg = await self._load_room_config(rid)
                     state["min_bet"] = int(cfg["min_bet"])
@@ -942,28 +1031,36 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     state.setdefault("channel_id", cfg.get("channel_id"))
                     self._mark_dirty(state)
 
+                # Capture the revision we loaded to protect our saves below
                 before_rev = int(state.get("__rev") or 0)
 
+                # If no one is seated, force pre_game (debounced) and skip further processing
                 if self._force_pre_game_if_empty_seats(state):
+                    # Only persist if DB still at the revision we loaded
                     if await self._save_if_current(rid, state, before_rev):
                         await self._broadcast_state(rid, state)
                     self._add_room_active(rid)
                     continue
 
-                phase = state.get("current_round", "pre-game")
-
-                # --- NEW: reap expired pending disconnects
-                changed_pd, need_advance = self._reap_pending_disconnects(state, rid)
-                if need_advance and state.get("current_round") in BETTING_ROUNDS:
+                # --- NEW: Authoritative DC reap path (based on WS and _dc_since) ---
+                changed_dc, need_advance_dc = self._reap_players_with_dead_ws(state, rid)
+                if need_advance_dc and state.get("current_round") in BETTING_ROUNDS:
                     await self._finish_betting_round_and_advance(state)
 
-                # Pre-game countdown
+                # --- Secondary: pending_disconnects fallback ---
+                changed_pd, need_advance_pd = self._reap_pending_disconnects(state, rid)
+                if need_advance_pd and state.get("current_round") in BETTING_ROUNDS:
+                    await self._finish_betting_round_and_advance(state)
+
+                phase = state.get("current_round", "pre-game")
+
+                # Pre-game: wait 60s from first seat
                 if phase == "pre-game":
                     t0 = state.get("pre_flop_timer_start_time")
                     if t0 and int(time.time()) >= int(t0) + PRE_GAME_WAIT_SECS:
                         await self._to_pre_flop(state)
 
-                # Betting rounds: per-player timer (and auto-fold on expiry)
+                # Betting rounds: enforce per-player auto timer
                 elif phase in BETTING_ROUNDS:
                     if not state.get("current_bettor"):
                         await self._finish_betting_round_and_advance(state)
@@ -989,6 +1086,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                     if self._timer_expired(state):
                         await self._to_pre_flop(state)
 
+                # Persist/broadcast only if structurally changed
                 after_rev = int(state.get("__rev") or 0)
                 changed = (after_rev != before_rev)
 
@@ -1022,6 +1120,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             self._ensure_defaults(state)
             self._ensure_betting_defaults(state)
 
+            # Ensure min_bet present (from DB), only once
             if not state.get("min_bet"):
                 cfg = await self._load_room_config(room_id)
                 state["min_bet"] = int(cfg["min_bet"])
@@ -1029,13 +1128,16 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 state.setdefault("channel_id", cfg.get("channel_id"))
                 self._mark_dirty(state)
 
+            # Immediately enforce pre_game if table is empty (debounced inside)
             self._force_pre_game_if_empty_seats(state)
 
+            # Capture the revision we loaded so our save is optimistic
             before_rev = int(state.get("__rev") or 0)
 
             state['guild_id'] = state.get('guild_id') or data.get('guild_id')
             state['channel_id'] = state.get('channel_id') or data.get('channel_id')
 
+            # If anyone interacts and pre-game countdown already elapsed, jump to pre-flop
             t0 = state.get('pre_flop_timer_start_time')
             if state.get('current_round') == 'pre-game' and t0 and time.time() >= t0 + PRE_GAME_WAIT_SECS:
                 await self._to_pre_flop(state)
@@ -1063,14 +1165,17 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             'is_folded': False,
                             'is_spectating': bool(is_mid_hand),
                             'in_hand': not bool(is_mid_hand),
-                            'total_contributed': 0,
-                            'connected': True
+                            'total_contributed': 0,  # NEW
+                            'connected': True,       # assume connected on sit
                         })
-                        # If this sitter had a stale pending disconnect, clear it
-                        pend = state.setdefault("pending_disconnects", {})
-                        pend.pop(player_id, None)
+                        # remove any stale dc stamps
+                        try:
+                            state['players'][-1].pop('_dc_since', None)
+                        except Exception:
+                            pass
                         self._mark_dirty(state)
 
+                        # First eligible sitter: start pre-game countdown
                         if len([p for p in state['players'] if not p.get('is_spectating')]) == 1 \
                             and state['current_round'] == 'pre-game' and not state.get('initial_countdown_triggered'):
                             state['pre_flop_timer_start_time'] = time.time()
@@ -1081,9 +1186,11 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
             elif action == 'player_leave':
                 player_id = str(data.get('sender_id') or data.get('discord_id'))
-                res = self._remove_player_by_id(state, player_id)
-                if res == "advance_phase" and state.get("current_round") in BETTING_ROUNDS:
+                # Use the centralized helper so bettors/phase adjust consistently
+                outcome = self._remove_player_by_id(state, player_id)
+                if outcome == "advance_phase" and state.get("current_round") in BETTING_ROUNDS:
                     await self._finish_betting_round_and_advance(state)
+
                 self._add_room_active(room_id)
 
             elif action == 'fold':
@@ -1098,6 +1205,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             await self._finish_betting_round_and_advance(state)
                         else:
                             self._advance_bettor_pointer(state)
+
                 self._add_room_active(room_id)
 
             elif action == 'player_action':
@@ -1111,21 +1219,26 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         min_bet = self._room_min_bet(state)
                         current_bet = int(state.get("current_bet") or 0)
                         p_bet = int(p.get("bet") or 0)
-                        amount = int(data.get("amount") or 0)
+                        amount = int(data.get("amount") or 0)  # NEW chips the actor already withdrew client-side
 
                         if move == "check":
-                            if not self._can_check(state, p):
+                            if self._can_check(state, p):
+                                pass
+                            else:
+                                logger.debug("Illegal CHECK attempted; requires call.")
                                 return
 
                         elif move == "call":
                             needed = max(0, current_bet - p_bet)
                             if needed > 0:
                                 if amount < needed:
+                                    logger.debug("Insufficient CALL contribution; ignoring.")
                                     return
                                 self._apply_contribution(state, p, needed)
 
                         elif move == "bet":
                             if not self._can_bet(state, amount):
+                                logger.debug("Illegal BET (either bet exists or below min).")
                                 return
                             self._apply_contribution(state, p, amount)
                             state["current_bet"] = int(p.get("bet") or 0)
@@ -1133,6 +1246,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                         elif move == "raise":
                             delta = amount
                             if not self._can_raise(state, p, delta):
+                                logger.debug("Illegal RAISE (below min raise or no bet to raise).")
                                 return
                             self._apply_contribution(state, p, delta)
                             state["current_bet"] = int(p.get("bet") or 0)
@@ -1147,6 +1261,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                             self._advance_bettor_pointer(state)
 
                         self._mark_dirty(state)
+
                 self._add_room_active(room_id)
 
             elif action == 'advance_phase':
@@ -1174,11 +1289,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
 
     # ---------------- Payouts ----------------
     async def _execute_payouts(self, state: dict):
+        """
+        Credit winners their shares (idempotent via 'credited' flag).
+        """
         info = state.get("pending_payouts") or {}
         if info.get("credited"):
             return
 
         payouts = (info.get("payouts") or {})
+        # If no payouts (dealer wins or zero pot), still mark as credited so we don't try again.
         if not payouts:
             info["credited"] = True
             state["pending_payouts"] = info
@@ -1192,11 +1311,15 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             except Exception as e:
                 logger.error(f"Failed to credit {pid} amount={amount}: {e}")
 
+        # mark as done (idempotency for the rest of the hand)
         info["credited"] = True
         state["pending_payouts"] = info
         self._mark_dirty(state)
 
     async def _credit_kekchipz(self, guild_id: str | None, discord_id: str, amount: int):
+        """
+        POST to your PHP credit endpoint. Use form-encoded payload (matches your withdraw endpoint).
+        """
         if amount <= 0:
             return
 
@@ -1217,6 +1340,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
                 headers=headers,
                 timeout=10,
             )
+            # Expecting JSON like {"ok": true}
             try:
                 data = await resp.json(content_type=None)
             except Exception:
@@ -1226,6 +1350,7 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if not data.get("ok"):
                 raise RuntimeError(f"Credit failed: {data}")
 
+    # ---------------- Hand evaluation (placeholder) ----------------
     async def evaluate_hands(self, state: dict):
         pass
 

@@ -869,12 +869,12 @@ async def _broadcast_cross_room_presence(old_room: Optional[str], new_room: str,
             await _broadcast_room_json(old_room, {
                 "type": "system_notice",
                 "room_id": old_room,
-                "message": f"{display_name} entered {pretty_to}.",
+                "message": f"{display_name} left {pretty_from} → {pretty_to}."
             })
         await _broadcast_room_json(new_room, {
             "type": "system_notice",
             "room_id": new_room,
-            "message": f"{display_name} entered {pretty_to}.",
+            "message": f"{display_name} entered {pretty_to}."
         })
     except Exception:
         logger.exception("Error broadcasting cross-room presence notice")
@@ -1192,7 +1192,7 @@ async def chat_websocket_handler(request):
         finally:
             return ws
 
-# ---------------------- GAME WS: /game_was (robust + loud logs) ----------------------
+# ---------------------- GAME WS: /game_wAS (robust + loud logs) ----------------------
 async def game_was_handler(request):
     """
     Game WebSocket: registers a player's presence in a room via MechanicsMain.
@@ -1404,7 +1404,7 @@ async def game_leave_handler(request: web.Request):
             pretty_from = _pretty_room(from_name or room_id)
             if to_name:
                 pretty_to = _pretty_room(to_name)
-                notice = f"{display_name} left {pretty_from}"
+                notice = f"{display_name} left {pretty_from} → {pretty_to}."
             else:
                 notice = f"{display_name} left {pretty_from}."
             if reason:

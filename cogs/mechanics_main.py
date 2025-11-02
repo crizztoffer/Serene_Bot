@@ -183,7 +183,12 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             if p.get("connected") is not True:
                 p["connected"] = True
                 changed = True
+            # Clear dc stamp on reconnect
             if p.pop("_dc_since", None) is not None:
+                changed = True
+            # Also clear any pending entry so the fallback reaper can't hit them
+            pend = state.setdefault("pending_disconnects", {})
+            if pend.pop(str(discord_id), None) is not None:
                 changed = True
             if changed:
                 self._mark_dirty(state)
@@ -944,6 +949,9 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
         """
         Reap any seated player who lost WS for >= DISCONNECT_GRACE_SECS and hasn't reconnected.
         Returns (changed, need_advance_phase).
+
+        Resiliency: if a player has no _dc_since but also no live WS, auto-stamp _dc_since = now
+        so missed disconnect hooks don't leave ghosts.
         """
         now = int(time.time())
         changed = False
@@ -953,20 +961,38 @@ class MechanicsMain(commands.Cog, name="MechanicsMain"):
             pid = str(p.get("discord_id") or "")
             if not pid:
                 continue
+
             t0 = p.get("_dc_since")
+
+            # NEW: if they have no live WS and no dc stamp, start the grace window now
+            if not t0 and not self._is_ws_connected(room_id, pid):
+                p["_dc_since"] = now
+                self._mark_dirty(state)
+                changed = True
+                t0 = now
+
+            # If still no stamp, nothing to do for this player
             if not t0:
                 continue
-            # if they have any live WS, skip (reconnected)
+
+            # If they reconnected, clear stamps and any pending entry
             if self._is_ws_connected(room_id, pid):
+                try:
+                    p.pop("_dc_since", None)
+                finally:
+                    (state.setdefault("pending_disconnects", {})).pop(pid, None)
+                self._mark_dirty(state)
+                changed = True
                 continue
+
+            # If grace period not yet elapsed, wait
             if (now - int(t0)) < DISCONNECT_GRACE_SECS:
                 continue
 
+            # Otherwise, remove player
             action = self._remove_player_by_id(state, pid)
-            changed = True
-
-            # clear pending entry (if any)
             (state.setdefault("pending_disconnects", {})).pop(pid, None)
+            changed = True
 
             if action == "advance_phase":
                 need_advance = True

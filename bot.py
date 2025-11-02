@@ -1255,11 +1255,14 @@ async def game_was_handler(request):
         guild_id = initial_data.get('guild_id')
         channel_id = initial_data.get('channel_id')
 
-        if not room_id or not sender_id:
+        if not room_id or sender_id is None:
             logger.error(f"[/game_was] Initial WS message missing room_id or sender_id: {initial_data}")
             await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
             await ws.close()
             return ws
+
+        # >>> A: Tag the WS with the player id so mechanics can see live presence
+        setattr(ws, "_player_id", str(sender_id))
 
         # --- 3) Add to in-memory presence registry immediately (normalized) ---
         mechanics_cog = bot.get_cog('MechanicsMain')
@@ -1270,25 +1273,21 @@ async def game_was_handler(request):
                 await ws.close()
                 return ws
 
-        # --- NEW BLOCK: Proactively send the current game state to the new client ---
+        # --- Proactively send the current game state to the new client ---
         if mechanics_cog:
             try:
-                # Load the state directly from the database
                 state = await mechanics_cog._load_game_state(room_id)
                 if state:
-                    # Construct the same envelope the broadcast function uses
-                    envelope = {"game_state": state, "room_id": room_id, "server_ts": int(time.time())}
-                    # Send the state directly to the newly connected client
+                    envelope = {"type": "state", "game_state": state, "room_id": room_id, "server_ts": int(time.time())}
                     await ws.send_str(json.dumps(envelope))
                     logger.info(f"Sent initial game_state for room '{room_id}' to new client {sender_id}.")
             except Exception as e:
                 logger.error(f"Failed to send initial game state for room '{room_id}': {e}", exc_info=True)
-        # --- END NEW BLOCK ---
 
-        # >>> NEW: Call hook to clear pending disconnects and mark presence
+        # >>> Call hook to clear pending disconnects and mark presence
         if mechanics_cog:
             try:
-                ok, _ = await mechanics_cog.player_connect(room_id=room_id, sender_id=str(sender_id))
+                ok, _ = await mechanics_cog.player_connect(room_id=room_id, discord_id=str(sender_id))
                 presence_persisted = bool(ok)
                 logger.debug(f"[/game_was] player_connect returned ok={ok} for sender_id={sender_id} room={room_id}")
             except Exception as e:
@@ -1325,21 +1324,16 @@ async def game_was_handler(request):
         logger.error(f"[/game_was] Handler error for room {room_id}: {e}", exc_info=True)
 
     finally:
-        # >>> NEW: mark a pending disconnect (10s grace handled by MechanicsMain)
+        # >>> B: Always invoke player_disconnect hook, even if bucket registration failed
         try:
-            if mechanics_cog and room_id and sender_id and presence_persisted:
-                try:
-                    ok, _ = await mechanics_cog.player_disconnect(room_id=room_id, sender_id=str(sender_id))
-                    logger.debug(f"[/game_was] player_disconnect marked (ok={ok}) for {sender_id} in {room_id}")
-                except Exception as e:
-                    logger.error(f"[/game_was] player_disconnect failed for {sender_id} in {room_id}: {e}", exc_info=True)
-        except Exception:
-            pass
-
-        # --- 6) Cleanup ---
-        if registered_in_bucket and mechanics_cog:
-            mechanics_cog.unregister_ws_connection(ws)
-        return ws
+            if mechanics_cog and room_id and sender_id is not None:
+                await mechanics_cog.player_disconnect(room_id=room_id, discord_id=str(sender_id))
+        except Exception as e:
+            logger.error(f"[/game_was] player_disconnect hook failed: {e}", exc_info=True)
+        finally:
+            if registered_in_bucket and mechanics_cog:
+                mechanics_cog.unregister_ws_connection(ws)
+            return ws
 
 # ---------------------- (NEW) Tiny HTTP endpoint for sendBeacon leaves ----------------------
 

@@ -1,652 +1,526 @@
-import asyncio
-import json
-import logging
+# cogs/mechanics_main2.py
 import os
-import random
+import json
 import time
+import asyncio
 from typing import Dict, List, Optional, Tuple
-
-# Use shared card/deck models
-from utils.game_models import Deck, Card
-
+from discord.ext import commands
 import aiomysql
-import aiohttp
-from discord.ext import commands, tasks
 
-logger = logging.getLogger(__name__)
+# --- Use the project's card/deck models exactly as provided ---
+# Note: ranks use "0" for 10; Card.to_output_format() returns e.g. "Ah", "0s".
+from utils.game_models import Card, Deck
 
-# =============================
-# Blackjack constants & helpers
-# =============================
-BJ_PREBET_WAIT_SECS = 20          # time after at least 1 seated player to allow bets
-BJ_DECISION_SECS    = 25          # per-player decision window during their turn
-BJ_BET_MIN_BY_MODE  = {
-    "1": 5,
-    "2": 25,
-    "3": 100,
-    "4": 250,
-}
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_HOST = os.getenv("DB_HOST")
 
-# Dealer rules: hit soft 17 (common casino rule)
-DEALER_HITS_SOFT_17 = True
-
-# Public state phases
-PH_WAITING_BETS   = "waiting_bets"
-PH_DEALING        = "dealing"
-PH_PLAYER_TURNS   = "player_turns"
-PH_DEALER_TURN    = "dealer_turn"
-PH_PAYOUT         = "payout"
-PH_BETWEEN        = "between_hands"
-
-# Allowed moves from client
-MOVE_HIT     = "hit"
-MOVE_STAND   = "stand"
-MOVE_DOUBLE  = "double"
-MOVE_SPLIT   = "split"   # implemented carefully (1 split per hand)
-MOVE_BET     = "bet"      # place initial bet (client withdraws chips first like poker)
-MOVE_SIT     = "player_sit"
-MOVE_LEAVE   = "player_leave"
-MOVE_GET     = "get_state"
-
-# =============================
-# Utilities
-# =============================
+# DB helpers (mirror your style in bot.py)
+async def _db_connect_dict():
+    return await aiomysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        db="serene_users",
+        charset='utf8mb4',
+        autocommit=True,
+        cursorclass=aiomysql.cursors.DictCursor
+    )
 
 def _now() -> int:
     return int(time.time())
 
-
-def _mk_deck_list() -> List[str]:
-    """Builds and shuffles a deck using utils.game_models.Deck, returning
-    a serialized list of two-character codes (e.g., 'AH', '0D').
-    """
-    d = Deck()
-    d.shuffle(); d.shuffle()
-    return d.to_output_format()
-
-
 def _hand_value(cards: List[str]) -> Tuple[int, bool]:
     """
-    Returns (best_total, is_soft) for card codes produced by Card.to_output_format()
-    where ranks are '2'..'9','0','J','Q','K','A' and suits end with 'H','D','C','S'.
+    Compute blackjack value for a list of two-char card strings, return (total, is_soft).
+    Aces start as 11 and we drop them to 1 while busting.
     """
     total = 0
     aces = 0
-    for c in cards:
-        if not c:
-            continue
-        r = c[:-1]  # rank is everything except final suit char
-        if r == "A":
+    for cs in cards:
+        # cs like "Ah", "7d", "0s", "Qc"
+        rank = cs[:-1]  # all but last char (since "0" is already single-char)
+        if rank in ("J", "Q", "K"):
+            v = 10
+        elif rank == "A":
+            v = 11
             aces += 1
-            total += 1
-        elif r in ("0", "J", "Q", "K"):
-            total += 10
+        elif rank == "0":
+            v = 10
         else:
             try:
-                total += int(r)
+                v = int(rank)
             except ValueError:
-                # Unexpected rank; ignore gracefully
-                pass
-    # upgrade some aces to 11
-    is_soft = False
-    while aces > 0 and total + 10 <= 21:
-        total += 10
+                v = 0
+        total += v
+    # Downgrade aces if we bust
+    soft = False
+    while total > 21 and aces > 0:
+        total -= 10
         aces -= 1
-        is_soft = True
-    return total, is_soft
-
+    if aces > 0:  # any remaining ace counted as 11
+        soft = True
+    return total, soft
 
 def _is_blackjack(cards: List[str]) -> bool:
-    return len(cards) == 2 and _hand_value(cards)[0] == 21
+    if len(cards) != 2:
+        return False
+    total, _ = _hand_value(cards)
+    return total == 21
 
+def _normalize_room_id(room_id: str) -> str:
+    return str(room_id or "").strip()
 
-# =============================
-# Cog: MechanicsMain2 (Blackjack)
-# =============================
 class MechanicsMain2(commands.Cog):
-    """A self-contained blackjack round manager that mirrors the public surface of
-    MechanicsMain (poker) enough to plug into the same infra: DB, WS bucket,
-    and bot websocket dispatcher. The game-state is persisted to
-    `bot_game_rooms.game_state` (JSON) just like poker.
     """
+    Blackjack mechanics (independent from Hold 'Em).
+    Room state layout (JSON in bot_game_rooms.game_state):
 
+    {
+      "room_type": "blackjack",
+      "deck": ["Ah","Kd",...],     # remaining undealt
+      "dealer": {"hand": ["??", "7d"], "hole_revealed": false},
+      "players": [
+        {"id": "123", "name": "Alice", "hand": ["As","0d"], "bet": 25, "stood": false,
+         "busted": false, "doubled": false, "surrendered": false, "acted": false}
+      ],
+      "status": "waiting|in_round|showdown|round_over",
+      "turn_index": 0,
+      "min_bet": 5,
+      "_empty_since": 0
+    }
+    """
     def __init__(self, bot):
         self.bot = bot
-        self.db_user = getattr(bot, "db_user", os.getenv("DB_USER"))
-        self.db_password = getattr(bot, "db_password", os.getenv("DB_PASSWORD"))
-        self.db_host = getattr(bot, "db_host", os.getenv("DB_HOST"))
-        self.db_name = "serene_users"
+        # independent WS registry (room_id -> set(web.WebSocketResponse))
+        self._ws_rooms: Dict[str, set] = {}
+        # action locks per room
+        self._locks: Dict[str, asyncio.Lock] = {}
 
-        if not hasattr(bot, "ws_rooms"):
-            bot.ws_rooms = {}
+    # ------------- Websocket presence API expected by bot.py -------------
 
-        self.rooms_with_active_timers = set()
-        self._tick_loop.start()
-
-    def cog_unload(self):
-        try:
-            self._tick_loop.cancel()
-        except Exception:
-            pass
-
-    # ------------- DB helpers -------------
-    async def _db(self):
-        return await aiomysql.connect(
-            host=self.db_host,
-            user=self.db_user,
-            password=self.db_password,
-            db=self.db_name,
-            charset="utf8mb4",
-            autocommit=True,
-            cursorclass=aiomysql.cursors.DictCursor,
-        )
-
-    async def _load_room_cfg(self, room_id: str) -> Dict:
-        try:
-            async with (await self._db()) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT game_mode, guild_id, channel_id FROM bot_game_rooms WHERE room_id=%s LIMIT 1",
-                        (str(room_id),),
-                    )
-                    row = await cur.fetchone()
-            gm = str((row or {}).get("game_mode") or "1")
-            return {
-                "game_mode": gm,
-                "min_bet": BJ_BET_MIN_BY_MODE.get(gm, BJ_BET_MIN_BY_MODE["1"]),
-                "guild_id": (row or {}).get("guild_id"),
-                "channel_id": (row or {}).get("channel_id"),
-            }
-        except Exception as e:
-            logger.warning(f"load_room_cfg failed for {room_id}: {e}")
-            return {"game_mode": "1", "min_bet": BJ_BET_MIN_BY_MODE["1"], "guild_id": None, "channel_id": None}
-
-    async def _load_state(self, room_id: str) -> Dict:
-        try:
-            async with (await self._db()) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "SELECT game_state FROM bot_game_rooms WHERE room_id=%s LIMIT 1",
-                        (str(room_id),),
-                    )
-                    row = await cur.fetchone()
-            if not row:
-                return {}
-            raw = row.get("game_state")
-            if isinstance(raw, (bytes, bytearray)):
-                raw = raw.decode("utf-8", "ignore")
-            if not raw:
-                return {}
-            return json.loads(raw)
-        except Exception as e:
-            logger.error(f"load_state error {room_id}: {e}")
-            return {}
-
-    async def _save_state(self, room_id: str, state: Dict):
-        try:
-            async with (await self._db()) as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        "UPDATE bot_game_rooms SET game_state=%s WHERE room_id=%s",
-                        (json.dumps(state), str(room_id)),
-                    )
-        except Exception as e:
-            logger.error(f"save_state error {room_id}: {e}")
-
-    # ------------- WS room bucket -------------
-    def register_ws_connection(self, ws, room_id: str):
-        rid = str(room_id)
-        self.bot.ws_rooms.setdefault(rid, set()).add(ws)
-        setattr(ws, "_assigned_room", rid)
+    def register_ws_connection(self, ws, room_id: str) -> bool:
+        rid = _normalize_room_id(room_id)
+        if not rid:
+            return False
+        if rid not in self._ws_rooms:
+            self._ws_rooms[rid] = set()
+        self._ws_rooms[rid].add(ws)
+        setattr(ws, "_bj_room_id", rid)
         return True
 
     def unregister_ws_connection(self, ws):
-        rid = getattr(ws, "_assigned_room", None)
+        rid = getattr(ws, "_bj_room_id", None)
+        if not rid:
+            return
         try:
-            if rid and rid in self.bot.ws_rooms:
-                self.bot.ws_rooms[rid].discard(ws)
-                if not self.bot.ws_rooms[rid]:
-                    del self.bot.ws_rooms[rid]
+            bucket = self._ws_rooms.get(rid)
+            if bucket and ws in bucket:
+                bucket.discard(ws)
+            if bucket and not bucket:
+                self._ws_rooms.pop(rid, None)
         except Exception:
             pass
 
-    async def _broadcast(self, room_id: str, payload: Dict):
-        payload.setdefault("server_ts", _now())
-        msg = json.dumps(payload)
-        dead = []
-        for ws in list(self.bot.ws_rooms.get(str(room_id), set())):
-            try:
-                if getattr(ws, "closed", False):
+    async def player_connect(self, room_id: str, discord_id: str) -> Tuple[bool, Optional[str]]:
+        # For parity with your poker cog; mark presence if you store it. No-op here.
+        return True, None
+
+    async def player_disconnect(self, room_id: str, discord_id: str):
+        # Optional bookkeeping (not required for blackjack round flow)
+        return
+
+    # ---------------------- DB state helpers ----------------------
+
+    async def _load_game_state(self, room_id: str) -> Optional[dict]:
+        if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+            return None
+        rid = _normalize_room_id(room_id)
+        conn = None
+        try:
+            conn = await _db_connect_dict()
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT game_state FROM bot_game_rooms WHERE room_id=%s", (rid,))
+                row = await cur.fetchone()
+                if not row:
+                    return None
+                raw = row.get("game_state")
+                if isinstance(raw, (bytes, bytearray)):
+                    raw = raw.decode("utf-8", errors="ignore")
+                try:
+                    jd = json.loads(raw) if raw else {}
+                except Exception:
+                    jd = {}
+                return jd or None
+        finally:
+            if conn:
+                conn.close()
+
+    async def _save_game_state(self, room_id: str, state: dict):
+        if not all([DB_USER, DB_PASSWORD, DB_HOST]):
+            return
+        rid = _normalize_room_id(room_id)
+        conn = None
+        try:
+            conn = await _db_connect_dict()
+            js = json.dumps(state)
+            async with conn.cursor() as cur:
+                # insert-or-update the row; set room_type to 'blackjack'
+                await cur.execute(
+                    """
+                    INSERT INTO bot_game_rooms (room_id, room_name, room_type, game_mode, game_state)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE game_state = VALUES(game_state), room_type = VALUES(room_type)
+                    """,
+                    (rid, f"Blackjack {rid}", "blackjack", 1, js)
+                )
+        finally:
+            if conn:
+                conn.close()
+
+    # ---------------------- Broadcasting ----------------------
+
+    async def _broadcast(self, room_id: str, payload: dict):
+        # Reuse bot-level broadcaster if you have one; otherwise send here.
+        try:
+            bucket = self._ws_rooms.get(room_id) or set()
+            msg = json.dumps(payload)
+            dead = []
+            for ws in list(bucket):
+                try:
+                    if ws.closed:
+                        dead.append(ws)
+                        continue
+                    await ws.send_str(msg)
+                except Exception:
                     dead.append(ws)
-                    continue
-                await ws.send_str(msg)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            try:
-                self.bot.ws_rooms.get(str(room_id), set()).discard(ws)
-            except Exception:
-                pass
+            for ws in dead:
+                try:
+                    bucket.discard(ws)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
-    # ------------- State scaffolding -------------
-    def _ensure_defaults(self, state: Dict, room_cfg: Optional[Dict] = None):
-        rcfg = room_cfg or {}
-        state.setdefault("room_id", state.get("room_id"))
-        state.setdefault("game", "blackjack")
-        state.setdefault("current_round", PH_WAITING_BETS)
-        state.setdefault("min_bet", int(rcfg.get("min_bet") or BJ_BET_MIN_BY_MODE["1"]))
-        state.setdefault("guild_id", rcfg.get("guild_id"))
-        state.setdefault("channel_id", rcfg.get("channel_id"))
-        state.setdefault("players", [])  # each: {discord_id,name,seat_id,connected,total_chips,avatar_url}
-        state.setdefault("hands", {})    # pid -> list of hands; hand: {cards, bet, stood, bust, split_allowed}
-        state.setdefault("dealer", {"cards": []})
-        state.setdefault("deck", [])
-        state.setdefault("action_deadline_epoch", 0)
-        state.setdefault("actor", None)         # whose turn (discord_id)
-        state.setdefault("turn_index", 0)       # index into play order across hands
-        state.setdefault("__rev", 0)
+    async def _broadcast_state(self, room_id: str, state: dict):
+        await self._broadcast(room_id, {"type": "state", "game_state": state, "room_id": room_id, "server_ts": _now()})
 
-    def _rev(self, state: Dict):
-        state["__rev"] = int(state.get("__rev") or 0) + 1
+    # ---------------------- Game helpers ----------------------
 
-    # ------------- Seating & betting -------------
-    def _find_player(self, state: Dict, pid: str) -> Optional[Dict]:
+    def _lock_for(self, room_id: str) -> asyncio.Lock:
+        rid = _normalize_room_id(room_id)
+        if rid not in self._locks:
+            self._locks[rid] = asyncio.Lock()
+        return self._locks[rid]
+
+    def _new_state(self) -> dict:
+        d = Deck()
+        d.shuffle()
+        return {
+            "room_type": "blackjack",
+            "deck": d.to_output_format(),  # list[str]
+            "dealer": {"hand": [], "hole_revealed": False},
+            "players": [],
+            "status": "waiting",
+            "turn_index": 0,
+            "min_bet": 5
+        }
+
+    def _deal_from(self, state: dict) -> Optional[str]:
+        # pop from the end (top) — consistent with Deck.deal_card().to_output_format()
+        deck = state.get("deck") or []
+        if not deck:
+            return None
+        return deck.pop()
+
+    def _player_by_id(self, state: dict, player_id: str) -> Optional[dict]:
         for p in (state.get("players") or []):
-            if str(p.get("discord_id")) == str(pid):
+            if str(p.get("id")) == str(player_id):
                 return p
         return None
 
-    def _active_seated(self, state: Dict) -> List[Dict]:
-        out = []
+    def _everyone_acted_or_busted(self, state: dict) -> bool:
         for p in (state.get("players") or []):
-            if p.get("seat_id") and not p.get("is_spectating"):
-                out.append(p)
-        return out
+            if not (p.get("busted") or p.get("surrendered") or p.get("stood") or p.get("acted")):
+                return False
+        return True
 
-    # Blackjack stores per-hand bets in state['hands'][pid][i]['bet']
-
-    # ------------- Dealing & flow -------------
-    def _need_deck(self, state: Dict):
-        # state['deck'] stores serialized card codes via Deck.to_output_format()
-        if not state.get("deck") or len(state["deck"]) < 15:
-            state["deck"] = _mk_deck_list()
-
-    def _deal_card(self, state: Dict) -> str:
-        self._need_deck(state)
-        try:
-            deck_obj = Deck(cards_data=state.get("deck") or [])
-            card = deck_obj.deal_card()
-            if card is None:
-                # rebuild fresh deck
-                state["deck"] = _mk_deck_list()
-                deck_obj = Deck(cards_data=state["deck"]) 
-                card = deck_obj.deal_card()
-            # persist mutated deck back to state
-            state["deck"] = deck_obj.to_output_format()
-            return card.to_output_format()
-        except Exception:
-            # Fallback: new deck
-            state["deck"] = _mk_deck_list()
-            deck_obj = Deck(cards_data=state["deck"]) 
-            card = deck_obj.deal_card()
-            state["deck"] = deck_obj.to_output_format()
-            return card.to_output_format()
-        except Exception:
-            state["deck"] = _mk_deck()
-            return state["deck"].pop()
-
-    def _players_in_hand(self, state: Dict) -> List[str]:
-        return [str(p.get("discord_id")) for p in self._active_seated(state)]
-
-    def _start_prebet(self, state: Dict):
-        state["current_round"] = PH_WAITING_BETS
-        state["actor"] = None
-        state["turn_index"] = 0
-        state["dealer"] = {"cards": []}
-        state["hands"] = {}
-        state["action_deadline_epoch"] = _now() + BJ_PREBET_WAIT_SECS
-        self._rev(state)
-
-    def _can_begin_hand(self, state: Dict) -> bool:
-        # Needs at least one player with a positive bet placed
-        for pid, hands in (state.get("hands") or {}).items():
-            for h in (hands or []):
-                if int(h.get("bet") or 0) > 0:
-                    return True
-        return False
-
-    def _begin_hand(self, state: Dict):
-        state["current_round"] = PH_DEALING
-        self._need_deck(state)
-        state["dealer"] = {"cards": []}
-        # initial two cards to each betting hand and dealer (1 up, 1 down)
-        for pid, hands in (state.get("hands") or {}).items():
-            for h in hands:
-                if int(h.get("bet") or 0) > 0:
-                    h["cards"] = [self._deal_card(state), self._deal_card(state)]
-                    h["stood"], h["bust"], h["split_allowed"] = False, False, True
-        state["dealer"]["cards"] = [self._deal_card(state), self._deal_card(state)]
-        state["current_round"] = PH_PLAYER_TURNS
-        state["turn_index"] = 0
-        order = self._linear_play_order(state)
-        state["actor"] = order[0] if order else None
-        state["action_deadline_epoch"] = _now() + BJ_DECISION_SECS
-        self._rev(state)
-
-    def _linear_play_order(self, state: Dict) -> List[Tuple[str, int]]:
-        """Flattens players' hands into [(pid, hand_index), ...] left-to-right by seat_id.
-        Only hands with a bet > 0 and not bust are included.
-        """
-        def seat_num(p):
-            try:
-                return int(str(p.get("seat_id", "seat_0")).split("_")[-1])
-            except Exception:
-                return 0
-        order = []
-        for p in sorted(self._active_seated(state), key=seat_num):
-            pid = str(p.get("discord_id"))
-            for i, h in enumerate(state.get("hands", {}).get(pid, [])):
-                if int(h.get("bet") or 0) > 0 and not h.get("bust") and not h.get("stood"):
-                    order.append((pid, i))
-        return order
-
-    def _advance_turn(self, state: Dict):
-        order = self._linear_play_order(state)
-        if not order:
-            # no playable hands -> dealer turn
-            state["current_round"] = PH_DEALER_TURN
-            state["actor"] = None
-            state["action_deadline_epoch"] = _now() + 2
-            self._rev(state)
+    def _advance_turn(self, state: dict):
+        players = state.get("players") or []
+        n = len(players)
+        if n == 0:
+            state["turn_index"] = 0
             return
-        idx = min(max(int(state.get("turn_index") or 0), 0), len(order) - 1)
-        idx += 1
-        if idx >= len(order):
-            state["current_round"] = PH_DEALER_TURN
-            state["actor"] = None
-            state["action_deadline_epoch"] = _now() + 2
-        else:
-            state["turn_index"] = idx
-            state["actor"] = order[idx][0]
-            state["action_deadline_epoch"] = _now() + BJ_DECISION_SECS
-        self._rev(state)
-
-    def _all_hands_for(self, state: Dict, pid: str) -> List[Dict]:
-        return list((state.get("hands", {}).get(str(pid)) or []))
-
-    # ------------- Player actions -------------
-    def _ensure_player_hands(self, state: Dict, pid: str):
-        hands = state.setdefault("hands", {}).setdefault(str(pid), [])
-        if not hands:
-            hands.append({"cards": [], "bet": 0, "stood": False, "bust": False, "split_allowed": True})
-
-    def _place_bet(self, state: Dict, pid: str, amount: int):
-        self._ensure_player_hands(state, pid)
-        h = state["hands"][str(pid)][0]
-        h["bet"] = int(h.get("bet") or 0) + max(0, int(amount or 0))
-        self._rev(state)
-
-    def _hit(self, state: Dict, pid: str, hand_index: int):
-        hands = self._all_hands_for(state, pid)
-        if hand_index < 0 or hand_index >= len(hands):
-            return
-        h = hands[hand_index]
-        if h.get("stood") or h.get("bust"):
-            return
-        h["cards"].append(self._deal_card(state))
-        total, _ = _hand_value(h["cards"])
-        if total > 21:
-            h["bust"] = True
-        self._rev(state)
-
-    def _stand(self, state: Dict, pid: str, hand_index: int):
-        hands = self._all_hands_for(state, pid)
-        if 0 <= hand_index < len(hands):
-            hands[hand_index]["stood"] = True
-            self._rev(state)
-
-    def _double(self, state: Dict, pid: str, hand_index: int):
-        hands = self._all_hands_for(state, pid)
-        if 0 <= hand_index < len(hands):
-            h = hands[hand_index]
-            if len(h["cards"]) == 2:  # simple double rule
-                h["bet"] = int(h.get("bet") or 0) * 2
-                h["cards"].append(self._deal_card(state))
-                total, _ = _hand_value(h["cards"])
-                if total > 21:
-                    h["bust"] = True
-                h["stood"] = True
-                self._rev(state)
-
-    def _split(self, state: Dict, pid: str, hand_index: int):
-        hands = self._all_hands_for(state, pid)
-        if 0 <= hand_index < len(hands):
-            h = hands[hand_index]
-            if not h.get("split_allowed"):
+        # move to next player that can act
+        for _ in range(n):
+            state["turn_index"] = (state.get("turn_index", 0) + 1) % n
+            p = players[state["turn_index"]]
+            if not (p.get("busted") or p.get("surrendered") or p.get("stood")):
                 return
-            cards = h.get("cards") or []
-            if len(cards) == 2 and cards[0][0] == cards[1][0]:
-                # make two hands, second hand inherits bet
-                card_a, card_b = cards
-                bet = int(h.get("bet") or 0)
-                # replace current hand
-                h["cards"] = [card_a, self._deal_card(state)]
-                h["split_allowed"] = False
-                # add new hand
-                hands.insert(hand_index + 1, {"cards": [card_b, self._deal_card(state)], "bet": bet, "stood": False, "bust": False, "split_allowed": False})
-                self._rev(state)
 
-    # ------------- Dealer + payout -------------
-    def _do_dealer_play(self, state: Dict):
-        d = state.get("dealer", {})
+    # ---------------------- Round flow ----------------------
+
+    async def _ensure_room(self, room_id: str) -> dict:
+        state = await self._load_game_state(room_id)
+        if not state:
+            state = self._new_state()
+            await self._save_game_state(room_id, state)
+        return state
+
+    async def _start_round_if_possible(self, room_id: str, state: dict):
+        """
+        Start a new deal if status is 'waiting' and at least one player has joined with a bet.
+        """
+        if state.get("status") != "waiting":
+            return
+        players = state.get("players") or []
+        if not players:
+            return
+
+        # Fresh deck each round if low
+        if len(state.get("deck") or []) < 15:
+            d = Deck()
+            d.shuffle()
+            state["deck"] = d.to_output_format()
+
+        # reset table markers
+        state["dealer"] = {"hand": [], "hole_revealed": False}
+        for p in players:
+            p.update({
+                "hand": [], "stood": False, "busted": False,
+                "doubled": False, "surrendered": False, "acted": False
+            })
+
+        # initial deal: player, dealer (up), player, dealer (hole)
+        for p in players:
+            c = self._deal_from(state);  p["hand"].append(c)
+        up = self._deal_from(state);     state["dealer"]["hand"].append(up)
+        for p in players:
+            c = self._deal_from(state);  p["hand"].append(c)
+        hole = self._deal_from(state);   state["dealer"]["hand"].append(hole)
+        state["dealer"]["hole_revealed"] = False
+
+        # mark first player to act
+        state["status"] = "in_round"
+        state["turn_index"] = 0
+        # pre-mark "acted" for those that have natural blackjack (they won't need actions)
+        for p in players:
+            if _is_blackjack(p["hand"]):
+                p["acted"] = True
+
+    def _finish_dealer_and_score(self, state: dict):
+        dealer = state.get("dealer") or {}
+        dealer_hand = dealer.get("hand") or []
+        dealer["hole_revealed"] = True
+
+        # Dealer draws to 17, hit soft 17? We'll stand on soft 17 (common variant); change if desired.
         while True:
-            total, soft = _hand_value(d.get("cards") or [])
+            total, soft = _hand_value(dealer_hand)
             if total < 17:
-                d["cards"].append(self._deal_card(state))
-                continue
-            if total == 17 and soft and DEALER_HITS_SOFT_17:
-                d["cards"].append(self._deal_card(state))
-                continue
-            break
-        self._rev(state)
-
-    def _payouts(self, state: Dict):
-        d_total, _ = _hand_value(state.get("dealer", {}).get("cards") or [])
-        dealer_bust = d_total > 21
-        for pid, hands in (state.get("hands") or {}).items():
-            for h in hands:
-                bet = int(h.get("bet") or 0)
-                if bet <= 0:
-                    continue
-                total, _ = _hand_value(h.get("cards") or [])
-                win = 0
-                if _is_blackjack(h.get("cards") or []) and not _is_blackjack(state.get("dealer", {}).get("cards") or []):
-                    win = int(bet * 1.5) + bet  # 3:2 payout (bet returned + winnings)
-                elif dealer_bust and total <= 21:
-                    win = bet * 2
-                elif total > 21:
-                    win = 0
-                elif d_total > 21:
-                    win = bet * 2
-                elif total > d_total:
-                    win = bet * 2
-                elif total == d_total:
-                    win = bet  # push
-                else:
-                    win = 0
-                h["payout"] = win
-        self._rev(state)
-
-    # ------------- Timer loop -------------
-    @tasks.loop(seconds=1.0)
-    async def _tick_loop(self):
-        try:
-            # Iterate only rooms that currently have timers running
-            for rid in list(self.rooms_with_active_timers):
-                state = await self._load_state(rid) or {}
-                if not state:
-                    self.rooms_with_active_timers.discard(rid)
-                    continue
-                self._ensure_defaults(state)
-                phase = state.get("current_round")
-                now = _now()
-
-                # Broadcast lightweight tick for countdowns
-                await self._broadcast(rid, {
-                    "type": "tick",
-                    "room_id": rid,
-                    "current_round": phase,
-                    "actor": state.get("actor"),
-                    "action_deadline_epoch": state.get("action_deadline_epoch"),
-                    "server_ts": now,
-                })
-
-                if now < int(state.get("action_deadline_epoch") or 0):
-                    continue
-
-                changed = False
-                if phase == PH_WAITING_BETS:
-                    if self._can_begin_hand(state):
-                        self._begin_hand(state)
-                        changed = True
-                    else:
-                        # extend window while someone is seated but hasn't bet yet
-                        state["action_deadline_epoch"] = now + 5
-                        changed = True
-
-                elif phase == PH_PLAYER_TURNS:
-                    # on timeout: auto-stand current hand to keep table moving
-                    self._advance_turn(state)
-                    changed = True
-
-                elif phase == PH_DEALER_TURN:
-                    self._do_dealer_play(state)
-                    state["current_round"] = PH_PAYOUT
-                    state["action_deadline_epoch"] = now + 1
-                    changed = True
-
-                elif phase == PH_PAYOUT:
-                    self._payouts(state)
-                    state["current_round"] = PH_BETWEEN
-                    state["action_deadline_epoch"] = now + 5
-                    changed = True
-
-                elif phase == PH_BETWEEN:
-                    self._start_prebet(state)
-                    changed = True
-
-                if changed:
-                    await self._save_state(rid, state)
-                    await self._broadcast(rid, {"type": "state", "room_id": rid, "game_state": state})
-                # keep room live until we reach waiting_bets again
-                if state.get("current_round") == PH_WAITING_BETS:
-                    # keep ticking while seats exist
-                    if not self._active_seated(state):
-                        self.rooms_with_active_timers.discard(rid)
-        except Exception as e:
-            logger.error(f"tick loop error: {e}")
-
-    @_tick_loop.before_loop
-    async def _before_tick(self):
-        await self.bot.wait_until_ready()
-
-    # ------------- Public hooks used by WS handler -------------
-    async def player_connect(self, room_id: str, discord_id: str):
-        # For blackjack, we just mark them connected in-memory by staying on WS
-        return True, ""
-
-    async def player_disconnect(self, room_id: str, discord_id: str):
-        return True, ""
-
-    # ============= Main dispatcher for websocket actions =============
-    async def handle_websocket_game_action(self, data: Dict):
-        room_id = str(data.get("room_id"))
-        sender  = str(data.get("sender_id"))
-        action  = data.get("action")
-
-        state = await self._load_state(room_id) or {}
-        cfg   = await self._load_room_cfg(room_id)
-        self._ensure_defaults(state, cfg)
-        state["room_id"] = room_id
-
-        # Always ensure there is at least an empty hand for seated players
-        if action == MOVE_SIT:
-            pdata   = data.get("player_data", {})
-            seat_id = pdata.get("seat_id")
-            name    = pdata.get("name") or "Player"
-            avatar  = pdata.get("avatar_url")
-            if seat_id and not self._find_player(state, sender):
-                state["players"].append({
-                    "discord_id": sender,
-                    "name": name,
-                    "seat_id": seat_id,
-                    "avatar_url": avatar,
-                    "is_spectating": False,
-                    "connected": True,
-                })
-                self._ensure_player_hands(state, sender)
-                # open a short pre-bet window once the first seat exists
-                if state.get("current_round") in (PH_BETWEEN, PH_WAITING_BETS):
-                    state["action_deadline_epoch"] = _now() + BJ_PREBET_WAIT_SECS
-                    state["current_round"] = PH_WAITING_BETS
-                self.rooms_with_active_timers.add(room_id)
-
-        elif action == MOVE_LEAVE:
-            # remove player completely
-            state["players"] = [p for p in (state.get("players") or []) if str(p.get("discord_id")) != sender]
-            if sender in (state.get("hands") or {}):
-                del state["hands"][sender]
-            if not self._active_seated(state):
-                # if table empty, reset to waiting bets
-                self._start_prebet(state)
-
-        elif action == MOVE_GET:
-            # just send the current state back via broadcast after save below
-            pass
-
-        elif action == MOVE_BET:
-            amount = int(data.get("amount") or 0)
-            min_bet = int(state.get("min_bet") or cfg.get("min_bet") or 5)
-            if amount >= min_bet:
-                self._place_bet(state, sender, amount)
-                # ensure countdown exists
-                if state.get("current_round") == PH_WAITING_BETS:
-                    state["action_deadline_epoch"] = _now() + max(5, BJ_PREBET_WAIT_SECS // 2)
-                self.rooms_with_active_timers.add(room_id)
-
-        elif action == "player_action":
-            move = str(data.get("move") or "").lower()
-            # Which hand is acting? Default to the first available hand owned by sender
-            order = self._linear_play_order(state)
-            acting_index = None
-            for idx, (pid, hidx) in enumerate(order):
-                if pid == sender:
-                    acting_index = (pid, hidx)
+                # hit
+                c = self._deal_from(state)
+                if not c:
                     break
-            if state.get("current_round") != PH_PLAYER_TURNS or not acting_index:
-                # ignore if it's not their turn
-                pass
+                dealer_hand.append(c)
+                continue
+            # stand on soft 17:
+            if total == 17 and soft:
+                break
+            if total >= 17:
+                break
+
+        dealer_total, _ = _hand_value(dealer_hand)
+        for p in (state.get("players") or []):
+            if p.get("surrendered"):
+                p["result"] = "lose_half"
+                continue
+            if p.get("busted"):
+                p["result"] = "lose"
+                continue
+            pt, _ = _hand_value(p["hand"])
+            if _is_blackjack(p["hand"]):
+                if _is_blackjack(dealer_hand):
+                    p["result"] = "push"
+                else:
+                    p["result"] = "blackjack"  # 3:2 assumed client-side
+                continue
+            if dealer_total > 21:
+                p["result"] = "win"
             else:
-                pid, hidx = acting_index
-                if move == MOVE_HIT:
-                    self._hit(state, pid, hidx)
-                elif move == MOVE_STAND:
-                    self._stand(state, pid, hidx)
-                elif move == MOVE_DOUBLE:
-                    self._double(state, pid, hidx)
-                elif move == MOVE_SPLIT:
-                    self._split(state, pid, hidx)
-                # advance if current hand is done
-                self._advance_turn(state)
+                if pt > dealer_total:
+                    p["result"] = "win"
+                elif pt < dealer_total:
+                    p["result"] = "lose"
+                else:
+                    p["result"] = "push"
 
-        # Begin the hand automatically if we are in waiting_bets and at least one bet exists
-        if state.get("current_round") == PH_WAITING_BETS and self._can_begin_hand(state):
-            self._begin_hand(state)
-            self.rooms_with_active_timers.add(room_id)
+        state["status"] = "round_over"
 
-        # Persist + broadcast
-        await self._save_state(room_id, state)
-        await self._broadcast(room_id, {"type": "state", "room_id": room_id, "game_state": state})
+    # ---------------------- Action entrypoints (WS) ----------------------
+
+    async def handle_websocket_game_action(self, data: dict):
+        """
+        Dispatch actions coming from the WS:
+          create_room, join, deal, hit, stand, double, surrender, reset_round
+        Expected fields include: room_id, sender_id, maybe display_name, bet.
+        """
+        room_id = _normalize_room_id(data.get("room_id"))
+        sender_id = str(data.get("sender_id"))
+        action = str(data.get("action") or "").lower()
+        display_name = str(data.get("display_name") or f"Player {sender_id}")
+
+        if not room_id or not sender_id or not action:
+            return
+
+        async with self._lock_for(room_id):
+            state = await self._ensure_room(room_id)
+
+            # Ensure room type label
+            state.setdefault("room_type", "blackjack")
+            state.setdefault("min_bet", 5)
+            players = state.setdefault("players", [])
+
+            # utility: find or create player shell (no auto-join on create_room)
+            def ensure_player():
+                p = self._player_by_id(state, sender_id)
+                if not p:
+                    p = {
+                        "id": sender_id, "name": display_name,
+                        "hand": [], "bet": state["min_bet"],
+                        "stood": False, "busted": False,
+                        "doubled": False, "surrendered": False, "acted": False
+                    }
+                    players.append(p)
+                return p
+
+            # ---- Actions ----
+
+            if action == "create_room":
+                # Fresh state, keep same room id
+                state = self._new_state()
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "join":
+                p = ensure_player()
+                # do not start round yet; client will call 'deal' after bets are placed
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "set_bet":
+                amt = data.get("bet")
+                try:
+                    bet = max(state.get("min_bet", 5), int(amt))
+                except Exception:
+                    bet = state.get("min_bet", 5)
+                p = ensure_player()
+                p["bet"] = bet
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "deal":
+                # start new round if waiting/round_over
+                if state.get("status") in ("waiting", "round_over"):
+                    await self._start_round_if_possible(room_id, state)
+                    await self._save_game_state(room_id, state)
+                    await self._broadcast_state(room_id, state)
+                return
+
+            if action == "hit":
+                if state.get("status") != "in_round":
+                    return
+                p = self._player_by_id(state, sender_id)
+                if not p or p.get("stood") or p.get("busted") or p.get("surrendered"):
+                    return
+                c = self._deal_from(state)
+                if c:
+                    p["hand"].append(c)
+                total, _ = _hand_value(p["hand"])
+                if total > 21:
+                    p["busted"] = True
+                    p["acted"] = True
+                    # advance or finish
+                    if self._everyone_acted_or_busted(state):
+                        # reveal and score
+                        self._finish_dealer_and_score(state)
+                    else:
+                        self._advance_turn(state)
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "stand":
+                if state.get("status") != "in_round":
+                    return
+                p = self._player_by_id(state, sender_id)
+                if not p or p.get("busted") or p.get("surrendered") or p.get("stood"):
+                    return
+                p["stood"] = True
+                p["acted"] = True
+                if self._everyone_acted_or_busted(state):
+                    self._finish_dealer_and_score(state)
+                else:
+                    self._advance_turn(state)
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "double":
+                if state.get("status") != "in_round":
+                    return
+                p = self._player_by_id(state, sender_id)
+                # allow double only as first action (2 cards, not acted)
+                if not p or p.get("acted") or len(p.get("hand") or []) != 2:
+                    return
+                p["bet"] = int(p.get("bet", state.get("min_bet", 5))) * 2
+                p["doubled"] = True
+                # exactly one card then auto-stand
+                c = self._deal_from(state)
+                if c:
+                    p["hand"].append(c)
+                total, _ = _hand_value(p["hand"])
+                if total > 21:
+                    p["busted"] = True
+                p["stood"] = True
+                p["acted"] = True
+                if self._everyone_acted_or_busted(state):
+                    self._finish_dealer_and_score(state)
+                else:
+                    self._advance_turn(state)
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "surrender":
+                if state.get("status") != "in_round":
+                    return
+                p = self._player_by_id(state, sender_id)
+                # typically only before any other action (2 cards, not acted)
+                if not p or p.get("acted") or len(p.get("hand") or []) != 2:
+                    return
+                p["surrendered"] = True
+                p["acted"] = True
+                p["stood"] = True
+                if self._everyone_acted_or_busted(state):
+                    self._finish_dealer_and_score(state)
+                else:
+                    self._advance_turn(state)
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            if action == "reset_round":
+                # keep players at table; set status to waiting so next 'deal' starts fresh
+                state["status"] = "waiting"
+                await self._save_game_state(room_id, state)
+                await self._broadcast_state(room_id, state)
+                return
+
+            # Unknown action -> ignore (or log)
+            return
 
 
 async def setup(bot):

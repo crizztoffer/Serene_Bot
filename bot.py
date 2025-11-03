@@ -1699,10 +1699,13 @@ async def game_was_handler(request):
 # ---------------------- (NEW) Blackjack WS: /blackjack_ws ----------------------
 async def blackjack_ws_handler(request: web.Request):
     """
-    Blackjack WebSocket: mirrors /game_was flow but targets MechanicsMain2 (Blackjack).
-    - Initial TEXT JSON must include: room_id, sender_id (guild_id/channel_id optional).
-    - Registers connection in blackjack cog's WS bucket for broadcasting.
-    - Forwards subsequent JSON frames to MechanicsMain2.handle_websocket_game_action.
+    Blackjack WebSocket: **identical semantics** to /game_was, but routed to MechanicsMain2.
+      - Requires initial TEXT JSON with: room_id, sender_id (guild_id/channel_id optional).
+      - Registers socket in MechanicsMain2 bucket; tags ws._player_id for presence.
+      - Sends immediate snapshot envelope: {"type":"state","game_state":<dict>,"room_id":..., "server_ts":...}
+      - Handles ping the same way.
+      - Forwards any JSON with "action" to MechanicsMain2.handle_websocket_game_action, injecting room_id/sender_id (+guild_id/channel_id if provided).
+      - Calls player_connect on join and player_disconnect on exit. Unregisters ws from bucket on exit.
     """
     logger.info("[/blackjack_ws] HTTP request received from %s (will attempt WS upgrade)", request.remote)
     ws = web.WebSocketResponse()
@@ -1720,20 +1723,22 @@ async def blackjack_ws_handler(request: web.Request):
     guild_id = None
     channel_id = None
     bj_cog = None
-    registered = False
+    presence_persisted = False
+    registered_in_bucket = False
 
     try:
-        # Wait for initial TEXT frame
+        # --- 1) Robust initial handshake: wait for TEXT JSON ---
         first_msg_str = None
         while True:
             msg = await ws.receive()
+
             if msg.type == web.WSMsgType.TEXT:
                 first_msg_str = msg.data
                 break
             elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
                 continue
             elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
-                logger.info("[/blackjack_ws] Client closed before handshake.")
+                logger.info("[/blackjack_ws] Client closed before sending initial TEXT handshake.")
                 await ws.close()
                 return ws
             elif msg.type == web.WSMsgType.ERROR:
@@ -1741,10 +1746,11 @@ async def blackjack_ws_handler(request: web.Request):
                 await ws.close()
                 return ws
 
-        # Parse initial JSON
+        # --- 2) Parse JSON payload: expect room_id & sender_id (+ guild_id optional) ---
         try:
             initial = json.loads(first_msg_str)
         except json.JSONDecodeError:
+            logger.error(f"[/blackjack_ws] Malformed initial JSON: {first_msg_str!r}")
             await ws.send_str(json.dumps({"status": "error", "message": "Malformed initial JSON."}))
             await ws.close()
             return ws
@@ -1755,32 +1761,52 @@ async def blackjack_ws_handler(request: web.Request):
         channel_id = initial.get("channel_id")
 
         if not room_id or sender_id is None:
+            logger.error(f"[/blackjack_ws] Initial WS message missing room_id or sender_id: {initial}")
             await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
             await ws.close()
             return ws
 
+        # Tag socket for presence/debug parity
         setattr(ws, "_player_id", str(sender_id))
 
-        # Register in blackjack cog's bucket and send current state
+        # --- 3) Add to in-memory presence bucket for BJ ---
         bj_cog = bot.get_cog("MechanicsMain2")
         if bj_cog:
-            registered = bj_cog.register_ws_connection(ws, room_id)
-            if not registered:
+            registered_in_bucket = bj_cog.register_ws_connection(ws, room_id)
+            if not registered_in_bucket:
                 await ws.send_str(json.dumps({"status": "error", "message": "Room id invalid."}))
                 await ws.close()
                 return ws
-            try:
-                st = await bj_cog._load_state(room_id)
-                if st:
-                    await ws.send_str(json.dumps({"type": "state", "room_id": room_id, "game_state": st, "server_ts": int(time.time())}))
-            except Exception as e:
-                logger.error(f"[/blackjack_ws] Failed sending initial state: {e}", exc_info=True)
 
-        # Main loop
+        # --- 4) Send initial state snapshot (same envelope as game_was) ---
+        if bj_cog:
+            try:
+                # Prefer _load_game_state for envelope parity; fall back to _load_state if the cog only exposes that.
+                load_fn = getattr(bj_cog, "_load_game_state", None)
+                if not callable(load_fn):
+                    load_fn = getattr(bj_cog, "_load_state", None)
+                state = await load_fn(room_id) if load_fn else None
+                if state:
+                    envelope = {"type": "state", "game_state": state, "room_id": room_id, "server_ts": int(time.time())}
+                    await ws.send_str(json.dumps(envelope))
+                    logger.info(f"Sent initial game_state for BJ room '{room_id}' to new client {sender_id}.")
+            except Exception as e:
+                logger.error(f"[/blackjack_ws] Failed to send initial game state for room '{room_id}': {e}", exc_info=True)
+
+        # --- 5) Mark presence in DB/state via player_connect (parity with game_was) ---
+        if bj_cog:
+            try:
+                ok, _ = await bj_cog.player_connect(room_id=room_id, discord_id=str(sender_id))
+                presence_persisted = bool(ok)
+                logger.debug(f"[/blackjack_ws] player_connect returned ok={ok} for sender_id={sender_id} room={room_id}")
+            except Exception as e:
+                logger.error(f"[/blackjack_ws] player_connect failed for {sender_id} in {room_id}: {e}", exc_info=True)
+
+        # --- 6) Main receive loop: pings + action dispatch ---
         async for msg in ws:
             if msg.type == web.WSMsgType.TEXT:
-                raw = msg.data.strip()
-                if raw.lower() == "ping" or raw == '{"action":"ping"}':
+                raw = msg.data
+                if raw == '{"action":"ping"}' or raw.strip().lower() == 'ping':
                     await ws.send_str('{"action":"pong"}')
                     continue
                 try:
@@ -1788,13 +1814,13 @@ async def blackjack_ws_handler(request: web.Request):
                 except json.JSONDecodeError:
                     continue
 
-                if isinstance(data, dict):
-                    data.setdefault("room_id", room_id)
-                    data.setdefault("sender_id", sender_id)
-                    if guild_id is not None: data.setdefault("guild_id", guild_id)
-                    if channel_id is not None: data.setdefault("channel_id", channel_id)
+                if isinstance(data, dict) and "action" in data:
                     if bj_cog:
                         try:
+                            data.setdefault("room_id", room_id)
+                            data.setdefault("sender_id", sender_id)
+                            if guild_id is not None: data.setdefault("guild_id", guild_id)
+                            if channel_id is not None: data.setdefault("channel_id", channel_id)
                             await bj_cog.handle_websocket_game_action(data)
                         except Exception as e:
                             logger.error(f"[/blackjack_ws] Dispatch error for action={data.get('action')} r={room_id}: {e}", exc_info=True)
@@ -1806,13 +1832,14 @@ async def blackjack_ws_handler(request: web.Request):
     except Exception as e:
         logger.error(f"[/blackjack_ws] Handler error for room {room_id}: {e}", exc_info=True)
     finally:
+        # Always call player_disconnect and unregister if we were registered
         try:
             if bj_cog and room_id and sender_id is not None:
                 await bj_cog.player_disconnect(room_id=room_id, discord_id=str(sender_id))
         except Exception as e:
             logger.error(f"[/blackjack_ws] player_disconnect hook failed: {e}", exc_info=True)
         finally:
-            if registered and bj_cog:
+            if registered_in_bucket and bj_cog:
                 bj_cog.unregister_ws_connection(ws)
             return ws
 
@@ -1848,20 +1875,6 @@ async def game_leave_handler(request: web.Request):
     """
     POST /game/leave  (CORS)
     Lightweight, idempotent endpoint for navigator.sendBeacon when a game page is torn down.
-
-    Expected fields (best-effort):
-      - room_id        : str   (required to broadcast)
-      - display_name   : str   (optional; defaults to 'Player')
-      - from_name      : str   (optional pretty name, e.g., 'Table 12')
-      - to_name        : str   (optional pretty name; commonly 'the lobby')
-      - reason         : str   (optional, e.g., 'swap-fragment' | 'back-to-lobby' | 'perform-leave')
-
-    Behavior:
-      - If room_id provided, emits:
-          • {"type":"user_left"} to that room
-          • {"type":"system_notice"} "X left {from_name}." (or "X left {from} → {to}." if to_name present)
-      - Always returns 204 (no body) on success.
-      - Never throws on malformed payloads (best-effort).
     """
     try:
         data = await _read_post_any(request)
@@ -1872,10 +1885,8 @@ async def game_leave_handler(request: web.Request):
         reason = (data.get("reason") or "").strip()
 
         if not room_id:
-            # Nothing to broadcast; still return success for beacon friendliness
             return web.Response(status=204, headers=CORS_HEADERS)
 
-        # Broadcast a leave event and a friendly system line
         try:
             await _broadcast_room_json(room_id, {
                 "type": "user_left",
@@ -1889,7 +1900,6 @@ async def game_leave_handler(request: web.Request):
             else:
                 notice = f"{display_name} left {pretty_from}."
             if reason:
-                # keep it subtle; useful for diagnostics
                 notice += f" ({reason})"
             await _broadcast_room_json(room_id, {
                 "type": "system_notice",
@@ -1902,7 +1912,6 @@ async def game_leave_handler(request: web.Request):
         return web.Response(status=204, headers=CORS_HEADERS)
     except Exception as e:
         logger.error(f"/game/leave error: {e}", exc_info=True)
-        # Still be graceful for beacons
         return web.Response(status=204, headers=CORS_HEADERS)
 
 # ---------------------- AVATAR WS: /avatar_ws ----------------------
@@ -1910,7 +1919,6 @@ async def game_leave_handler(request: web.Request):
 async def _resolve_member_avatar(guild_id: int, user_id: int) -> Tuple[Optional[str], Optional[str]]:
     """
     Returns (avatar_url, display_name) for a member, or (None, None) if not found.
-    Uses cache first; falls back to API fetch. Provides a safe default avatar if needed.
     """
     try:
         guild = bot.get_guild(int(guild_id))
@@ -1927,7 +1935,7 @@ async def _resolve_member_avatar(guild_id: int, user_id: int) -> Tuple[Optional[
         if not member:
             return (None, None)
 
-        # Preferred: display_avatar (handles server avatar / global avatar / default)
+        # Preferred: display_avatar
         try:
             asset = member.display_avatar
             if hasattr(asset, "with_size"):
@@ -1948,11 +1956,6 @@ async def _resolve_member_avatar(guild_id: int, user_id: int) -> Tuple[Optional[
 async def avatar_ws_handler(request):
     """
     Lightweight WS for resolving Discord avatar URLs.
-    Usage:
-      send {"op":"get_avatar","guild_id":"123","discord_id":"456"}
-      or   {"op":"get_avatar","guild_id":"123","discord_ids":["456","789"]}
-    Replies one message per requested user with type="avatar".
-    Keeps the socket open for multiple requests; client may close anytime.
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -1979,7 +1982,7 @@ async def avatar_ws_handler(request):
                 await ws.send_json({"type": "error", "error": "invalid_payload"})
                 continue
 
-            op = data.get("op") or "get_avatar"  # default to get_avatar for back-compat
+            op = data.get("op") or "get_avatar"  # default to get_avatar
             if op != "get_avatar":
                 await ws.send_json({"type": "error", "error": "unknown_op"})
                 continue
@@ -2028,16 +2031,14 @@ async def avatar_ws_handler(request):
 # ---------------------- ADMIN WS: /admin_ws ----------------------
 
 async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name: str) -> bool:
-    """Create or update the quarantine role & channel for the guild.
-        When a new channel is created, seed it with the saved rules embed + Accept button.
-        Also ensure the quarantine role is hidden from every other channel/category."""
+    """Create or update the quarantine role & channel for the guild."""
     try:
         guild = bot.get_guild(int(guild_id))
         if not guild:
             logger.error(f"ensure_quarantine_objects: Bot not in guild {guild_id}")
             return False
 
-        # Role: create if missing (be robust about lookups)
+        # Role
         role = _find_role_fuzzy(guild, role_name)
         if not role:
             role = await guild.create_role(
@@ -2047,7 +2048,7 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             )
             logger.info(f"Created role '{role_name}' in guild {guild_id}")
 
-        # Channel: create or update with proper overwrites for quarantine channel itself
+        # Channel overwrites
         overwrites = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
             role: discord.PermissionOverwrite(
@@ -2058,12 +2059,10 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             )
         }
 
-        # Try fuzzy find channel (Discord may slugify)
+        # Channel: create or update
         channel = _find_text_channel_fuzzy(guild, channel_name)
-
         created = False
         if not channel:
-            # Create with slug-like name for consistency
             desired_name = _slugify_channel_name(channel_name) or channel_name
             channel = await guild.create_text_channel(
                 desired_name,
@@ -2076,7 +2075,7 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
             await channel.edit(overwrites=overwrites, reason="Ensure quarantine channel permissions")
             logger.info(f"Updated channel '{channel.name}' overwrites in guild {guild_id}")
 
-        # Enforce deny on all other channels/categories for the quarantine role
+        # Global deny elsewhere
         await _enforce_quarantine_visibility(guild, role, channel)
 
         # If newly created, seed the Read Me message with Accept button
@@ -2091,7 +2090,6 @@ async def ensure_quarantine_objects(guild_id: str, role_name: str, channel_name:
         logger.error(f"ensure_quarantine_objects error: {e}", exc_info=True)
         return False
 
-# Expose to other modules (e.g., flag.py) so they can enforce after assigning the role
 bot.ensure_quarantine_objects = ensure_quarantine_objects
 
 async def admin_ws_handler(request):
@@ -2103,8 +2101,6 @@ async def admin_ws_handler(request):
     """
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-
-    # Success log on upgrade
     logger.info("✅ [/admin_ws] WebSocket upgraded successfully from %s", request.remote)
 
     try:
@@ -2186,7 +2182,7 @@ async def start_web_server():
     bot.web_app.router.add_get('/game_was', game_was_handler)
     logger.info("🛠️  Registered WebSocket route: /game_was")
 
-    # NEW: Blackjack WS route
+    # Blackjack WS route (identical semantics)
     bot.web_app.router.add_get('/blackjack_ws', blackjack_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /blackjack_ws")
 
@@ -2199,7 +2195,7 @@ async def start_web_server():
     bot.web_app.router.add_get('/avatar_ws', avatar_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /avatar_ws")
 
-    # NEW: Game list websocket (lobby list + pruning, plus on-demand get_rooms)
+    # NEW: Game list websocket
     bot.web_app.router.add_get('/gamelist_info', gamelist_info_ws_handler)
     logger.info("🛠️  Registered WebSocket route: /gamelist_info")
 
@@ -2207,7 +2203,6 @@ async def start_web_server():
     bot.web_app.router.add_get('/gamelist', gamelist_http_handler)
     logger.info("🛠️  Registered GET route: /gamelist")
 
-    # Log routes again once the server is started and accepting connections
     bot.web_app.on_startup.append(_on_web_started)
 
     port = int(os.getenv("PORT", 8080))
@@ -2378,14 +2373,6 @@ async def hourly_db_check():
 async def award_kekchipz_loop():
     """
     Every minute, iterate all guild members and award kekchipz to those currently online.
-    Tiers:
-      < 30 min:        +1/min
-      30–59 min:       +2/min
-      60–89 min:       +3/min
-      90–119 min:      +4/min
-      120–179 min:     +4/min
-      180+ min:        +5/min
-    Resets when user goes offline.
     """
     now = time.time()
     increments = {}  # {(guild_id, user_id): delta}
@@ -2412,7 +2399,7 @@ async def award_kekchipz_loop():
             if minutes_due <= 0:
                 continue
 
-            # Cap catch-up to avoid huge spikes if the loop stalls
+            # Cap catch-up
             minutes_to_process = min(minutes_due, 10)
             delta = 0
 
@@ -2452,8 +2439,7 @@ async def award_kekchipz_loop():
 async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
     """
     Ensure a user exists in discord_users. On first insert, also capture their current roles
-    and store them in role_data as JSON: {"roles": ["<role_id>", ...]} (excluding @everyone).
-    Also initializes current_room_id to NULL (meaning: not in any room).
+    and store them in role_data as JSON, and initialize current_room_id to NULL.
     """
     if not all([DB_USER, DB_PASSWORD, DB_HOST]):
         logger.error("Missing DB credentials.")
@@ -2476,20 +2462,18 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
             )
             (count,) = await cursor.fetchone()
             if count == 0:
-                # Build initial json_data
                 initial_json_data = json.dumps({"warnings": {}})
 
-                # Try to capture roles (IDs) for role_data, exclude @everyone
+                # Capture roles (IDs), exclude @everyone
                 role_ids = []
                 try:
-                    guild = bot.get_guild(int(guild_id))
+                    guild_obj = bot.get_guild(int(guild_id))
                     member = None
-                    if guild:
-                        member = guild.get_member(int(discord_id))
+                    if guild_obj:
+                        member = guild_obj.get_member(int(discord_id))
                         if member is None:
-                            # Fallback to API fetch if not cached
                             try:
-                                member = await guild.fetch_member(int(discord_id))
+                                member = await guild_obj.fetch_member(int(discord_id))
                             except Exception:
                                 member = None
                     if member:
@@ -2502,7 +2486,7 @@ async def add_user_to_db_if_not_exists(guild_id, user_name, discord_id):
                 await cursor.execute(
                     "INSERT INTO discord_users (guild_id, user_name, discord_id, kekchipz, json_data, role_data, current_room_id) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json, None)  # None -> NULL
+                    (str(guild_id), user_name, str(discord_id), 2000, initial_json_data, role_data_json, None)
                 )
                 logger.info(f"Added new user '{user_name}' to DB with 2000 kekchipz, role_data={role_data_json}, current_room_id=NULL.")
     except Exception as e:
@@ -2576,8 +2560,7 @@ async def load_cogs():
         os.makedirs("cogs")
 
     # Order-sensitive cogs first (dependencies)
-    # ADDED: mechanics_main2 for Blackjack
-    ordered_cogs = ["mechanics_main", "mechanics_main2", "communication_main"]  # Keep as-is; if missing, it's fine.
+    ordered_cogs = ["mechanics_main", "mechanics_main2", "communication_main"]
     loaded_cogs_set = set()
 
     for cog_name in ordered_cogs:

@@ -1024,14 +1024,13 @@ class MechanicsMain2(commands.Cog):
                 pdata = data.get("player_data", {}) or {}
                 seat_id = pdata.get("seat_id")
                 player_id = str(pdata.get("discord_id") or data.get("sender_id"))
-                reason = "ok"
                 if seat_id and player_id:
                     # already at table? noop
                     if any(str(p.get("discord_id")) == player_id for p in players):
-                        reason = "already_seated"
+                        pass
                     # seat taken? noop
                     elif any(str(p.get("seat_id")) == str(seat_id) for p in players):
-                        reason = "seat_taken"
+                        pass
                     else:
                         is_mid_hand = state.get("status") not in ("pre-game", "round_over")
                         players.append({
@@ -1039,8 +1038,10 @@ class MechanicsMain2(commands.Cog):
                             "name": pdata.get("name") or display_name or "Player",
                             "seat_id": seat_id,
                             "avatar_url": pdata.get("avatar_url"),
+                            # PARITY WITH TH SEATING: set bet=0 on sit; total_chips + total_contributed fields
+                            "total_chips": 1000,
                             "hand": [],
-                            "bet": state.get("min_bet", MODE_MIN_BET["1"]),
+                            "bet": 0,
                             "stood": False, "busted": False,
                             "doubled": False, "surrendered": False,
                             "acted": False,
@@ -1063,11 +1064,12 @@ class MechanicsMain2(commands.Cog):
                             self._mark_dirty(state)
                             self._add_room_active(room_id)
                 else:
-                    reason = "missing_fields"
-                _log("sit_attempt", room_id=room_id, player_id=player_id or sender_id, seat_id=seat_id, result=reason)
+                    # missing fields -> ignore (same as TH's noop behavior)
+                    pass
 
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("sit_attempt", room_id=room_id, player_id=player_id or sender_id, seat_id=seat_id)
                 return
 
             if action == "player_leave":
@@ -1093,11 +1095,13 @@ class MechanicsMain2(commands.Cog):
                 if not self._find_player(state, sender_id):
                     players.append({
                         "discord_id": sender_id, "name": display_name,
-                        "hand": [], "bet": state.get("min_bet", MODE_MIN_BET["1"]),
+                        "hand": [], "bet": 0,
                         "stood": False, "busted": False,
                         "doubled": False, "surrendered": False, "acted": False,
                         "is_spectating": True, "in_hand": False,
-                        "connected": True
+                        "connected": True,
+                        "total_contributed": 0,
+                        "total_chips": 1000,
                     })
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)

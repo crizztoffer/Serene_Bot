@@ -1696,6 +1696,126 @@ async def game_was_handler(request):
                 mechanics_cog.unregister_ws_connection(ws)
             return ws
 
+# ---------------------- (NEW) Blackjack WS: /blackjack_ws ----------------------
+async def blackjack_ws_handler(request: web.Request):
+    """
+    Blackjack WebSocket: mirrors /game_was flow but targets MechanicsMain2 (Blackjack).
+    - Initial TEXT JSON must include: room_id, sender_id (guild_id/channel_id optional).
+    - Registers connection in blackjack cog's WS bucket for broadcasting.
+    - Forwards subsequent JSON frames to MechanicsMain2.handle_websocket_game_action.
+    """
+    logger.info("[/blackjack_ws] HTTP request received from %s (will attempt WS upgrade)", request.remote)
+    ws = web.WebSocketResponse()
+    try:
+        ok = await ws.prepare(request)
+        logger.info("[/blackjack_ws] prepare() returned %s — upgrade %s", ok, "OK" if ok else "FAILED")
+    except Exception as e:
+        logger.error(f"[/blackjack_ws] prepare() raised: {e}", exc_info=True)
+        return web.Response(text="Upgrade failed", status=400)
+
+    logger.info("✅ [/blackjack_ws] WebSocket upgraded successfully from %s — endpoint is live", request.remote)
+
+    room_id = None
+    sender_id = None
+    guild_id = None
+    channel_id = None
+    bj_cog = None
+    registered = False
+
+    try:
+        # Wait for initial TEXT frame
+        first_msg_str = None
+        while True:
+            msg = await ws.receive()
+            if msg.type == web.WSMsgType.TEXT:
+                first_msg_str = msg.data
+                break
+            elif msg.type in (web.WSMsgType.PING, web.WSMsgType.PONG):
+                continue
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info("[/blackjack_ws] Client closed before handshake.")
+                await ws.close()
+                return ws
+            elif msg.type == web.WSMsgType.ERROR:
+                logger.error(f"[/blackjack_ws] WS error before handshake: {ws.exception()}")
+                await ws.close()
+                return ws
+
+        # Parse initial JSON
+        try:
+            initial = json.loads(first_msg_str)
+        except json.JSONDecodeError:
+            await ws.send_str(json.dumps({"status": "error", "message": "Malformed initial JSON."}))
+            await ws.close()
+            return ws
+
+        room_id = initial.get("room_id")
+        sender_id = initial.get("sender_id")
+        guild_id = initial.get("guild_id")
+        channel_id = initial.get("channel_id")
+
+        if not room_id or sender_id is None:
+            await ws.send_str(json.dumps({"status": "error", "message": "Missing room_id or sender_id."}))
+            await ws.close()
+            return ws
+
+        setattr(ws, "_player_id", str(sender_id))
+
+        # Register in blackjack cog's bucket and send current state
+        bj_cog = bot.get_cog("MechanicsMain2")
+        if bj_cog:
+            registered = bj_cog.register_ws_connection(ws, room_id)
+            if not registered:
+                await ws.send_str(json.dumps({"status": "error", "message": "Room id invalid."}))
+                await ws.close()
+                return ws
+            try:
+                st = await bj_cog._load_state(room_id)
+                if st:
+                    await ws.send_str(json.dumps({"type": "state", "room_id": room_id, "game_state": st, "server_ts": int(time.time())}))
+            except Exception as e:
+                logger.error(f"[/blackjack_ws] Failed sending initial state: {e}", exc_info=True)
+
+        # Main loop
+        async for msg in ws:
+            if msg.type == web.WSMsgType.TEXT:
+                raw = msg.data.strip()
+                if raw.lower() == "ping" or raw == '{"action":"ping"}':
+                    await ws.send_str('{"action":"pong"}')
+                    continue
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
+                if isinstance(data, dict):
+                    data.setdefault("room_id", room_id)
+                    data.setdefault("sender_id", sender_id)
+                    if guild_id is not None: data.setdefault("guild_id", guild_id)
+                    if channel_id is not None: data.setdefault("channel_id", channel_id)
+                    if bj_cog:
+                        try:
+                            await bj_cog.handle_websocket_game_action(data)
+                        except Exception as e:
+                            logger.error(f"[/blackjack_ws] Dispatch error for action={data.get('action')} r={room_id}: {e}", exc_info=True)
+
+            elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.CLOSING, web.WSMsgType.CLOSED):
+                logger.info(f"[/blackjack_ws] Closing for player {sender_id} in room {room_id}. Reason: {msg.type.name}")
+                break
+
+    except Exception as e:
+        logger.error(f"[/blackjack_ws] Handler error for room {room_id}: {e}", exc_info=True)
+    finally:
+        try:
+            if bj_cog and room_id and sender_id is not None:
+                await bj_cog.player_disconnect(room_id=room_id, discord_id=str(sender_id))
+        except Exception as e:
+            logger.error(f"[/blackjack_ws] player_disconnect hook failed: {e}", exc_info=True)
+        finally:
+            if registered and bj_cog:
+                bj_cog.unregister_ws_connection(ws)
+            return ws
+
 # ---------------------- (NEW) Tiny HTTP endpoint for sendBeacon leaves ----------------------
 
 async def _read_post_any(request: web.Request) -> dict:
@@ -2065,6 +2185,10 @@ async def start_web_server():
     # WS endpoints
     bot.web_app.router.add_get('/game_was', game_was_handler)
     logger.info("🛠️  Registered WebSocket route: /game_was")
+
+    # NEW: Blackjack WS route
+    bot.web_app.router.add_get('/blackjack_ws', blackjack_ws_handler)
+    logger.info("🛠️  Registered WebSocket route: /blackjack_ws")
 
     bot.web_app.router.add_get('/chat_ws', chat_websocket_handler)  # Chat WS
     logger.info("🛠️  Registered WebSocket route: /chat_ws")
@@ -2452,7 +2576,8 @@ async def load_cogs():
         os.makedirs("cogs")
 
     # Order-sensitive cogs first (dependencies)
-    ordered_cogs = ["mechanics_main", "communication_main"]  # Keep as-is; if missing, it's fine.
+    # ADDED: mechanics_main2 for Blackjack
+    ordered_cogs = ["mechanics_main", "mechanics_main2", "communication_main"]  # Keep as-is; if missing, it's fine.
     loaded_cogs_set = set()
 
     for cog_name in ordered_cogs:

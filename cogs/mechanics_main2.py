@@ -3,6 +3,7 @@ import os
 import json
 import time
 import asyncio
+import logging
 from typing import Dict, List, Optional, Tuple
 from discord.ext import commands, tasks
 import aiomysql
@@ -25,6 +26,90 @@ MODE_MIN_BET = {
     "3": 25,
     "4": 100,
 }
+
+# ===================== WS DEBUG LOGGING =====================
+def _init_logger() -> logging.Logger:
+    """
+    blackjack_ws logger with env-driven configuration.
+    Env:
+      BJ_WS_LOG_LEVEL    -> logging level (DEBUG/INFO/WARNING/ERROR)
+      BJ_WS_LOG_JSON     -> "1" to emit JSON lines, else human-readable
+      BJ_WS_LOG_PAYLOADS -> "1" to include compact payload bodies (inbound)
+    """
+    name = "blackjack_ws"
+    logger = logging.getLogger(name)
+
+    # Only configure handlers once
+    if getattr(logger, "_bj_configured", False):
+        return logger
+
+    level_name = (os.getenv("BJ_WS_LOG_LEVEL") or "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
+
+    json_mode = os.getenv("BJ_WS_LOG_JSON") == "1"
+
+    class _JsonFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            base = {
+                "ts": int(time.time()),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+            # Merge extra dict if present
+            if hasattr(record, "extra"):
+                try:
+                    base.update(record.extra)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            return json.dumps(base, separators=(",", ":"), ensure_ascii=False)
+
+    class _TextFormatter(logging.Formatter):
+        def format(self, record: logging.LogRecord) -> str:
+            prefix = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {record.levelname:<7} {record.name}: "
+            msg = record.getMessage()
+            if hasattr(record, "extra"):
+                try:
+                    x = record.extra  # type: ignore[attr-defined]
+                    if x:
+                        msg += " | " + ", ".join(f"{k}={x[k]}" for k in sorted(x))
+                except Exception:
+                    pass
+            return prefix + msg
+
+    handler = logging.StreamHandler()
+    handler.setLevel(level)
+    handler.setFormatter(_JsonFormatter() if json_mode else _TextFormatter())
+    logger.addHandler(handler)
+    logger._bj_configured = True  # type: ignore[attr-defined]
+
+    return logger
+
+LOG = _init_logger()
+LOG_INCLUDE_PAYLOADS = os.getenv("BJ_WS_LOG_PAYLOADS") == "1"
+
+def _log(event: str, level: int = logging.INFO, **fields):
+    """
+    Emit a normalized log line. Keeps messages short; puts details in the 'extra' bag.
+    """
+    try:
+        msg = event
+        rec = logging.LogRecord(LOG.name, level, __file__, 0, msg, args=None, exc_info=None)
+        setattr(rec, "extra", fields)
+        LOG.handle(rec)
+    except Exception:
+        # never let logging crash the game loop
+        pass
+
+def _payload_size_snippet(obj) -> Tuple[int, Optional[str]]:
+    try:
+        s = json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+        return len(s), (s if LOG_INCLUDE_PAYLOADS else None)
+    except Exception:
+        return 0, None
+# ===========================================================
+
 
 # ====== DB helpers (mirror your style in bot.py) ======
 async def _db_connect_dict():
@@ -129,9 +214,11 @@ class MechanicsMain2(commands.Cog):
 
         # kick off timer loop
         self.check_game_timers.start()
+        _log("mechanics_init", room_id="*", note="timer_loop_started")
 
     def cog_unload(self):
         self.check_game_timers.cancel()
+        _log("mechanics_unload", room_id="*")
 
     # ------------- Websocket presence API expected by bot.py -------------
 
@@ -147,10 +234,12 @@ class MechanicsMain2(commands.Cog):
             self._ws_rooms[rid] = set()
         self._ws_rooms[rid].add(ws)
         setattr(ws, "_bj_room_id", rid)
+        _log("ws_register", room_id=rid, player_id=getattr(ws, "_player_id", None), count=len(self._ws_rooms[rid]))
         return True
 
     def unregister_ws_connection(self, ws):
         rid = getattr(ws, "_bj_room_id", None)
+        pid = getattr(ws, "_player_id", None)
         if not rid:
             return
         try:
@@ -159,8 +248,9 @@ class MechanicsMain2(commands.Cog):
                 bucket.discard(ws)
             if bucket and not bucket:
                 self._ws_rooms.pop(rid, None)
-        except Exception:
-            pass
+            _log("ws_unregister", room_id=rid, player_id=pid, remaining=len(self._ws_rooms.get(rid, set())))
+        except Exception as e:
+            _log("ws_unregister_error", logging.ERROR, room_id=rid, player_id=pid, error=str(e))
 
     # ---- presence tagging helpers (parity with TH) ----
     def _is_ws_connected(self, room_id: str, player_id: str) -> bool:
@@ -187,6 +277,7 @@ class MechanicsMain2(commands.Cog):
             self._ensure_defaults(state)
             p = self._find_player(state, str(discord_id))
             if not p:
+                _log("presence_connect_noop", room_id=rid, player_id=discord_id)
                 return True, None
             changed = False
             if p.get("connected") is not True:
@@ -200,7 +291,9 @@ class MechanicsMain2(commands.Cog):
             if changed:
                 self._mark_dirty(state)
                 await self._save_game_state(rid, state)
+                _log("presence_connect", room_id=rid, player_id=discord_id)
         except Exception as e:
+            _log("presence_connect_error", logging.ERROR, room_id=rid, player_id=discord_id, error=str(e))
             return False, str(e)
         return True, None
 
@@ -214,6 +307,7 @@ class MechanicsMain2(commands.Cog):
             self._ensure_defaults(state)
             p = self._find_player(state, str(discord_id))
             if not p:
+                _log("presence_disconnect_noop", room_id=rid, player_id=discord_id)
                 return
             changed = False
             if p.get("connected") is not False:
@@ -230,8 +324,9 @@ class MechanicsMain2(commands.Cog):
             if changed:
                 self._mark_dirty(state)
                 await self._save_game_state(rid, state)
-        except Exception:
-            pass
+                _log("presence_disconnect", room_id=rid, player_id=discord_id, grace_secs=DISCONNECT_GRACE_SECS)
+        except Exception as e:
+            _log("presence_disconnect_error", logging.ERROR, room_id=rid, player_id=discord_id, error=str(e))
 
     # ---------------------- DB state helpers ----------------------
 
@@ -317,15 +412,23 @@ class MechanicsMain2(commands.Cog):
                         dead.append(ws)
                         continue
                     await ws.send_str(msg)
-                except Exception:
+                except Exception as e:
                     dead.append(ws)
+                    _log("ws_send_error", logging.ERROR, room_id=room_id, error=str(e))
             for ws in dead:
                 try:
                     bucket.discard(ws)
                 except Exception:
                     pass
-        except Exception:
-            pass
+            _log(
+                "broadcast",
+                room_id=room_id,
+                kind=str(payload.get("type") or payload.get("action") or "unknown"),
+                recipients=len(bucket),
+                bytes=len(msg),
+            )
+        except Exception as e:
+            _log("broadcast_error", logging.ERROR, room_id=room_id, error=str(e))
 
     async def _broadcast_state(self, room_id: str, state: dict):
         await self._broadcast(
@@ -369,21 +472,19 @@ class MechanicsMain2(commands.Cog):
         }
 
     async def _broadcast_tick(self, room_id: str, state: dict):
-        await self._broadcast(
-            room_id,
-            {
-                "type": "tick",
-                "room_id": room_id,
-                "server_ts": _now(),
-                "current_round": state.get("status"),
-                "action_deadline_epoch": state.get("action_deadline_epoch"),
-                "round_timer_start": state.get("round_timer_start"),
-                "round_timer_secs": state.get("round_timer_secs"),
-                "current_actor": self._actor_id(state),
-                "ui_for_current_actor": self._build_ui_hint_for_current_actor(state),
-                "__rev": int(state.get("__rev") or 0),
-            }
-        )
+        pkt = {
+            "type": "tick",
+            "room_id": room_id,
+            "server_ts": _now(),
+            "current_round": state.get("status"),
+            "action_deadline_epoch": state.get("action_deadline_epoch"),
+            "round_timer_start": state.get("round_timer_start"),
+            "round_timer_secs": state.get("round_timer_secs"),
+            "current_actor": self._actor_id(state),
+            "ui_for_current_actor": self._build_ui_hint_for_current_actor(state),
+            "__rev": int(state.get("__rev") or 0),
+        }
+        await self._broadcast(room_id, pkt)
 
     # ---------------------- Game helpers ----------------------
 
@@ -510,6 +611,7 @@ class MechanicsMain2(commands.Cog):
         # clear debounce
         state.pop("_empty_since", None)
         self._mark_dirty(state)
+        _log("force_pre_game", room_id=state.get("room_id"))
         return True
 
     # --------- DC reap (parity with TH) ---------
@@ -533,6 +635,7 @@ class MechanicsMain2(commands.Cog):
         # Remove from table entirely (parity with TH)
         state["players"] = [q for q in state.get("players", []) if str(q.get("discord_id")) != pid]
         self._mark_dirty(state)
+        _log("player_removed", room_id=state.get("room_id"), player_id=pid, in_round=in_round, was_current=was_current)
 
         # Force pre-game if no one is seated
         self._force_pre_game_if_empty_seats(state)
@@ -566,6 +669,7 @@ class MechanicsMain2(commands.Cog):
                 self._mark_dirty(state)
                 changed = True
                 t0 = now
+                _log("reap_mark_dc", room_id=room_id, player_id=pid)
 
             if not t0:
                 continue
@@ -579,6 +683,7 @@ class MechanicsMain2(commands.Cog):
                 (state.setdefault("pending_disconnects", {})).pop(pid, None)
                 self._mark_dirty(state)
                 changed = True
+                _log("reap_reconnect", room_id=room_id, player_id=pid)
                 continue
 
             # if grace not elapsed, skip
@@ -591,6 +696,7 @@ class MechanicsMain2(commands.Cog):
             changed = True
             if action == "advance_phase":
                 need_advance = True
+            _log("reap_remove", room_id=room_id, player_id=pid, advance=need_advance)
 
         return changed, need_advance
 
@@ -610,6 +716,7 @@ class MechanicsMain2(commands.Cog):
                 state["pending_disconnects"].pop(pid, None)
                 self._mark_dirty(state)
                 changed = True
+                _log("reap_pend_cleared_live", room_id=room_id, player_id=pid)
                 continue
 
             action = self._remove_player_by_id(state, pid)
@@ -618,6 +725,7 @@ class MechanicsMain2(commands.Cog):
             changed = True
             if action == "advance_phase":
                 need_advance = True
+            _log("reap_pend_removed", room_id=room_id, player_id=pid, advance=need_advance)
 
         return changed, need_advance
 
@@ -628,6 +736,7 @@ class MechanicsMain2(commands.Cog):
         if not state:
             state = self._new_state()
             await self._save_game_state(room_id, state)
+            _log("room_bootstrap", room_id=room_id)
         return state
 
     async def _start_round_if_possible(self, room_id: str, state: dict):
@@ -686,6 +795,7 @@ class MechanicsMain2(commands.Cog):
         # optional: set an action deadline like TH (client uses it for countdown)
         state["action_deadline_epoch"] = _now() + self.ACTION_SECS
         self._mark_dirty(state)
+        _log("round_start", room_id=room_id, players=len(players))
 
     def _finish_dealer_and_score(self, state: dict):
         dealer = state.get("dealer") or {}
@@ -739,6 +849,7 @@ class MechanicsMain2(commands.Cog):
         state["round_timer_start"] = _now()
         state["round_timer_secs"] = self.POST_ROUND_WAIT_SECS
         self._mark_dirty(state)
+        _log("round_showdown", room_id=state.get("room_id"), dealer_total=dealer_total)
 
     # ---------------------- Timer loop ----------------------
     def _add_room_active(self, room_id: str):
@@ -795,6 +906,7 @@ class MechanicsMain2(commands.Cog):
                             p["stood"] = True
                             p["acted"] = True
                             self._mark_dirty(state)
+                            _log("auto_stand_timeout", room_id=rid, player_id=actor_id)
                         if self._everyone_acted_or_busted(state):
                             self._finish_dealer_and_score(state)
                         else:
@@ -813,6 +925,7 @@ class MechanicsMain2(commands.Cog):
                         state["round_timer_secs"] = None
                         state["action_deadline_epoch"] = None
                         self._mark_dirty(state)
+                        _log("status_round_over", room_id=rid)
 
                 # if a reaper said advance phase mid-round, finish dealer now
                 if need_advance and state.get("status") == "in_round":
@@ -831,7 +944,8 @@ class MechanicsMain2(commands.Cog):
 
                 self._add_room_active(rid)
 
-            except Exception:
+            except Exception as e:
+                _log("timer_loop_error", logging.ERROR, room_id=rid, error=str(e))
                 # stop polling this room if it keeps erroring
                 try:
                     self.rooms_with_active_timers.discard(rid)
@@ -874,6 +988,17 @@ class MechanicsMain2(commands.Cog):
         if not room_id or not sender_id or not action:
             return
 
+        # Log inbound (compact)
+        size, snippet = _payload_size_snippet(data)
+        _log(
+            "ws_inbound",
+            room_id=room_id,
+            player_id=sender_id,
+            action=action,
+            bytes=size,
+            payload=(snippet if LOG_INCLUDE_PAYLOADS else None),
+        )
+
         async with self._lock_for(room_id):
             state = await self._ensure_room(room_id)
             self._ensure_defaults(state)
@@ -899,13 +1024,14 @@ class MechanicsMain2(commands.Cog):
                 pdata = data.get("player_data", {}) or {}
                 seat_id = pdata.get("seat_id")
                 player_id = str(pdata.get("discord_id") or data.get("sender_id"))
+                reason = "ok"
                 if seat_id and player_id:
                     # already at table? noop
                     if any(str(p.get("discord_id")) == player_id for p in players):
-                        pass
+                        reason = "already_seated"
                     # seat taken? noop
                     elif any(str(p.get("seat_id")) == str(seat_id) for p in players):
-                        pass
+                        reason = "seat_taken"
                     else:
                         is_mid_hand = state.get("status") not in ("pre-game", "round_over")
                         players.append({
@@ -936,6 +1062,9 @@ class MechanicsMain2(commands.Cog):
                             state["initial_countdown_triggered"] = True
                             self._mark_dirty(state)
                             self._add_room_active(room_id)
+                else:
+                    reason = "missing_fields"
+                _log("sit_attempt", room_id=room_id, player_id=player_id or sender_id, seat_id=seat_id, result=reason)
 
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
@@ -948,6 +1077,7 @@ class MechanicsMain2(commands.Cog):
                 self._add_room_active(room_id)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("leave", room_id=room_id, player_id=sender_id, outcome=outcome)
                 return
 
             # ---- Game setup / presence-level actions ----
@@ -955,6 +1085,7 @@ class MechanicsMain2(commands.Cog):
                 state = self._new_state()
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("create_room", room_id=room_id)
                 return
 
             if action == "join":
@@ -971,6 +1102,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("join", room_id=room_id, player_id=sender_id)
                 return
 
             if action == "set_bet":
@@ -985,6 +1117,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("set_bet", room_id=room_id, player_id=sender_id, bet=bet)
                 return
 
             if action == "deal":
@@ -992,6 +1125,7 @@ class MechanicsMain2(commands.Cog):
                     await self._start_round_if_possible(room_id, state)
                     await self._save_game_state(room_id, state)
                     await self._broadcast_state(room_id, state)
+                    _log("deal", room_id=room_id, player_id=sender_id)
                 return
 
             # ---- Per-move actions ----
@@ -1020,6 +1154,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("move_hit", room_id=room_id, player_id=sender_id, total=total)
                 return
 
             if action == "stand":
@@ -1038,6 +1173,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("move_stand", room_id=room_id, player_id=sender_id)
                 return
 
             if action == "double":
@@ -1064,6 +1200,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("move_double", room_id=room_id, player_id=sender_id, total=total, bet=p.get("bet"))
                 return
 
             if action == "surrender":
@@ -1083,6 +1220,7 @@ class MechanicsMain2(commands.Cog):
                     self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("move_surrender", room_id=room_id, player_id=sender_id)
                 return
 
             if action == "reset_round":
@@ -1096,9 +1234,11 @@ class MechanicsMain2(commands.Cog):
                 self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
                 await self._broadcast_state(room_id, state)
+                _log("reset_round", room_id=room_id, player_id=sender_id)
                 return
 
             # Unknown action -> ignore
+            _log("ws_inbound_unknown", room_id=room_id, player_id=sender_id, action=action)
             return
 
 

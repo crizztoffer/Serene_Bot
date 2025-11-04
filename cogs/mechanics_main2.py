@@ -705,7 +705,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state["dealer_reveal_triggered"] = False
         state["_betting_skip_round"] = {}
         for p in state.get("players", []):
-            p["bet"] = 0  # reset all bets entering betting
+            p["bet"] = 0  # reset when entering betting
             p["hands"] = []
         # establish first betting actor & timer
         state["current_actor"] = self._first_betting_actor(state, state.get("room_id") or "")
@@ -1198,6 +1198,17 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
           - 'advance_phase'               (universal/admin)
           - 'player_action' with moves: 'bet','hit','stand','double','split','surrender','insurance'
         """
+        # --- NEW: normalize payload to dict in case upstream passed a JSON string ---
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                logger.error("handle_websocket_game_action: received non-dict and non-JSON payload; ignoring")
+                return
+        if not isinstance(data, dict):
+            logger.error("handle_websocket_game_action: payload is not a dict; ignoring")
+            return
+
         action = data.get('action')
         room_id = self._normalize_room_id(data.get('room_id'))
 
@@ -1232,6 +1243,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
+                if not isinstance(pdata, dict):
+                    pdata = {}
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or data.get('sender_id'))
                 if seat_id and player_id:
@@ -1391,9 +1404,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             self._mark_dirty(state)
                             self._add_room_active(room_id)
 
-                # final save/broadcast if changed — **authoritative save** from action handler
+                # final save/broadcast if changed — authoritative save from action handler
                 if int(state.get("__rev") or 0) != int(before_rev):
-                    await self._save_game_state(room_id, state)   # <-- no optimistic check
+                    await self._save_game_state(room_id, state)
                     await self._broadcast_state(room_id, state)
 
         except Exception as e:

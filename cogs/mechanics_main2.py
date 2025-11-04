@@ -94,13 +94,63 @@ def safe_int(x, default=0):
     try: return int(x)
     except: return default
 
-# ------------------------------------------------------------------------------
+# ---------------- Card-code hygiene (NO BACKEND HIDING) ----------------
+# The client controls visibility. We *always* transmit real codes.
+VALID_SUITS = {"S","H","D","C"}
+def _sanitize_card_dict(cd: Optional[dict]) -> Optional[dict]:
+    """
+    Ensure a card dict has a real code (never '??', never blank), and normalize to
+    the output format expected by the client.
+    """
+    if not cd:
+        return None
+    code = (cd.get("code") or "").strip()
+    rank = (cd.get("rank") or "").strip().upper()
+    suit = (cd.get("suit") or "").strip().upper()
+
+    # If a Card object slipped through, force to output format:
+    if hasattr(cd, "to_output_format"):
+        try:
+            cd = cd.to_output_format()
+            code = (cd.get("code") or "").strip()
+            rank = (cd.get("rank") or "").strip().upper()
+            suit = (cd.get("suit") or "").strip().upper()
+        except Exception:
+            return None
+
+    # Reject any placeholder/hidden marker:
+    if code in ("??", "BACK", "HIDE", "X", "xx", "XX"):
+        return None
+
+    # Normalize:
+    if not rank and code:
+        # derive rank/suit from code like 'AS' or '0D'
+        rank = code[:-1].upper()
+        suit = code[-1:].upper()
+    if rank == "10":  # frontend prefers '0' for tens
+        rank = "0"
+    if suit not in VALID_SUITS or not rank:
+        return None
+
+    out_code = f"{rank}{suit}"
+    return {"code": out_code, "rank": rank, "suit": suit}
+
+def _sanitize_cards_list(cards: Optional[List[dict]]) -> List[dict]:
+    out = []
+    for cd in (cards or []):
+        norm = _sanitize_card_dict(cd)
+        if norm:
+            out.append(norm)
+    return out
+
+# ----------------------------------------------------------------------
 # The Cog
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
     """
     Blackjack mechanics to be used behind the blackjack_ws websocket.
-    Universal actions preserved: player_sit, player_leave, advance_phase.
+    IMPORTANT: The server NEVER hides cards. It always sends real codes/dicts.
+               The client (gameth.php) decides what to render face-up/back.
     """
     def __init__(self, bot):
         self.bot = bot
@@ -182,6 +232,12 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if conn: conn.close()
 
     async def _save_game_state(self, room_id: str, state: dict):
+        # As a last line of defense, sanitize every save to guarantee real codes:
+        try:
+            self._sanitize_state_cards(state)
+        except Exception as e:
+            logger.error(f"Sanitize before save failed: {e}", exc_info=True)
+
         conn = None
         try:
             conn = await self._get_db_connection()
@@ -199,6 +255,16 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             raise
         finally:
             if conn: conn.close()
+
+    def _sanitize_state_cards(self, state: dict):
+        """Make sure no placeholder/back markers exist anywhere in state."""
+        # dealer
+        state["dealer_hand"] = _sanitize_cards_list(state.get("dealer_hand") or [])
+        # players
+        for p in state.get("players", []):
+            hands = p.get("hands") or []
+            for h in hands:
+                h["cards"] = _sanitize_cards_list(h.get("cards") or [])
 
     async def _save_if_current(self, room_id: str, state: dict, expected_rev: int) -> bool:
         try:
@@ -277,6 +343,12 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
     # ---------------- Broadcasts ----------------
     async def _broadcast_state(self, room_id: str, state: dict):
+        # sanitize before sending, as well:
+        try:
+            self._sanitize_state_cards(state)
+        except Exception as e:
+            logger.error(f"Sanitize before broadcast failed: {e}", exc_info=True)
+
         bucket = self.bot.ws_rooms.get(room_id, set())
         if not bucket: return
         envelope = {
@@ -480,6 +552,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return d
 
     def _deal_card(self, state: dict) -> dict:
+        """
+        ALWAYS returns a real card dict (never placeholders).
+        """
         deck = Deck(cards_data=state["deck"]) if state.get("deck") else self._fresh_deck()
         c = deck.deal_card()
         state["deck"] = deck.to_output_format()
@@ -533,10 +608,13 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         for p in state.get("players", []):
             if not p.get("hands"): continue
             cards = p["hands"][0]["cards"]
-            tot, is_bj, is_busted, _ = bj_total(cards)
+            # sanitize just in case:
+            p["hands"][0]["cards"] = _sanitize_cards_list(cards)
+            tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
             p["hands"][0]["is_busted"] = is_busted
 
+        state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])
         state["dealer_total"] = dt
         self._mark_dirty(state)
@@ -576,9 +654,10 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             total, is_bj, is_busted, soft = bj_total(state.get("dealer_hand") or [])
             if total < 17:
                 c = self._deal_card(state)
-                if c: state["dealer_hand"].append(c)
+                if c: state["dealer_hand"].append(_sanitize_card_dict(c))
                 continue
             break
+        state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, _, _ = bj_total(state["dealer_hand"])
         state["dealer_total"] = dt
         self._mark_dirty(state)
@@ -608,7 +687,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
           - Double: bet doubled; draw one card then stand (handled earlier); settle at 1:1.
           - Insurance (not fully enforced here; placeholder for future).
         """
-        dealer_cards = state.get("dealer_hand") or []
+        state["dealer_hand"] = _sanitize_cards_list(state.get("dealer_hand") or [])
+        dealer_cards = state["dealer_hand"]
         d_total, d_bj, d_bust, _ = bj_total(dealer_cards)
         d_is_blackjack = (len(dealer_cards) == 2 and d_total == 21)
 
@@ -629,6 +709,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
             # For now single hand; if you later support splits, iterate all hands and accumulate
             h = hands[0]
+            h["cards"] = _sanitize_cards_list(h.get("cards") or [])
             bet = safe_int(h.get("bet"), base_bet)
             doubled = bool(h.get("double"))
             surrender = bool(h.get("surrendered"))
@@ -1093,7 +1174,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                         if move == "hit":
                             c = self._deal_card(state)
                             if c:
-                                h["cards"].append(c)
+                                h["cards"].append(_sanitize_card_dict(c))
                                 total, is_bj, is_busted, _ = bj_total(h["cards"])
                                 h["total"] = total
                                 h["is_busted"] = is_busted
@@ -1120,7 +1201,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["bet"] = safe_int(h.get("bet"), safe_int(p.get("bet")))  # keep base for 3:2 calc
                             c = self._deal_card(state)
                             if c:
-                                h["cards"].append(c)
+                                h["cards"].append(_sanitize_card_dict(c))
                             total, _, is_busted, _ = bj_total(h["cards"])
                             h["total"] = total
                             h["is_busted"] = is_busted

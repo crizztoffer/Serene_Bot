@@ -70,7 +70,11 @@ def bj_total(cards: List[dict]) -> Tuple[int, bool, bool, bool]:
     vals = []
     aces = 0
     for c in (cards or []):
-        rank = (c.get("rank") or "").upper()
+        # cards are normalized before we get here, but be defensive
+        if isinstance(c, str):
+            rank = (c[:-1] or "").upper()
+        else:
+            rank = (c.get("rank") or "").upper()
         if rank in ("A",):
             aces += 1
             vals.append(11)
@@ -98,45 +102,64 @@ def safe_int(x, default=0):
 # ---------------- Card-code hygiene (NO BACKEND HIDING) ----------------
 # The client controls visibility. We *always* transmit real codes.
 VALID_SUITS = {"S","H","D","C"}
-def _sanitize_card_dict(cd: Optional[dict]) -> Optional[dict]:
-    """
-    Ensure a card dict has a real code (never '??', never blank), and normalize to
-    the output format expected by the client.
-    """
-    if not cd:
-        return None
-    code = (cd.get("code") or "").strip()
-    rank = (cd.get("rank") or "").strip().upper()
-    suit = (cd.get("suit") or "").strip().upper()
 
-    # If a Card object slipped through, force to output format:
+def _normalize_code(rank: str, suit: str) -> Optional[dict]:
+    rank = (rank or "").strip().upper()
+    suit = (suit or "").strip().upper()
+    if rank == "10":  # frontend prefers '0' for tens
+        rank = "0"
+    if not rank or suit not in VALID_SUITS:
+        return None
+    return {"code": f"{rank}{suit}", "rank": rank, "suit": suit}
+
+def _sanitize_card_dict(cd: Optional[object]) -> Optional[dict]:
+    """
+    Accepts:
+      - dict like {"code":"AS","rank":"A","suit":"S"}
+      - Card object with .to_output_format()
+      - string like "AS" or "0D"
+    Returns normalized dict or None (rejecting placeholders like "??").
+    """
+    if cd is None:
+        return None
+
+    # String form: "AS", "0D", etc (or placeholders)
+    if isinstance(cd, str):
+        s = cd.strip()
+        if not s or s.upper() in ("??", "BACK", "HIDE", "X", "XX"):
+            return None
+        rank = s[:-1].upper()
+        suit = s[-1:].upper()
+        return _normalize_code(rank, suit)
+
+    # Card object
     if hasattr(cd, "to_output_format"):
         try:
             cd = cd.to_output_format()
-            code = (cd.get("code") or "").strip()
-            rank = (cd.get("rank") or "").strip().upper()
-            suit = (cd.get("suit") or "").strip().upper()
         except Exception:
             return None
 
-    # Reject any placeholder/hidden marker:
-    if code in ("??", "BACK", "HIDE", "X", "xx", "XX"):
-        return None
+    # Dict form
+    if isinstance(cd, dict):
+        code = (cd.get("code") or "").strip()
+        rank = (cd.get("rank") or "").strip().upper()
+        suit = (cd.get("suit") or "").strip().upper()
 
-    # Normalize:
-    if not rank and code:
-        # derive rank/suit from code like 'AS' or '0D'
-        rank = code[:-1].upper()
-        suit = code[-1:].upper()
-    if rank == "10":  # frontend prefers '0' for tens
-        rank = "0"
-    if suit not in VALID_SUITS or not rank:
-        return None
+        # Reject any placeholder/hidden marker
+        if (code or "").upper() in ("??", "BACK", "HIDE", "X", "XX"):
+            return None
 
-    out_code = f"{rank}{suit}"
-    return {"code": out_code, "rank": rank, "suit": suit}
+        # Derive from code if rank/suit missing
+        if not rank and code:
+            rank = code[:-1].upper()
+            suit = code[-1:].upper()
 
-def _sanitize_cards_list(cards: Optional[List[dict]]) -> List[dict]:
+        return _normalize_code(rank, suit)
+
+    # Unknown type
+    return None
+
+def _sanitize_cards_list(cards: Optional[List[object]]) -> List[dict]:
     out = []
     for cd in (cards or []):
         norm = _sanitize_card_dict(cd)
@@ -687,7 +710,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         for p in state.get("players", []):
             if not p.get("hands"): continue
             cards = p["hands"][0]["cards"]
-            # sanitize just in case:
+            # sanitize just in case (now accepts strings too)
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
@@ -1198,7 +1221,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
           - 'advance_phase'               (universal/admin)
           - 'player_action' with moves: 'bet','hit','stand','double','split','surrender','insurance'
         """
-        # --- NEW: normalize payload to dict in case upstream passed a JSON string ---
+        # Normalize payload to dict in case upstream passed a JSON string
         if isinstance(data, str):
             try:
                 data = json.loads(data)

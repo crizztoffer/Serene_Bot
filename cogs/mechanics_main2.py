@@ -462,14 +462,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 return h
         return None
 
-    def _all_bets_placed(self, state: dict) -> bool:
-        seated = [p for p in state.get("players", []) if self._eligible_seated(p)]
-        if not seated: return False
-        for p in seated:
-            if safe_int(p.get("bet")) <= 0:
-                return False
-        return True
-
     # ----- Canonical seat order & eligibility (mirrors hold'em) -----
     def _seat_num(self, seat_id: Optional[str]) -> int:
         try:
@@ -487,11 +479,10 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         pairs.sort(key=lambda t: t[0])
         return [pid for _, pid in pairs]
 
-    def _is_within_dc_grace(self, state: dict, pid: str) -> bool:
+    def _is_within_dc_grace(self, state: dict, room_id: str, pid: str) -> bool:
         """
         Hold'em-parity presence:
-          - connected == True       -> eligible
-          - connected is None       -> treat as eligible (do NOT block a fresh sitter)
+          - connected == True/None  -> eligible
           - connected == False      -> eligible only if WS is live OR within DC grace window
         """
         p = self._find_player(state, pid)
@@ -499,13 +490,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             return False
 
         conn_flag = p.get("connected", None)
-        if conn_flag is True:
-            return True
-        if conn_flag is None:
-            return True  # unknown presence should not block seats/turns
+        if conn_flag is True or conn_flag is None:
+            return True  # unknown/true presence should not block seats/turns
 
         # explicitly disconnected: allow during grace or if socket is live
-        if self._is_ws_connected(state.get("room_id"), pid):
+        if self._is_ws_connected(room_id, pid):
             return True
 
         deadline = (state.get("pending_disconnects") or {}).get(str(pid))
@@ -518,24 +507,24 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
         return False
 
-    def _eligible_for_betting(self, state: dict, pid: str) -> bool:
+    def _eligible_for_betting(self, state: dict, room_id: str, pid: str) -> bool:
         """Seated, not skipped this betting round, and hasn't placed a bet yet."""
         p = self._find_player(state, pid)
         if not p or not p.get("seat_id"):
             return False
-        if not self._is_within_dc_grace(state, pid):
+        if not self._is_within_dc_grace(state, room_id, pid):
             return False
         skips = state.get("_betting_skip_round") or {}
         if skips.get(str(pid)):
             return False
         return safe_int(p.get("bet")) <= 0
 
-    def _eligible_for_action(self, state: dict, pid: str) -> bool:
+    def _eligible_for_action(self, state: dict, room_id: str, pid: str) -> bool:
         """Seated, within DC grace, has an actionable hand (not busted/standing/surrendered)."""
         p = self._find_player(state, pid)
         if not p or not p.get("seat_id"):
             return False
-        if not self._is_within_dc_grace(state, pid):
+        if not self._is_within_dc_grace(state, room_id, pid):
             return False
         h = self._active_hand(p)
         return bool(h)
@@ -561,8 +550,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 return cand
         return None
 
-    # ----- New: betting turn helpers -----
-    def _all_bets_placed_or_skipped(self, state: dict) -> bool:
+    def _all_bets_placed_or_skipped(self, state: dict, room_id: str) -> bool:
         ids = self._seat_order_ids(state)
         if not ids:
             return False
@@ -572,7 +560,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if not p:
                 continue
             # DC past grace ⇒ implicitly skipped
-            if not self._is_within_dc_grace(state, pid):
+            if not self._is_within_dc_grace(state, room_id, pid):
                 continue
             if safe_int(p.get("bet")) > 0:
                 continue
@@ -581,25 +569,27 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             return False
         return True
 
-    def _first_betting_actor(self, state: dict) -> Optional[str]:
+    def _first_betting_actor(self, state: dict, room_id: str) -> Optional[str]:
         ids = self._seat_order_ids(state)
-        return self._first_in_round(ids, lambda pid: self._eligible_for_betting(state, pid))
+        return self._first_in_round(ids, lambda pid: self._eligible_for_betting(state, room_id, pid))
 
-    def _advance_betting_actor(self, state: dict):
+    def _advance_betting_actor(self, state: dict, room_id: str):
         ids = self._seat_order_ids(state)
-        nxt = self._next_in_round(ids, state.get("current_actor"), lambda pid: self._eligible_for_betting(state, pid))
+        nxt = self._next_in_round(ids, state.get("current_actor"),
+                                  lambda pid: self._eligible_for_betting(state, room_id, pid))
         state["current_actor"] = nxt
         if nxt:
             self._start_action_timer(state)  # 60s betting turn
         self._mark_dirty(state)
 
-    def _first_actor(self, state: dict) -> Optional[str]:
+    def _first_actor(self, state: dict, room_id: str) -> Optional[str]:
         ids = self._seat_order_ids(state)
-        return self._first_in_round(ids, lambda pid: self._eligible_for_action(state, pid))
+        return self._first_in_round(ids, lambda pid: self._eligible_for_action(state, room_id, pid))
 
-    def _advance_actor(self, state: dict):
+    def _advance_actor(self, state: dict, room_id: str):
         ids = self._seat_order_ids(state)
-        nxt = self._next_in_round(ids, state.get("current_actor"), lambda pid: self._eligible_for_action(state, pid))
+        nxt = self._next_in_round(ids, state.get("current_actor"),
+                                  lambda pid: self._eligible_for_action(state, room_id, pid))
         state["current_actor"] = nxt
         if nxt:
             self._start_action_timer(state)
@@ -715,10 +705,10 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state["dealer_reveal_triggered"] = False
         state["_betting_skip_round"] = {}
         for p in state.get("players", []):
-            p["bet"] = 0  # reset bets at the start of every betting round
+            p["bet"] = 0  # reset all bets entering betting
             p["hands"] = []
         # establish first betting actor & timer
-        state["current_actor"] = self._first_betting_actor(state)
+        state["current_actor"] = self._first_betting_actor(state, state.get("room_id") or "")
         if state["current_actor"]:
             self._start_action_timer(state)  # 60s per bettor
         else:
@@ -734,7 +724,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
     async def _to_player_turn(self, state: dict):
         state["current_round"] = PHASE_PLAYER_TURN
-        state["current_actor"] = self._first_actor(state)
+        state["current_actor"] = self._first_actor(state, state.get("room_id") or "")
         if state["current_actor"]:
             self._start_action_timer(state)
         self._mark_dirty(state)
@@ -1007,6 +997,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 if not state:
                     continue
                 self._ensure_defaults(state)
+                # stamp the room id so helpers that read it don't see None
+                if not state.get("room_id"):
+                    state["room_id"] = rid
 
                 # room limits from DB once
                 cfg = await self._load_room_config(rid)
@@ -1031,23 +1024,23 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 # --- Unify actor validity with hold'em ---
                 ids = self._seat_order_ids(state)
                 if phase == PHASE_BETTING:
-                    if state.get("current_actor") and not self._eligible_for_betting(state, str(state["current_actor"])):
+                    if state.get("current_actor") and not self._eligible_for_betting(state, rid, str(state["current_actor"])):
                         state["current_actor"] = self._next_in_round(ids, state.get("current_actor"),
-                                                                    lambda pid: self._eligible_for_betting(state, pid))
+                                                                    lambda pid: self._eligible_for_betting(state, rid, pid))
                         if state.get("current_actor"):
                             self._start_action_timer(state)
                         self._mark_dirty(state)
-                    if not state.get("current_actor") and not self._all_bets_placed_or_skipped(state):
-                        first = self._first_betting_actor(state)
+                    if not state.get("current_actor") and not self._all_bets_placed_or_skipped(state, rid):
+                        first = self._first_betting_actor(state, rid)
                         if first:
                             state["current_actor"] = first
                             self._start_action_timer(state)
                             self._mark_dirty(state)
 
                 elif phase == PHASE_PLAYER_TURN:
-                    if state.get("current_actor") and not self._eligible_for_action(state, str(state["current_actor"])):
+                    if state.get("current_actor") and not self._eligible_for_action(state, rid, str(state["current_actor"])):
                         state["current_actor"] = self._next_in_round(ids, state.get("current_actor"),
-                                                                    lambda pid: self._eligible_for_action(state, pid))
+                                                                    lambda pid: self._eligible_for_action(state, rid, pid))
                         if state.get("current_actor"):
                             self._start_action_timer(state)
                         self._mark_dirty(state)
@@ -1065,17 +1058,17 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             skips = state.setdefault("_betting_skip_round", {})
                             skips[pid] = True
                             self._mark_dirty(state)
-                            self._advance_betting_actor(state)
+                            self._advance_betting_actor(state, rid)
                     else:
                         # no actor -> attempt to select first pending bettor
-                        nxt = self._first_betting_actor(state)
+                        nxt = self._first_betting_actor(state, rid)
                         if nxt:
                             state["current_actor"] = nxt
                             self._start_action_timer(state)
                             self._mark_dirty(state)
 
                     # When all seated either bet or were skipped, deal
-                    if self._all_bets_placed_or_skipped(state):
+                    if self._all_bets_placed_or_skipped(state, rid):
                         await self._to_dealing(state)
                         await self._to_player_turn(state)
 
@@ -1092,7 +1085,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h = self._active_hand(p)
                                 if h: h["is_standing"] = True
                             self._mark_dirty(state)
-                            self._advance_actor(state)
+                            self._advance_actor(state, rid)
                             if not state.get("current_actor"):
                                 await self._to_dealer_turn(state)
 
@@ -1149,6 +1142,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         try:
             state = await self._load_game_state(room_id) or {'room_id': room_id}
             self._ensure_defaults(state)
+            if not state.get("room_id"):
+                state["room_id"] = room_id
             p = self._find_player(state, str(discord_id))
             if not p: return True, ""
             changed = False
@@ -1173,6 +1168,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         try:
             state = await self._load_game_state(room_id) or {'room_id': room_id}
             self._ensure_defaults(state)
+            if not state.get("room_id"):
+                state["room_id"] = room_id
             p = self._find_player(state, str(discord_id))
             if not p: return True, ""
             changed = False
@@ -1210,6 +1207,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 state = {'room_id': room_id, 'current_round': PHASE_PRE_GAME, 'players': []}
 
             self._ensure_defaults(state)
+            # stamp room
+            state["room_id"] = room_id
 
             # room limits presence
             cfg = await self._load_room_config(room_id)
@@ -1268,9 +1267,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 if phase == PHASE_PRE_GAME:
                     await self._to_betting(state)
                 elif phase == PHASE_BETTING:
-                    if self._all_bets_placed_or_skipped(state):
+                    if self._all_bets_placed_or_skipped(state, room_id):
                         await self._to_dealing(state); await self._to_player_turn(state)
-                elif phase == PHASE_DEALING':
+                elif phase == PHASE_DEALING:
                     await self._to_player_turn(state)
                 elif phase == PHASE_PLAYER_TURN:
                     await self._to_dealer_turn(state)
@@ -1306,7 +1305,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
                 # BETTING phase (per-player, actor-gated; hold'em parity)
                 if move == "bet" and state.get("current_round") == PHASE_BETTING:
-                    if state.get("current_actor") == actor and self._eligible_for_betting(state, actor):
+                    if state.get("current_actor") == actor and self._eligible_for_betting(state, room_id, actor):
                         p = self._find_player(state, actor)
                         if p:
                             mn = int(state.get("min_bet") or 0)
@@ -1317,11 +1316,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 (state.setdefault("_betting_skip_round", {})).pop(actor, None)
                                 changed = True
                                 self._mark_dirty(state)
-                                if self._all_bets_placed_or_skipped(state):
+                                if self._all_bets_placed_or_skipped(state, room_id):
                                     await self._to_dealing(state)
                                     await self._to_player_turn(state)
                                 else:
-                                    self._advance_betting_actor(state)
+                                    self._advance_betting_actor(state, room_id)
                                 self._add_room_active(room_id)
                     # else: ignore late/ghost bet packets, same as hold'em
 
@@ -1343,13 +1342,13 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["has_acted"] = True
                             if is_busted or total >= 21:
                                 h["is_standing"] = True
-                                self._advance_actor(state)
+                                self._advance_actor(state, room_id)
                             changed = True
 
                         elif move == "stand":
                             h["is_standing"] = True
                             h["has_acted"] = True
-                            self._advance_actor(state)
+                            self._advance_actor(state, room_id)
                             changed = True
 
                         elif move == "double":
@@ -1364,7 +1363,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             h["total"] = total
                             h["is_busted"] = is_busted
                             h["is_standing"] = True
-                            self._advance_actor(state)
+                            self._advance_actor(state, room_id)
                             changed = True
 
                         elif move == "split":
@@ -1375,7 +1374,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["surrendered"] = True
                                 h["is_standing"] = True
                                 h["has_acted"] = True
-                                self._advance_actor(state)
+                                self._advance_actor(state, room_id)
                                 changed = True
 
                         elif move == "insurance":

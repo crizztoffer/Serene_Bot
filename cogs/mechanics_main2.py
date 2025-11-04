@@ -470,14 +470,92 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 return False
         return True
 
-    # ----- New: betting turn helpers -----
-    def _all_bets_placed_or_skipped(self, state: dict) -> bool:
-        seated = [p for p in state.get("players", []) if self._eligible_seated(p)]
-        if not seated:
+    # ----- Canonical seat order & eligibility (mirrors hold'em) -----
+    def _seat_num(self, seat_id: Optional[str]) -> int:
+        try:
+            return int(str(seat_id or "seat_9999").split("_")[-1])
+        except Exception:
+            return 9999
+
+    def _seat_order_ids(self, state: dict) -> List[str]:
+        """Sorted list of discord_ids by seat order (ascending), seated only."""
+        pairs = []
+        for p in state.get("players", []):
+            if not p.get("seat_id"):
+                continue
+            pairs.append((self._seat_num(p.get("seat_id")), str(p.get("discord_id"))))
+        pairs.sort(key=lambda t: t[0])
+        return [pid for _, pid in pairs]
+
+    def _is_within_dc_grace(self, state: dict, pid: str) -> bool:
+        """Connected OR still inside DC grace window counts as eligible (like hold'em)."""
+        if self._is_ws_connected(state.get("room_id"), pid):
+            return True
+        deadline = (state.get("pending_disconnects") or {}).get(str(pid))
+        if deadline and int(time.time()) < int(deadline):
+            return True
+        p = self._find_player(state, pid)
+        dc_since = p.get("_dc_since") if p else None
+        if dc_since and (int(time.time()) - int(dc_since)) < DISCONNECT_GRACE_SECS:
+            return True
+        return False
+
+    def _eligible_for_betting(self, state: dict, pid: str) -> bool:
+        """Seated, not skipped this betting round, and hasn't placed a bet yet."""
+        p = self._find_player(state, pid)
+        if not p or not p.get("seat_id"):
+            return False
+        if not self._is_within_dc_grace(state, pid):
             return False
         skips = state.get("_betting_skip_round") or {}
-        for p in seated:
-            pid = str(p.get("discord_id"))
+        if skips.get(str(pid)):
+            return False
+        return safe_int(p.get("bet")) <= 0
+
+    def _eligible_for_action(self, state: dict, pid: str) -> bool:
+        """Seated, within DC grace, has an actionable hand (not busted/standing/surrendered)."""
+        p = self._find_player(state, pid)
+        if not p or not p.get("seat_id"):
+            return False
+        if not self._is_within_dc_grace(state, pid):
+            return False
+        h = self._active_hand(p)
+        return bool(h)
+
+    def _first_in_round(self, ids: List[str], predicate) -> Optional[str]:
+        for pid in ids:
+            if predicate(pid):
+                return pid
+        return None
+
+    def _next_in_round(self, ids: List[str], current: Optional[str], predicate) -> Optional[str]:
+        """One full wrap max, exactly like hold'em."""
+        if not ids:
+            return None
+        if current in ids:
+            start = ids.index(current)
+        else:
+            start = -1
+        n = len(ids)
+        for step in range(1, n+1):
+            cand = ids[(start + step) % n]
+            if predicate(cand):
+                return cand
+        return None
+
+    # ----- New: betting turn helpers -----
+    def _all_bets_placed_or_skipped(self, state: dict) -> bool:
+        ids = self._seat_order_ids(state)
+        if not ids:
+            return False
+        skips = state.get("_betting_skip_round") or {}
+        for pid in ids:
+            p = self._find_player(state, pid)
+            if not p:
+                continue
+            # DC past grace ⇒ implicitly skipped
+            if not self._is_within_dc_grace(state, pid):
+                continue
             if safe_int(p.get("bet")) > 0:
                 continue
             if skips.get(pid):
@@ -486,110 +564,27 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return True
 
     def _first_betting_actor(self, state: dict) -> Optional[str]:
-        skips = state.get("_betting_skip_round") or {}
-        candidates = []
-        for p in state.get("players", []):
-            if not self._eligible_seated(p):
-                continue
-            pid = str(p.get("discord_id"))
-            if safe_int(p.get("bet")) > 0 or skips.get(pid):
-                continue
-            try:
-                seat_num = int(str(p.get("seat_id")).split("_")[-1])
-            except Exception:
-                seat_num = 9999
-            candidates.append((seat_num, pid))
-        candidates.sort(key=lambda t: t[0])
-        return candidates[0][1] if candidates else None
+        ids = self._seat_order_ids(state)
+        return self._first_in_round(ids, lambda pid: self._eligible_for_betting(state, pid))
 
     def _advance_betting_actor(self, state: dict):
-        skips = state.get("_betting_skip_round") or {}
-        order = []
-        for p in state.get("players", []):
-            if not self._eligible_seated(p):
-                continue
-            try:
-                seat_num = int(str(p.get("seat_id")).split("_")[-1])
-            except Exception:
-                seat_num = 9999
-            order.append((seat_num, str(p.get("discord_id"))))
-        order.sort(key=lambda t: t[0])
-        ids = [pid for _, pid in order]
-        if not ids:
-            state["current_actor"] = None
-            self._mark_dirty(state)
-            return
-
-        cur = str(state.get("current_actor") or "")
-        start_i = ids.index(cur) if cur in ids else -1
-        n = len(ids)
-        for step in range(1, n+1):
-            nxt = ids[(start_i + step) % n]
-            p = self._find_player(state, nxt)
-            if not p:
-                continue
-            if safe_int(p.get("bet")) <= 0 and not skips.get(nxt):
-                state["current_actor"] = nxt
-                self._start_action_timer(state)  # 60s betting turn
-                self._mark_dirty(state)
-                return
-
-        state["current_actor"] = None
+        ids = self._seat_order_ids(state)
+        nxt = self._next_in_round(ids, state.get("current_actor"), lambda pid: self._eligible_for_betting(state, pid))
+        state["current_actor"] = nxt
+        if nxt:
+            self._start_action_timer(state)  # 60s betting turn
         self._mark_dirty(state)
 
     def _first_actor(self, state: dict) -> Optional[str]:
-        # lowest seat number first
-        candidates = []
-        for p in state.get("players", []):
-            if self._eligible_seated(p):
-                sid = str(p.get("seat_id") or "")
-                try:
-                    seat_num = int(sid.split("_")[-1])
-                except Exception:
-                    seat_num = 9999
-                candidates.append((seat_num, str(p.get("discord_id"))))
-        candidates.sort(key=lambda t: t[0])
-        return candidates[0][1] if candidates else None
+        ids = self._seat_order_ids(state)
+        return self._first_in_round(ids, lambda pid: self._eligible_for_action(state, pid))
 
     def _advance_actor(self, state: dict):
-        order = []
-        for p in state.get("players", []):
-            if self._eligible_seated(p):
-                try:
-                    seat_num = int(str(p.get("seat_id")).split("_")[-1])
-                except Exception:
-                    seat_num = 9999
-                order.append((seat_num, str(p.get("discord_id"))))
-        order.sort(key=lambda t: t[0])
-        ids = [pid for _, pid in order]
-        if not ids:
-            state["current_actor"] = None
-            self._mark_dirty(state)
-            return
-
-        cur = str(state.get("current_actor") or "")
-        if cur not in ids:
-            state["current_actor"] = ids[0]
-            self._mark_dirty(state)
+        ids = self._seat_order_ids(state)
+        nxt = self._next_in_round(ids, state.get("current_actor"), lambda pid: self._eligible_for_action(state, pid))
+        state["current_actor"] = nxt
+        if nxt:
             self._start_action_timer(state)
-            return
-
-        i = ids.index(cur)
-        # find next actor who still has an actionable hand
-        n = len(ids)
-        for step in range(1, n+1):
-            nxt = ids[(i + step) % n]
-            p = self._find_player(state, nxt)
-            if not p: continue
-            h = self._active_hand(p)
-            if h:
-                state["current_actor"] = nxt
-                self._mark_dirty(state)
-                self._start_action_timer(state)
-                return
-
-        # none left -> to dealer
-        state["current_actor"] = None
         self._mark_dirty(state)
 
     # ---------------- Timers ----------------
@@ -688,7 +683,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
-            p["hands"][0]["is_busted"] = is_busted
+            p["hands"][0"]["is_busted"] = is_busted
 
         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])
@@ -1015,6 +1010,30 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
                 phase = state.get("current_round", PHASE_PRE_GAME)
 
+                # --- Unify actor validity with hold'em ---
+                ids = self._seat_order_ids(state)
+                if phase == PHASE_BETTING:
+                    if state.get("current_actor") and not self._eligible_for_betting(state, str(state["current_actor"])):
+                        state["current_actor"] = self._next_in_round(ids, state.get("current_actor"),
+                                                                    lambda pid: self._eligible_for_betting(state, pid))
+                        if state.get("current_actor"):
+                            self._start_action_timer(state)
+                        self._mark_dirty(state)
+                    if not state.get("current_actor") and not self._all_bets_placed_or_skipped(state):
+                        first = self._first_betting_actor(state)
+                        if first:
+                            state["current_actor"] = first
+                            self._start_action_timer(state)
+                            self._mark_dirty(state)
+
+                elif phase == PHASE_PLAYER_TURN:
+                    if state.get("current_actor") and not self._eligible_for_action(state, str(state["current_actor"])):
+                        state["current_actor"] = self._next_in_round(ids, state.get("current_actor"),
+                                                                    lambda pid: self._eligible_for_action(state, pid))
+                        if state.get("current_actor"):
+                            self._start_action_timer(state)
+                        self._mark_dirty(state)
+
                 if phase == PHASE_PRE_GAME:
                     t0 = state.get("pre_game_timer_start")
                     if t0 and int(time.time()) >= int(t0) + PRE_GAME_WAIT_SECS:
@@ -1265,23 +1284,25 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 actor = str(data.get("sender_id") or data.get("discord_id"))
                 amount = safe_int(data.get("amount"), 0)
 
-                # BETTING phase (per-player, actor-gated)
-                if move == "bet" and state.get("current_round") == PHASE_BETTING and state.get("current_actor") == actor:
-                    p = self._find_player(state, actor)
-                    if p and self._eligible_seated(p):
-                        mn = int(state.get("min_bet") or 0)
-                        mx = int(state.get("max_bet") or 0)
-                        if amount >= mn and (mx <= 0 or amount <= mx):
-                            p["bet"] = amount
-                            # clear any skip flag for safety
-                            (state.setdefault("_betting_skip_round", {})).pop(actor, None)
-                            self._mark_dirty(state)
-                            if self._all_bets_placed_or_skipped(state):
-                                await self._to_dealing(state)
-                                await self._to_player_turn(state)
-                            else:
-                                self._advance_betting_actor(state)
-                            self._add_room_active(room_id)
+                # BETTING phase (per-player, actor-gated; hold'em parity)
+                if move == "bet" and state.get("current_round") == PHASE_BETTING:
+                    if state.get("current_actor") == actor and self._eligible_for_betting(state, actor):
+                        p = self._find_player(state, actor)
+                        if p:
+                            mn = int(state.get("min_bet") or 0)
+                            mx = int(state.get("max_bet") or 0)
+                            if amount >= mn and (mx <= 0 or amount <= mx):
+                                p["bet"] = amount
+                                # clear any skip flag for safety
+                                (state.setdefault("_betting_skip_round", {})).pop(actor, None)
+                                self._mark_dirty(state)
+                                if self._all_bets_placed_or_skipped(state):
+                                    await self._to_dealing(state)
+                                    await self._to_player_turn(state)
+                                else:
+                                    self._advance_betting_actor(state)
+                                self._add_room_active(room_id)
+                    # else: ignore late/ghost bet packets, same as hold'em
 
                 # PLAYER TURN
                 elif state.get("current_round") == PHASE_PLAYER_TURN and state.get("current_actor") == actor:

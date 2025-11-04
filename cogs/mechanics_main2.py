@@ -488,16 +488,34 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return [pid for _, pid in pairs]
 
     def _is_within_dc_grace(self, state: dict, pid: str) -> bool:
-        """Connected OR still inside DC grace window counts as eligible (like hold'em)."""
+        """
+        Hold'em-parity presence:
+          - connected == True       -> eligible
+          - connected is None       -> treat as eligible (do NOT block a fresh sitter)
+          - connected == False      -> eligible only if WS is live OR within DC grace window
+        """
+        p = self._find_player(state, pid)
+        if not p or not p.get("seat_id"):
+            return False
+
+        conn_flag = p.get("connected", None)
+        if conn_flag is True:
+            return True
+        if conn_flag is None:
+            return True  # unknown presence should not block seats/turns
+
+        # explicitly disconnected: allow during grace or if socket is live
         if self._is_ws_connected(state.get("room_id"), pid):
             return True
+
         deadline = (state.get("pending_disconnects") or {}).get(str(pid))
         if deadline and int(time.time()) < int(deadline):
             return True
-        p = self._find_player(state, pid)
-        dc_since = p.get("_dc_since") if p else None
+
+        dc_since = p.get("_dc_since")
         if dc_since and (int(time.time()) - int(dc_since)) < DISCONNECT_GRACE_SECS:
             return True
+
         return False
 
     def _eligible_for_betting(self, state: dict, pid: str) -> bool:
@@ -683,7 +701,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
-            p["hands"][0"]["is_busted"] = is_busted
+            p["hands"][0]["is_busted"] = is_busted
 
         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])

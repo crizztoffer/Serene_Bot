@@ -715,7 +715,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state["dealer_reveal_triggered"] = False
         state["_betting_skip_round"] = {}
         for p in state.get("players", []):
-            p["bet"] = int(p.get("bet") or 0)
+            p["bet"] = 0  # reset bets at the start of every betting round
             p["hands"] = []
         # establish first betting actor & timer
         state["current_actor"] = self._first_betting_actor(state)
@@ -1215,7 +1215,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             cfg = await self._load_room_config(room_id)
             self._ensure_room_limits(state, cfg)
 
-            # optimistic rev
+            # optimistic rev (only for timer saves; actions will save unconditionally)
             before_rev = int(state.get("__rev") or 0)
 
             # minimal enrichment
@@ -1270,7 +1270,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 elif phase == PHASE_BETTING:
                     if self._all_bets_placed_or_skipped(state):
                         await self._to_dealing(state); await self._to_player_turn(state)
-                elif phase == PHASE_DEALING:
+                elif phase == PHASE_DEALING':
                     await self._to_player_turn(state)
                 elif phase == PHASE_PLAYER_TURN:
                     await self._to_dealer_turn(state)
@@ -1302,6 +1302,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 actor = str(data.get("sender_id") or data.get("discord_id"))
                 amount = safe_int(data.get("amount"), 0)
 
+                changed = False
+
                 # BETTING phase (per-player, actor-gated; hold'em parity)
                 if move == "bet" and state.get("current_round") == PHASE_BETTING:
                     if state.get("current_actor") == actor and self._eligible_for_betting(state, actor):
@@ -1313,6 +1315,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 p["bet"] = amount
                                 # clear any skip flag for safety
                                 (state.setdefault("_betting_skip_round", {})).pop(actor, None)
+                                changed = True
                                 self._mark_dirty(state)
                                 if self._all_bets_placed_or_skipped(state):
                                     await self._to_dealing(state)
@@ -1341,23 +1344,19 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             if is_busted or total >= 21:
                                 h["is_standing"] = True
                                 self._advance_actor(state)
-                                if not state.get("current_actor"):
-                                    await self._to_dealer_turn(state)
+                            changed = True
 
                         elif move == "stand":
                             h["is_standing"] = True
                             h["has_acted"] = True
                             self._advance_actor(state)
-                            if not state.get("current_actor"):
-                                await self._to_dealer_turn(state)
+                            changed = True
 
                         elif move == "double":
-                            # take exactly one card then stand; client already withdrew amount; double flag used for payout
                             h["double"] = True
                             h["has_acted"] = True
-                            # optional: track side "bet" copy
                             if amount > 0:
-                                h["bet"] = safe_int(h.get("bet"), safe_int(p.get("bet")))  # keep base for 3:2 calc
+                                h["bet"] = safe_int(h.get("bet"), safe_int(p.get("bet")))
                             c = self._deal_card(state)
                             if c:
                                 h["cards"].append(_sanitize_card_dict(c))
@@ -1366,11 +1365,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             h["is_busted"] = is_busted
                             h["is_standing"] = True
                             self._advance_actor(state)
-                            if not state.get("current_actor"):
-                                await self._to_dealer_turn(state)
+                            changed = True
 
                         elif move == "split":
-                            # soft-disable by hint unless true pair; full split handling is out-of-scope here
                             pass
 
                         elif move == "surrender":
@@ -1379,24 +1376,25 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["is_standing"] = True
                                 h["has_acted"] = True
                                 self._advance_actor(state)
-                                if not state.get("current_actor"):
-                                    await self._to_dealer_turn(state)
+                                changed = True
 
                         elif move == "insurance":
-                            # record the insurance amount; settlement not fully implemented here
                             if amount > 0 and not h.get("insured", False):
                                 h["insured"] = True
                                 h["insurance_amount"] = amount
                                 h["has_acted"] = True
-                            # no actor advance on insurance itself
+                                changed = True
 
-                        self._mark_dirty(state)
-                        self._add_room_active(room_id)
+                        if changed and not state.get("current_actor"):
+                            await self._to_dealer_turn(state)
 
-            # final save/broadcast if changed
-            after_rev = int(state.get("__rev") or 0)
-            if after_rev != before_rev:
-                if await self._save_if_current(room_id, state, before_rev):
+                        if changed:
+                            self._mark_dirty(state)
+                            self._add_room_active(room_id)
+
+                # final save/broadcast if changed — **authoritative save** from action handler
+                if int(state.get("__rev") or 0) != int(before_rev):
+                    await self._save_game_state(room_id, state)   # <-- no optimistic check
                     await self._broadcast_state(room_id, state)
 
         except Exception as e:

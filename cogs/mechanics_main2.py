@@ -22,12 +22,13 @@ PHASE_DEALING     = "dealing"
 PHASE_PLAYER_TURN = "player_turn"
 PHASE_DEALER_TURN = "dealer_turn"
 PHASE_SHOWDOWN    = "showdown"
-PHASE_POST_ROUND  = "post_round"
+PHASE_POST_ROUND  = "post_round"  # kept for compatibility but no longer used in the normal flow
 
 # Phase timers
 PRE_GAME_WAIT_SECS    = 60
-POST_ROUND_WAIT_SECS  = 12
-ACTION_SECS           = 30  # per-actor move timer
+POST_ROUND_WAIT_SECS  = 15   # winners are shown for 15 seconds
+ACTION_SECS           = 60   # per-actor move timer (betting turns & player actions)
+DEALER_REVEAL_WAIT    = 2    # 2 ticks before the dealer starts auto-hitting
 
 # ---------------- Minimums by game_mode ----------------
 MODE_MIN_BET = {
@@ -329,6 +330,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state.setdefault("max_bet", MODE_MAX_BET["1"])
         state.setdefault("current_actor", None)  # discord_id
         state.setdefault("pending_disconnects", {})  # {discord_id: epoch_deadline}
+        # added for new mechanics
+        state.setdefault("dealer_reveal_triggered", False)
+        state.setdefault("_betting_skip_round", {})  # {discord_id: True} mark per-round betting timeouts
         return state
 
     def _ensure_room_limits(self, state: dict, cfg: dict):
@@ -466,6 +470,73 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 return False
         return True
 
+    # ----- New: betting turn helpers -----
+    def _all_bets_placed_or_skipped(self, state: dict) -> bool:
+        seated = [p for p in state.get("players", []) if self._eligible_seated(p)]
+        if not seated:
+            return False
+        skips = state.get("_betting_skip_round") or {}
+        for p in seated:
+            pid = str(p.get("discord_id"))
+            if safe_int(p.get("bet")) > 0:
+                continue
+            if skips.get(pid):
+                continue
+            return False
+        return True
+
+    def _first_betting_actor(self, state: dict) -> Optional[str]:
+        skips = state.get("_betting_skip_round") or {}
+        candidates = []
+        for p in state.get("players", []):
+            if not self._eligible_seated(p):
+                continue
+            pid = str(p.get("discord_id"))
+            if safe_int(p.get("bet")) > 0 or skips.get(pid):
+                continue
+            try:
+                seat_num = int(str(p.get("seat_id")).split("_")[-1])
+            except Exception:
+                seat_num = 9999
+            candidates.append((seat_num, pid))
+        candidates.sort(key=lambda t: t[0])
+        return candidates[0][1] if candidates else None
+
+    def _advance_betting_actor(self, state: dict):
+        skips = state.get("_betting_skip_round") or {}
+        order = []
+        for p in state.get("players", []):
+            if not self._eligible_seated(p):
+                continue
+            try:
+                seat_num = int(str(p.get("seat_id")).split("_")[-1])
+            except Exception:
+                seat_num = 9999
+            order.append((seat_num, str(p.get("discord_id"))))
+        order.sort(key=lambda t: t[0])
+        ids = [pid for _, pid in order]
+        if not ids:
+            state["current_actor"] = None
+            self._mark_dirty(state)
+            return
+
+        cur = str(state.get("current_actor") or "")
+        start_i = ids.index(cur) if cur in ids else -1
+        n = len(ids)
+        for step in range(1, n+1):
+            nxt = ids[(start_i + step) % n]
+            p = self._find_player(state, nxt)
+            if not p:
+                continue
+            if safe_int(p.get("bet")) <= 0 and not skips.get(nxt):
+                state["current_actor"] = nxt
+                self._start_action_timer(state)  # 60s betting turn
+                self._mark_dirty(state)
+                return
+
+        state["current_actor"] = None
+        self._mark_dirty(state)
+
     def _first_actor(self, state: dict) -> Optional[str]:
         # lowest seat number first
         candidates = []
@@ -574,12 +645,17 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         self._mark_dirty(state)
 
     def _initial_deal(self, state: dict):
-        # assume all bets > 0 have been placed
+        # assume all bets > 0 have been placed or players skipped
         deck = self._fresh_deck()
-        # deal 2 to each seated
+        skips = state.get("_betting_skip_round") or {}
+        # deal 2 to each seated who actually bet and were not skipped
         for _ in range(2):
             for p in state.get("players", []):
-                if not self._eligible_seated(p): continue
+                if not self._eligible_seated(p):
+                    continue
+                pid = str(p.get("discord_id"))
+                if safe_int(p.get("bet")) <= 0 or skips.get(pid):
+                    continue
                 if not p.get("hands"):
                     p["hands"] = [{
                         "cards": [],
@@ -623,11 +699,17 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
     async def _to_betting(self, state: dict):
         state["current_round"] = PHASE_BETTING
         # wipe any previous per-round flags
+        state["dealer_reveal_triggered"] = False
+        state["_betting_skip_round"] = {}
         for p in state.get("players", []):
             p["bet"] = int(p.get("bet") or 0)
             p["hands"] = []
-        state["current_actor"] = None
-        self._start_phase_timer(state, 0)
+        # establish first betting actor & timer
+        state["current_actor"] = self._first_betting_actor(state)
+        if state["current_actor"]:
+            self._start_action_timer(state)  # 60s per bettor
+        else:
+            self._start_phase_timer(state, 0)
         self._mark_dirty(state)
 
     async def _to_dealing(self, state: dict):
@@ -647,24 +729,14 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
     async def _to_dealer_turn(self, state: dict):
         state["current_round"] = PHASE_DEALER_TURN
         state["current_actor"] = None
-        self._start_phase_timer(state, 0)
-        self._mark_dirty(state)
-        # draw to 17 (H17/S17 toggle: here stand on 17 incl soft 17)
-        while True:
-            total, is_bj, is_busted, soft = bj_total(state.get("dealer_hand") or [])
-            if total < 17:
-                c = self._deal_card(state)
-                if c: state["dealer_hand"].append(_sanitize_card_dict(c))
-                continue
-            break
-        state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
-        dt, _, _, _ = bj_total(state["dealer_hand"])
-        state["dealer_total"] = dt
+        state["dealer_reveal_triggered"] = True  # frontend should flip reveal on this
+        # wait 2 ticks before dealer auto-hits
+        self._start_phase_timer(state, DEALER_REVEAL_WAIT)
         self._mark_dirty(state)
 
     async def _to_showdown(self, state: dict):
         state["current_round"] = PHASE_SHOWDOWN
-        self._start_phase_timer(state, POST_ROUND_WAIT_SECS)
+        self._start_phase_timer(state, POST_ROUND_WAIT_SECS)  # 15s winners screen
         # compute payouts
         await self._compute_and_credit_payouts(state)
         self._mark_dirty(state)
@@ -949,19 +1021,34 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                         await self._to_betting(state)
 
                 elif phase == PHASE_BETTING:
-                    # when every seated player has a bet
-                    if self._all_bets_placed(state):
+                    # per-player 60s betting turns: timeout -> skip for this round
+                    if state.get("current_actor"):
+                        if self._action_timer_expired(state):
+                            pid = str(state["current_actor"])
+                            skips = state.setdefault("_betting_skip_round", {})
+                            skips[pid] = True
+                            self._mark_dirty(state)
+                            self._advance_betting_actor(state)
+                    else:
+                        # no actor -> attempt to select first pending bettor
+                        nxt = self._first_betting_actor(state)
+                        if nxt:
+                            state["current_actor"] = nxt
+                            self._start_action_timer(state)
+                            self._mark_dirty(state)
+
+                    # When all seated either bet or were skipped, deal
+                    if self._all_bets_placed_or_skipped(state):
                         await self._to_dealing(state)
                         await self._to_player_turn(state)
 
                 elif phase == PHASE_PLAYER_TURN:
                     if not state.get("current_actor"):
-                        # no actor means advance to dealer
+                        # no actor means advance to dealer (reveal + 2s pause then hit)
                         await self._to_dealer_turn(state)
-                        await self._to_showdown(state)
                     else:
                         if self._action_timer_expired(state):
-                            # timeout -> auto-stand
+                            # timeout -> auto-stand current actor's active hand
                             actor = state["current_actor"]
                             p = self._find_player(state, actor)
                             if p:
@@ -971,19 +1058,33 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             self._advance_actor(state)
                             if not state.get("current_actor"):
                                 await self._to_dealer_turn(state)
-                                await self._to_showdown(state)
 
                 elif phase == PHASE_DEALER_TURN:
-                    # immediately handled in transition
-                    await self._to_showdown(state)
+                    # Wait for reveal delay, then auto-hit while total <= 16. Stop at >=17 or bust.
+                    if self._timer_expired(state):
+                        while True:
+                            total, is_bj, is_busted, soft = bj_total(state.get("dealer_hand") or [])
+                            if total <= 16:
+                                c = self._deal_card(state)
+                                if c: state["dealer_hand"].append(_sanitize_card_dict(c))
+                                continue
+                            break
+                        state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
+                        dt, _, _, _ = bj_total(state["dealer_hand"])
+                        state["dealer_total"] = dt
+                        self._mark_dirty(state)
+                        await self._to_showdown(state)
 
                 elif phase == PHASE_SHOWDOWN:
+                    # After 15s of showing winners, go straight to a new betting round
                     if self._timer_expired(state):
-                        await self._to_post_round(state)
+                        for p in state.get("players", []):
+                            p["bet"] = 0
+                        await self._to_betting(state)
 
                 elif phase == PHASE_POST_ROUND:
-                    if self._timer_expired(state):
-                        await self._to_betting(state)
+                    # For compatibility, immediately start betting again
+                    await self._to_betting(state)
 
                 # Save/broadcast
                 after_rev = int(state.get("__rev") or 0)
@@ -1130,16 +1231,31 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 if phase == PHASE_PRE_GAME:
                     await self._to_betting(state)
                 elif phase == PHASE_BETTING:
-                    if self._all_bets_placed(state):
+                    if self._all_bets_placed_or_skipped(state):
                         await self._to_dealing(state); await self._to_player_turn(state)
                 elif phase == PHASE_DEALING:
                     await self._to_player_turn(state)
                 elif phase == PHASE_PLAYER_TURN:
-                    await self._to_dealer_turn(state); await self._to_showdown(state)
+                    await self._to_dealer_turn(state)
                 elif phase == PHASE_DEALER_TURN:
+                    # emulate reveal delay elapsed then proceed to showdown
+                    while True:
+                        total, is_bj, is_busted, soft = bj_total(state.get("dealer_hand") or [])
+                        if total <= 16:
+                            c = self._deal_card(state)
+                            if c: state["dealer_hand"].append(_sanitize_card_dict(c))
+                            continue
+                        break
+                    state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
+                    dt, _, _, _ = bj_total(state["dealer_hand"])
+                    state["dealer_total"] = dt
+                    self._mark_dirty(state)
                     await self._to_showdown(state)
                 elif phase == PHASE_SHOWDOWN:
-                    await self._to_post_round(state)
+                    # jump to betting
+                    for p in state.get("players", []):
+                        p["bet"] = 0
+                    await self._to_betting(state)
                 elif phase == PHASE_POST_ROUND:
                     await self._to_betting(state)
                 self._add_room_active(room_id)
@@ -1149,18 +1265,22 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 actor = str(data.get("sender_id") or data.get("discord_id"))
                 amount = safe_int(data.get("amount"), 0)
 
-                # BETTING phase
-                if move == "bet" and state.get("current_round") == PHASE_BETTING:
+                # BETTING phase (per-player, actor-gated)
+                if move == "bet" and state.get("current_round") == PHASE_BETTING and state.get("current_actor") == actor:
                     p = self._find_player(state, actor)
                     if p and self._eligible_seated(p):
                         mn = int(state.get("min_bet") or 0)
                         mx = int(state.get("max_bet") or 0)
                         if amount >= mn and (mx <= 0 or amount <= mx):
                             p["bet"] = amount
+                            # clear any skip flag for safety
+                            (state.setdefault("_betting_skip_round", {})).pop(actor, None)
                             self._mark_dirty(state)
-                            if self._all_bets_placed(state):
+                            if self._all_bets_placed_or_skipped(state):
                                 await self._to_dealing(state)
                                 await self._to_player_turn(state)
+                            else:
+                                self._advance_betting_actor(state)
                             self._add_room_active(room_id)
 
                 # PLAYER TURN
@@ -1183,14 +1303,14 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["is_standing"] = True
                                 self._advance_actor(state)
                                 if not state.get("current_actor"):
-                                    await self._to_dealer_turn(state); await self._to_showdown(state)
+                                    await self._to_dealer_turn(state)
 
                         elif move == "stand":
                             h["is_standing"] = True
                             h["has_acted"] = True
                             self._advance_actor(state)
                             if not state.get("current_actor"):
-                                await self._to_dealer_turn(state); await self._to_showdown(state)
+                                await self._to_dealer_turn(state)
 
                         elif move == "double":
                             # take exactly one card then stand; client already withdrew amount; double flag used for payout
@@ -1208,7 +1328,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             h["is_standing"] = True
                             self._advance_actor(state)
                             if not state.get("current_actor"):
-                                await self._to_dealer_turn(state); await self._to_showdown(state)
+                                await self._to_dealer_turn(state)
 
                         elif move == "split":
                             # soft-disable by hint unless true pair; full split handling is out-of-scope here
@@ -1221,7 +1341,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                                 h["has_acted"] = True
                                 self._advance_actor(state)
                                 if not state.get("current_actor"):
-                                    await self._to_dealer_turn(state); await self._to_showdown(state)
+                                    await self._to_dealer_turn(state)
 
                         elif move == "insurance":
                             # record the insurance amount; settlement not fully implemented here

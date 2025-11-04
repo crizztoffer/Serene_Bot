@@ -330,6 +330,25 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             pass
         return False
 
+    def _sender_in_room_bucket(self, room_id: str, player_id: str) -> bool:
+        """
+        Mirror hold'em room-gating: if the room has a bucket, only accept actions
+        from senders that have a live WS in that same room.
+        """
+        bucket = self.bot.ws_rooms.get(str(room_id), set())
+        if not bucket:
+            # if there's no bucket, be permissive (e.g., unit tests / headless)
+            return True
+        for ws in list(bucket):
+            try:
+                if getattr(ws, "closed", False):
+                    continue
+                if str(getattr(ws, "_player_id", "")) == str(player_id):
+                    return True
+            except Exception:
+                continue
+        return False
+
     # ---------------- State defaults & patches ----------------
     def _mark_dirty(self, state: dict):
         state["__rev"] = int(state.get("__rev") or 0) + 1
@@ -476,7 +495,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return None
 
     def _eligible_seated(self, p: dict) -> bool:
-        return bool(p and p.get("seat_id"))
+        # must be seated and not flagged as observer for the current hand
+        return bool(p and p.get("seat_id") and not p.get("sitting_out"))
 
     def _active_hand(self, p: dict) -> Optional[dict]:
         hands = p.get("hands") or []
@@ -531,9 +551,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return False
 
     def _eligible_for_betting(self, state: dict, room_id: str, pid: str) -> bool:
-        """Seated, not skipped this betting round, and hasn't placed a bet yet."""
+        """Seated, not skipped this betting round, hasn't placed a bet yet, not sitting_out."""
         p = self._find_player(state, pid)
         if not p or not p.get("seat_id"):
+            return False
+        if p.get("sitting_out"):
             return False
         if not self._is_within_dc_grace(state, room_id, pid):
             return False
@@ -543,9 +565,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return safe_int(p.get("bet")) <= 0
 
     def _eligible_for_action(self, state: dict, room_id: str, pid: str) -> bool:
-        """Seated, within DC grace, has an actionable hand (not busted/standing/surrendered)."""
+        """Seated, within DC grace, not sitting_out, has an actionable hand."""
         p = self._find_player(state, pid)
         if not p or not p.get("seat_id"):
+            return False
+        if p.get("sitting_out"):
             return False
         if not self._is_within_dc_grace(state, room_id, pid):
             return False
@@ -581,6 +605,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         for pid in ids:
             p = self._find_player(state, pid)
             if not p:
+                continue
+            # observers don't need to bet
+            if p.get("sitting_out"):
                 continue
             # DC past grace ⇒ implicitly skipped
             if not self._is_within_dc_grace(state, room_id, pid):
@@ -714,7 +741,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
-            p["hands"][0]["is_busted"] = is_busted
+            p["hands"][0"]["is_busted"] = is_busted
 
         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])
@@ -727,9 +754,12 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         # wipe any previous per-round flags
         state["dealer_reveal_triggered"] = False
         state["_betting_skip_round"] = {}
+        # reset per-player state; admit observers for the new hand
         for p in state.get("players", []):
             p["bet"] = 0  # reset when entering betting
             p["hands"] = []
+            if p.get("sitting_out"):
+                p["sitting_out"] = False
         # establish first betting actor & timer
         state["current_actor"] = self._first_betting_actor(state, state.get("room_id") or "")
         if state["current_actor"]:
@@ -1264,19 +1294,41 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 await self._to_betting(state)
                 self._add_room_active(room_id)
 
+            # Identify sender for room-gating (matches hold'em semantics)
+            sender_id = str(data.get('sender_id') or data.get('discord_id') or "")
+            # Gate all player-affecting actions if there is a live bucket and sender not in it
+            if action in ('player_sit', 'player_leave', 'player_action'):
+                if not self._sender_in_room_bucket(room_id, sender_id):
+                    logger.info(f"[{room_id}] Ignoring '{action}' from non-bucket sender {sender_id}")
+                    return
+
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
                 if not isinstance(pdata, dict):
                     pdata = {}
                 seat_id = pdata.get('seat_id')
-                player_id = str(pdata.get('discord_id') or data.get('sender_id'))
+                player_id = str(pdata.get('discord_id') or sender_id)
+
                 if seat_id and player_id:
-                    # prevent dup seat/dup player
+                    # Reap ghosts proactively so dead owners don't block seating
+                    self._reap_players_with_dead_ws(state, room_id)
+                    self._reap_pending_disconnects(state, room_id)
+
+                    # If seat is occupied by someone outside DC grace (or no live ws), free it
+                    for q in list(state['players']):
+                        if str(q.get('seat_id')) == str(seat_id):
+                            qid = str(q.get('discord_id'))
+                            if not self._is_within_dc_grace(state, room_id, qid):
+                                self._remove_player_by_id(state, qid)
+
+                    # prevent dup seat/dup player post-reap
                     if any(str(p.get('discord_id')) == player_id for p in state['players']):
                         pass
                     elif any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
                         pass
                     else:
+                        # mid-hand sits are observers until next betting (hold'em parity)
+                        is_mid_hand = state.get("current_round") != PHASE_PRE_GAME
                         state['players'].append({
                             'discord_id': player_id,
                             'name': pdata.get('name', 'Player'),
@@ -1285,6 +1337,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             'bet': 0,
                             'hands': [],
                             'connected': True,
+                            'sitting_out': bool(is_mid_hand),
                         })
                         # start pre-game countdown (first sitter)
                         if state['current_round'] == PHASE_PRE_GAME and not state.get('initial_countdown_triggered'):
@@ -1294,7 +1347,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                         self._mark_dirty(state)
 
             elif action == 'player_leave':
-                player_id = str(data.get('sender_id') or data.get('discord_id'))
+                player_id = str(sender_id or data.get('discord_id'))
                 self._remove_player_by_id(state, player_id)
                 self._add_room_active(room_id)
 
@@ -1334,7 +1387,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
             elif action == 'player_action':
                 move = (data.get("move") or "").lower()
-                actor = str(data.get("sender_id") or data.get("discord_id"))
+                actor = str(sender_id or data.get("discord_id"))
                 amount = safe_int(data.get("amount"), 0)
 
                 changed = False

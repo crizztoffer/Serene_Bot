@@ -741,7 +741,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
-            p["hands"][0"]["is_busted"] = is_busted
+            p["hands"][0]["is_busted"] = is_busted
 
         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])

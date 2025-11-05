@@ -263,7 +263,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             logger.error(f"Sanitize before save failed: {e}", exc_info=True)
 
         conn = None
-        try:
+               try:
             conn = await self._get_db_connection()
             async with conn.cursor() as cursor:
                 rows_affected = await cursor.execute(
@@ -422,20 +422,24 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             "double_amount": 0,
             "min_bet": int(state.get("min_bet") or 0),
             "max_bet": int(state.get("max_bet") or 0),
+
+            # NEW: expose split/multi-hand context
+            "hand_count": 0,
+            "active_hand_index": None,
         }
         if not actor: return hint
         p = self._find_player(state, actor)
         if not p: return hint
 
+        hint["hand_count"] = len(p.get("hands") or [])
+        ah_idx = self._active_hand_index(p)
+        hint["active_hand_index"] = ah_idx
+
         # during betting: no action bar
-        if state.get("current_round") != PHASE_PLAYER_TURN:
+        if state.get("current_round") != PHASE_PLAYER_TURN or ah_idx is None:
             return hint
 
-        # find the active hand (first non-busted/non-standing)
-        hand = self._active_hand(p)
-        if not hand:
-            return hint
-
+        hand = (p.get("hands") or [])[ah_idx]
         cards = hand.get("cards", [])
         total, is_bj, is_busted, _ = bj_total(cards)
         # Base permissions
@@ -445,7 +449,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         hint["can_double"] = (len(cards) == 2 and not hand.get("has_acted", False))
         hint["double_amount"] = int(hand.get("bet") or p.get("bet") or 0)
 
-        # Split: 2 cards same rank and not already split; implement basic gate (client shows disabled otherwise)
+        # Split: 2 cards same rank and not already split; implement basic gate (one split per player per round)
         if len(cards) == 2:
             r0 = (cards[0].get("rank") or "").upper()
             r1 = (cards[1].get("rank") or "").upper()
@@ -504,6 +508,33 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if not h.get("is_busted") and not h.get("is_standing") and not h.get("surrendered"):
                 return h
         return None
+
+    # NEW: expose index of active hand for multi-hand flow
+    def _active_hand_index(self, p: dict) -> Optional[int]:
+        hands = p.get("hands") or []
+        for i, h in enumerate(hands):
+            if not h.get("is_busted") and not h.get("is_standing") and not h.get("surrendered"):
+                return i
+        return None
+
+    # NEW: card dealing helpers for a specific hand
+    def _deal_one_to_hand(self, state: dict, h: dict) -> None:
+        c = self._deal_card(state)
+        if c:
+            h.setdefault("cards", []).append(_sanitize_card_dict(c))
+        t, is_bj, is_busted, _ = bj_total(h.get("cards") or [])
+        h["total"] = t
+        h["is_busted"] = is_busted
+
+    def _ensure_one_card_if_needed(self, state: dict, h: dict) -> None:
+        """
+        After a split, the new active hand might only have its split card.
+        Draw one automatic card before allowing actions.
+        """
+        cards = h.get("cards") or []
+        if len(cards) == 1:
+            self._deal_one_to_hand(state, h)
+            h["has_acted"] = False
 
     # ----- Canonical seat order & eligibility (mirrors hold'em) -----
     def _seat_num(self, seat_id: Optional[str]) -> int:
@@ -830,57 +861,56 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             hands = p.get("hands") or []
             base_bet = safe_int(p.get("bet"), 0)
 
-            # if no hand (didn't bet), skip row
+            # If no hand (didn't bet), add neutral row
             if not hands:
                 eval_rows.append({"name": name, "hand_type": "", "is_winner": False, "discord_id": pid, "amount_won": 0})
                 continue
 
-            # For now single hand; if you later support splits, iterate all hands and accumulate
-            h = hands[0]
-            h["cards"] = _sanitize_cards_list(h.get("cards") or [])
-            bet = safe_int(h.get("bet"), base_bet)
-            doubled = bool(h.get("double"))
-            surrender = bool(h.get("surrendered"))
-            cards = h.get("cards") or []
-            t, is_bj, bust, _ = bj_total(cards)
+            # Iterate all hands and accumulate deltas
+            total_delta_for_player = 0
+            for idx, h in enumerate(hands):
+                h["cards"] = _sanitize_cards_list(h.get("cards") or [])
+                bet = safe_int(h.get("bet"), base_bet)
+                doubled = bool(h.get("double"))
+                surrender = bool(h.get("surrendered"))
+                cards = h.get("cards") or []
+                t, is_bj, bust, _ = bj_total(cards)
+                effective_bet = bet * (2 if doubled else 1)
 
-            # Adjust wager for double
-            effective_bet = bet * (2 if doubled else 1)
-
-            delta = 0
-            if surrender:
-                # lose half (round down)
-                delta = - (effective_bet // 2)
-            elif bust:
-                delta = - effective_bet
-            else:
-                if d_bust:
-                    # dealer busts: player wins 1:1 unless player has blackjack (still 3:2)
-                    if is_bj and not d_is_blackjack:
-                        delta = int(1.5 * bet)  # blackjack uses original bet, not doubled
-                    else:
-                        delta = effective_bet
+                delta = 0
+                if surrender:
+                    delta = - (effective_bet // 2)
+                elif bust:
+                    delta = - effective_bet
                 else:
-                    if is_bj and not d_is_blackjack:
-                        delta = int(1.5 * bet)
-                    elif d_is_blackjack and is_bj:
-                        delta = 0  # push on mutual blackjack
-                    else:
-                        if t > d_total:
-                            delta = effective_bet
-                        elif t < d_total:
-                            delta = - effective_bet
+                    if d_bust:
+                        if is_bj and not d_is_blackjack:
+                            delta = int(1.5 * bet)  # blackjack uses original bet
                         else:
-                            delta = 0  # push
+                            delta = effective_bet
+                    else:
+                        if is_bj and not d_is_blackjack:
+                            delta = int(1.5 * bet)
+                        elif d_is_blackjack and is_bj:
+                            delta = 0  # push on mutual blackjack
+                        else:
+                            if t > d_total:
+                                delta = effective_bet
+                            elif t < d_total:
+                                delta = - effective_bet
+                            else:
+                                delta = 0  # push
 
-            payouts[pid] = payouts.get(pid, 0) + delta
-            eval_rows.append({
-                "name": name,
-                "hand_type": "Blackjack" if is_bj else f"{t}",
-                "is_winner": (delta > 0),
-                "discord_id": pid,
-                "amount_won": delta
-            })
+                total_delta_for_player += delta
+                eval_rows.append({
+                    "name": name,
+                    "hand_type": ("Blackjack" if is_bj else f"{t}") + (f" (Hand {idx+1})" if len(hands) > 1 else ""),
+                    "is_winner": (delta > 0),
+                    "discord_id": pid,
+                    "amount_won": delta
+                })
+
+            payouts[pid] = payouts.get(pid, 0) + total_delta_for_player
 
         # winner_lines for the UI
         for pid, amt in payouts.items():
@@ -1137,10 +1167,14 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             if p:
                                 h = self._active_hand(p)
                                 if h: h["is_standing"] = True
+                                # if player has another hand, keep actor; otherwise advance
+                                if self._active_hand(p):
+                                    self._start_action_timer(state)
+                                else:
+                                    self._advance_actor(state, rid)
+                                    if not state.get("current_actor"):
+                                        await self._to_dealer_turn(state)
                             self._mark_dirty(state)
-                            self._advance_actor(state, rid)
-                            if not state.get("current_actor"):
-                                await self._to_dealer_turn(state)
 
                 elif phase == PHASE_DEALER_TURN:
                     # Wait for reveal delay, then auto-hit while total <= 16. Stop at >=17 or bust.
@@ -1417,67 +1451,136 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 # PLAYER TURN
                 elif state.get("current_round") == PHASE_PLAYER_TURN and state.get("current_actor") == actor:
                     p = self._find_player(state, actor)
-                    h = self._active_hand(p) if p else None
+                    h_idx = self._active_hand_index(p) if p else None
+                    h = (p.get("hands") or [])[h_idx] if (p and h_idx is not None) else None
+
                     if p and h:
                         cards = h.get("cards") or []
                         total, is_bj, is_busted, _ = bj_total(cards)
 
+                        def _maybe_continue_same_player_after_this_hand():
+                            """
+                            If the same player still has another actionable hand, keep the actor,
+                            auto-deal one to that next hand (if it only has its split card),
+                            refresh the action timer, and DO NOT advance to next player.
+                            Returns True if we stayed on the same player, False if we advanced.
+                            """
+                            next_idx = self._active_hand_index(p)
+                            if next_idx is not None:  # player still has an active hand
+                                next_hand = (p.get("hands") or [])[next_idx]
+                                self._ensure_one_card_if_needed(state, next_hand)
+                                self._start_action_timer(state)  # refresh 60s for the new hand
+                                return True
+                            # otherwise, normal advancement
+                            self._advance_actor(state, room_id)
+                            return False
+
+                        changed_local = False
+
                         if move == "hit":
-                            c = self._deal_card(state)
-                            if c:
-                                h["cards"].append(_sanitize_card_dict(c))
-                                total, is_bj, is_busted, _ = bj_total(h["cards"])
-                                h["total"] = total
-                                h["is_busted"] = is_busted
-                                h["has_acted"] = True
+                            self._deal_one_to_hand(state, h)
+                            h["has_acted"] = True
+                            # recompute post-hit
+                            total, _, is_busted, _ = bj_total(h.get("cards") or [])
+                            h["total"] = total
+                            h["is_busted"] = is_busted
                             if is_busted or total >= 21:
                                 h["is_standing"] = True
-                                self._advance_actor(state, room_id)
-                            changed = True
+                                stayed = _maybe_continue_same_player_after_this_hand()
+                                if not stayed and not state.get("current_actor"):
+                                    await self._to_dealer_turn(state)
+                            changed = changed_local = True
 
                         elif move == "stand":
                             h["is_standing"] = True
                             h["has_acted"] = True
-                            self._advance_actor(state, room_id)
-                            changed = True
+                            stayed = _maybe_continue_same_player_after_this_hand()
+                            if not stayed and not state.get("current_actor"):
+                                await self._to_dealer_turn(state)
+                            changed = changed_local = True
 
                         elif move == "double":
                             h["double"] = True
                             h["has_acted"] = True
                             if amount > 0:
+                                # keep original bet in hand; amount is already debited client-side
                                 h["bet"] = safe_int(h.get("bet"), safe_int(p.get("bet")))
-                            c = self._deal_card(state)
-                            if c:
-                                h["cards"].append(_sanitize_card_dict(c))
-                            total, _, is_busted, _ = bj_total(h["cards"])
-                            h["total"] = total
-                            h["is_busted"] = is_busted
+                            self._deal_one_to_hand(state, h)
                             h["is_standing"] = True
-                            self._advance_actor(state, room_id)
-                            changed = True
+                            stayed = _maybe_continue_same_player_after_this_hand()
+                            if not stayed and not state.get("current_actor"):
+                                await self._to_dealer_turn(state)
+                            changed = changed_local = True
 
                         elif move == "split":
-                            pass
+                            # Preconditions: exactly 2 cards, same rank, first decision on hand, not already split
+                            if len(cards) == 2 and not h.get("has_acted", False) and not p.get("has_split", False):
+                                r0 = (cards[0].get("rank") or "").upper()
+                                r1 = (cards[1].get("rank") or "").upper()
+                                if r0 == r1:
+                                    base_bet = safe_int(h.get("bet"), safe_int(p.get("bet")))
+                                    # If the client supplied a specific amount for the second hand, use it; else mirror base bet.
+                                    bet_B = base_bet if amount <= 0 else amount
+
+                                    # Split into A/B
+                                    cA, cB = cards[0], cards[1]
+                                    # Hand A keeps first card; Hand B starts with second card
+                                    hA = {
+                                        "cards": [cA],
+                                        "total": 0,
+                                        "is_busted": False,
+                                        "is_standing": False,
+                                        "has_acted": False,
+                                        "bet": base_bet,
+                                        "double": False,
+                                        "surrendered": False,
+                                        "insured": False,
+                                    }
+                                    hB = {
+                                        "cards": [cB],
+                                        "total": 0,
+                                        "is_busted": False,
+                                        "is_standing": False,
+                                        "has_acted": False,
+                                        "bet": bet_B,
+                                        "double": False,
+                                        "surrendered": False,
+                                        "insured": False,
+                                    }
+
+                                    # Deal 1 card to Hand A immediately (per rules)
+                                    self._deal_one_to_hand(state, hA)
+
+                                    # Replace player's hands so that A is first, B is second
+                                    hands = p.get("hands") or []
+                                    hands[h_idx] = hA
+                                    hands.insert(h_idx + 1, hB)
+                                    p["hands"] = hands
+                                    p["has_split"] = True
+
+                                    # Keep the same actor on Hand A; refresh timer
+                                    self._start_action_timer(state)
+                                    changed = changed_local = True
 
                         elif move == "surrender":
                             if len(cards) == 2 and not h.get("has_acted", False):
                                 h["surrendered"] = True
                                 h["is_standing"] = True
                                 h["has_acted"] = True
-                                self._advance_actor(state, room_id)
-                                changed = True
+                                stayed = _maybe_continue_same_player_after_this_hand()
+                                if not stayed and not state.get("current_actor"):
+                                    await self._to_dealer_turn(state)
+                                changed = changed_local = True
 
                         elif move == "insurance":
                             if amount > 0 and not h.get("insured", False):
                                 h["insured"] = True
                                 h["insurance_amount"] = amount
                                 h["has_acted"] = True
-                                changed = True
+                                changed = changed_local = True
 
-                        if changed and not state.get("current_actor"):
-                            await self._to_dealer_turn(state)
-
-                        if changed:
+                        if changed_local:
+                            # If no one left to act, dealer turn may be triggered above.
                             self._mark_dirty(state)
                             self._add_room_active(room_id)
 

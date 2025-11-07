@@ -699,6 +699,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         if not ts or not dur:
             return False
         return int(time.time()) >= (int(ts) + int(dur))
+    def _clear_action_timer(self, state: dict):
+        state["action_timer_start"] = None
+        state["action_timer_secs"] = None
+        state["action_deadline_epoch"] = None
+
 
     # ---------------- Dealer & dealing ----------------
     def _fresh_deck(self) -> Deck:
@@ -819,10 +824,12 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state["dealer_reveal_triggered"] = True  # frontend should flip reveal on this
         # wait 2 ticks before dealer auto-hits
         self._start_phase_timer(state, DEALER_REVEAL_WAIT)
+        self._clear_action_timer(state)
         self._mark_dirty(state)
 
     async def _to_showdown(self, state: dict):
         state["current_round"] = PHASE_SHOWDOWN
+        self._clear_action_timer(state)
         self._start_phase_timer(state, POST_ROUND_WAIT_SECS)  # 15s winners screen
         # compute payouts
         await self._compute_and_credit_payouts(state)
@@ -1193,11 +1200,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                         await self._to_showdown(state)
 
                 elif phase == PHASE_SHOWDOWN:
-                    # After 15s of showing winners, go straight to a new betting round
+                    # After 15s of showing winners, transition through a legacy POST_ROUND phase (compat with gamebj.php)
                     if self._timer_expired(state):
                         for p in state.get("players", []):
                             p["bet"] = 0
-                        await self._to_betting(state)
+                        await self._to_post_round(state)
 
                 elif phase == PHASE_POST_ROUND:
                     # For compatibility, immediately start betting again

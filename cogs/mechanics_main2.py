@@ -785,7 +785,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             p["hands"][0]["cards"] = _sanitize_cards_list(cards)
             tot, is_bj, is_busted, _ = bj_total(p["hands"][0]["cards"])
             p["hands"][0]["total"] = tot
-            p["hands"][0"]["is_busted"] = is_busted
+            p["hands"][0]["is_busted"] = is_busted
 
         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
         dt, _, dbust, _ = bj_total(state["dealer_hand"])
@@ -1253,7 +1253,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             p["bet"] = 0
                         await self._to_post_round(state)
 
-                elif phase == PHASE_POST_ROUND:
+                elif phase == PHASE_POST_ROUND]:
                     # For compatibility, immediately start betting again
                     await self._to_betting(state)
 
@@ -1279,42 +1279,20 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
     # ---------------- Connect/Disconnect hooks ----------------
     async def player_connect(self, room_id: str, discord_id: str):
+        """
+        On reconnect: just mark connected and clear DC markers.
+        Do NOT touch seat/bet/hands here—seats were freed at disconnect time.
+        """
         room_id = self._normalize_room_id(room_id)
         try:
             state = await self._load_game_state(room_id) or {'room_id': room_id}
             self._ensure_defaults(state)
             if not state.get("room_id"):
                 state["room_id"] = room_id
-
             p = self._find_player(state, str(discord_id))
             if not p:
                 return True, ""
-
             changed = False
-
-            # If they are reconnecting after a disconnect, treat them as returning *unseated*.
-            was_disconnected = (p.get("connected") is False) or bool(p.get("_dc_since")) or (str(discord_id) in (state.get("pending_disconnects") or {}))
-            if was_disconnected:
-                # If this player was the actor, clear it (prevents stuck action bar/UI)
-                if str(state.get("current_actor") or "") == str(discord_id):
-                    state["current_actor"] = None
-                    changed = True
-
-                # Unseat and clear per-hand/per-bet transient state
-                if p.get("seat_id") is not None:
-                    p["seat_id"] = None
-                    changed = True
-                if p.get("hands"):
-                    p["hands"] = []
-                    changed = True
-                if safe_int(p.get("bet")) != 0:
-                    p["bet"] = 0
-                    changed = True
-                if not p.get("sitting_out"):
-                    p["sitting_out"] = True
-                    changed = True
-
-            # Normalize connection flags and clear DC markers
             if p.get("connected") is not True:
                 p["connected"] = True
                 changed = True
@@ -1323,7 +1301,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             pend = state.setdefault("pending_disconnects", {})
             if pend.pop(str(discord_id), None) is not None:
                 changed = True
-
             if changed:
                 self._mark_dirty(state)
                 await self._save_game_state(room_id, state)
@@ -1333,6 +1310,10 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return True, ""
 
     async def player_disconnect(self, room_id: str, discord_id: str):
+        """
+        On disconnect: immediately relinquish the seat and clear transient hand/bet state,
+        so the client never shows a ghost occupant when they rejoin later.
+        """
         room_id = self._normalize_room_id(room_id)
         try:
             state = await self._load_game_state(room_id) or {'room_id': room_id}
@@ -1340,16 +1321,44 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if not state.get("room_id"):
                 state["room_id"] = room_id
             p = self._find_player(state, str(discord_id))
-            if not p: return True, ""
+            if not p:
+                return True, ""
+
             changed = False
+
+            # If this player was acting, clear actor to avoid stuck UI
+            if str(state.get("current_actor") or "") == str(discord_id):
+                state["current_actor"] = None
+                changed = True
+
+            # Free seat & clear round-transient state
+            if p.get("seat_id") is not None:
+                p["seat_id"] = None
+                changed = True
+            if p.get("hands"):
+                p["hands"] = []
+                changed = True
+            if safe_int(p.get("bet")) != 0:
+                p["bet"] = 0
+                changed = True
+            if not p.get("sitting_out"):
+                p["sitting_out"] = True
+                changed = True
+
+            # Presence markers
             if p.get("connected") is not False:
-                p["connected"] = False; changed = True
+                p["connected"] = False
+                changed = True
             if not p.get("_dc_since"):
-                p["_dc_since"] = int(time.time()); changed = True
+                p["_dc_since"] = int(time.time())
+                changed = True
+
             pend = state.setdefault("pending_disconnects", {})
             deadline = int(time.time()) + DISCONNECT_GRACE_SECS
             if pend.get(str(discord_id)) != deadline:
-                pend[str(discord_id)] = deadline; changed = True
+                pend[str(discord_id)] = deadline
+                changed = True
+
             if changed:
                 self._mark_dirty(state)
                 await self._save_game_state(room_id, state)

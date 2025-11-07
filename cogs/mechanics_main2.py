@@ -1,4 +1,3 @@
-
 import logging
 import json
 import aiomysql
@@ -484,6 +483,11 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             "current_actor": state.get("current_actor"),
             "__rev": state.get("__rev", 0),
             "ui_for_current_actor": self._build_ui_hint_for_actor(state),
+
+            # Keep dealer visible during player turns
+            "dealer_hand": _sanitize_cards_list(state.get("dealer_hand") or []),
+            "dealer_total": state.get("dealer_total"),
+            "dealer_reveal_triggered": state.get("dealer_reveal_triggered", False),
         }
         msg = json.dumps(payload)
         for ws in list(bucket):
@@ -848,7 +852,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         self._add_room_active(state.get("room_id") or "")
 
     async def _to_post_round(self, state: dict):
-        state["current_round"] = PHASE_POST_ROUND
+        state["current_round"] = PHASE_POST_ROUND"
         # cleanup: zero bets after credit is done
         for p in state.get("players", []):
             p["bet"] = 0
@@ -862,17 +866,18 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
           - Blackjack (2-card 21) pays 3:2 unless dealer also blackjack (push).
           - Bust loses.
           - Surrender loses half.
-          - Double: bet doubled; draw one card then stand (handled earlier); settle at 1:1.
-          - Insurance (not fully enforced here; placeholder for future).
+          - Double: bet doubled; settle at 1:1 on the doubled amount.
+          - Insurance (placeholder).
         """
         state["dealer_hand"] = _sanitize_cards_list(state.get("dealer_hand") or [])
         dealer_cards = state["dealer_hand"]
         d_total, d_bj, d_bust, _ = bj_total(dealer_cards)
         d_is_blackjack = (len(dealer_cards) == 2 and d_total == 21)
 
-        payouts = {}  # discord_id -> amount delta (+ means credit)
-        winner_lines = []
-        eval_rows = []
+        payouts = {}         # discord_id -> int (aggregate)
+        winner_lines = []    # keeps +/- summary lines like before
+        push_lines = []      # NEW: explicit push notices
+        eval_rows = []       # per-hand rows for UI tables
 
         for p in state.get("players", []):
             pid = str(p.get("discord_id"))
@@ -880,13 +885,16 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             hands = p.get("hands") or []
             base_bet = safe_int(p.get("bet"), 0)
 
-            # If no hand (didn't bet), add neutral row
             if not hands:
-                eval_rows.append({"name": name, "hand_type": "", "is_winner": False, "discord_id": pid, "amount_won": 0})
+                # No bet placed this round: neutral row (kept for table alignment)
+                eval_rows.append({
+                    "name": name, "hand_type": "", "is_winner": False,
+                    "discord_id": pid, "amount_won": 0, "result": "no_bet"
+                })
                 continue
 
-            # Iterate all hands and accumulate deltas
             total_delta_for_player = 0
+
             for idx, h in enumerate(hands):
                 h["cards"] = _sanitize_cards_list(h.get("cards") or [])
                 bet = safe_int(h.get("bet"), base_bet)
@@ -897,45 +905,63 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 effective_bet = bet * (2 if doubled else 1)
 
                 delta = 0
+                result_str = "lose"
+
                 if surrender:
                     delta = - (effective_bet // 2)
+                    result_str = "surrender"
                 elif bust:
                     delta = - effective_bet
+                    result_str = "lose"
                 else:
                     if d_bust:
                         if is_bj and not d_is_blackjack:
-                            delta = int(1.5 * bet)  # blackjack uses original bet
+                            delta = int(1.5 * bet)
+                            result_str = "win"
                         else:
                             delta = effective_bet
+                            result_str = "win"
                     else:
                         if is_bj and not d_is_blackjack:
                             delta = int(1.5 * bet)
+                            result_str = "win"
                         elif d_is_blackjack and is_bj:
-                            delta = 0  # push on mutual blackjack
+                            delta = 0
+                            result_str = "push"
                         else:
                             if t > d_total:
                                 delta = effective_bet
+                                result_str = "win"
                             elif t < d_total:
                                 delta = - effective_bet
+                                result_str = "lose"
                             else:
-                                delta = 0  # push
+                                delta = 0
+                                result_str = "push"
 
                 total_delta_for_player += delta
+
                 eval_rows.append({
                     "name": name,
                     "hand_type": ("Blackjack" if is_bj else f"{t}") + (f" (Hand {idx+1})" if len(hands) > 1 else ""),
                     "is_winner": (delta > 0),
                     "discord_id": pid,
-                    "amount_won": delta
+                    "amount_won": delta,
+                    "result": result_str,  # NEW
+                    "bet": bet,            # handy if UI wants to show “kept $X”
                 })
+
+                # Collect explicit push notices per *hand*:
+                if result_str == "push":
+                    push_lines.append(f"{name}: PUSH (keeps bet ${bet:,})" + (f" – Hand {idx+1}" if len(hands) > 1 else ""))
 
             payouts[pid] = payouts.get(pid, 0) + total_delta_for_player
 
-        # winner_lines for the UI
+        # winner_lines (aggregate +/- like before)
         for pid, amt in payouts.items():
             nm = None
             for row in eval_rows:
-                if row["discord_id"] == pid:
+                if row["discord_id"] == pid and row["name"]:
                     nm = row["name"]; break
             if nm is None: nm = "Player"
             if amt != 0:
@@ -944,9 +970,14 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
         state["last_evaluation"] = {
             "evaluations": eval_rows,
-            "dealer_evaluation": {"hand_type": "Blackjack" if d_is_blackjack else f"{d_total}"},
-            "winner_lines": winner_lines
+            "dealer_evaluation": {
+                "hand_type": "Blackjack" if d_is_blackjack else f"{d_total}",
+                "total": d_total
+            },
+            "winner_lines": winner_lines,
+            "push_lines": push_lines,   # NEW
         }
+
         state["pending_payouts"] = {"payouts": {k: int(v) for k, v in payouts.items()}, "credited": False}
 
         try:

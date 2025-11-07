@@ -834,6 +834,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         # compute payouts
         await self._compute_and_credit_payouts(state)
         self._mark_dirty(state)
+        self._add_room_active(state.get("room_id") or "")
 
     async def _to_post_round(self, state: dict):
         state["current_round"] = PHASE_POST_ROUND
@@ -1190,8 +1191,12 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             total, is_bj, is_busted, soft = bj_total(state.get("dealer_hand") or [])
                             if total <= 16:
                                 c = self._deal_card(state)
-                                if c: state["dealer_hand"].append(_sanitize_card_dict(c))
-                                continue
+                                if c:
+                                    state["dealer_hand"].append(_sanitize_card_dict(c))
+                                    continue
+                                else:
+                                    logger.error("Deck exhausted during dealer_turn; breaking to showdown")
+                                    break
                             break
                         state["dealer_hand"] = _sanitize_cards_list(state["dealer_hand"])
                         dt, _, _, _ = bj_total(state["dealer_hand"])
@@ -1426,6 +1431,134 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 elif phase == PHASE_POST_ROUND:
                     await self._to_betting(state)
                 self._add_room_active(room_id)
+
+            elif action == 'player_action':
+                move = (data.get("move") or "").lower()
+                actor = str(sender_id or data.get("discord_id"))
+                amount = safe_int(data.get("amount"), 0)
+
+                changed = False
+
+                # BETTING phase (per-player, actor-gated; hold'em parity)
+                if move == "bet" and state.get("current_round") == PHASE_BETTING:
+                    if state.get("current_actor") == actor and self._eligible_for_betting(state, room_id, actor):
+                        p = self._find_player(state, actor)
+                        if p:
+                            mn = int(state.get("min_bet") or 0)
+                            mx = int(state.get("max_bet") or 0)
+                            if amount >= mn and (mx <= 0 or amount <= mx):
+                                p["bet"] = amount
+                                # clear any skip flag for safety
+                                (state.setdefault("_betting_skip_round", {})).pop(actor, None)
+                                changed = True
+                                self._mark_dirty(state)
+                                if self._all_bets_placed_or_skipped(state, room_id):
+                                    await self._to_dealing(state)
+                                    await self._to_player_turn(state)
+                                else:
+                                    self._advance_betting_actor(state, room_id)
+                                self._add_room_active(room_id)
+
+                # PLAYER TURN
+                elif state.get("current_round") == PHASE_PLAYER_TURN and state.get("current_actor") == actor:
+                    p = self._find_player(state, actor)
+                    h_idx = self._active_hand_index(p) if p else None
+                    h = (p.get("hands") or [])[h_idx] if (p and h_idx is not None) else None
+
+                    if p and h:
+                        cards = h.get("cards") or []
+                        total, is_bj, is_busted, _ = bj_total(cards)
+
+                        def _maybe_continue_same_player_after_this_hand():
+                            # If the same player still has another actionable hand, keep the actor,
+                            # auto-deal one to that next hand (if it only has its split card),
+                            # refresh the action timer, and DO NOT advance to next player.
+                            next_idx = self._active_hand_index(p)
+                            if next_idx is not None:  # player still has an active hand
+                                next_hand = (p.get("hands") or [])[next_idx]
+                                self._ensure_one_card_if_needed(state, next_hand)
+                                self._start_action_timer(state)  # refresh 60s for the new hand
+                                return True
+                            # otherwise, normal advancement
+                            self._advance_actor(state, room_id)
+                            return False
+
+                        changed_local = False
+
+                        if move == "hit":
+                            self._deal_one_to_hand(state, h)
+                            h["has_acted"] = True
+                            total, _, is_busted, _ = bj_total(h.get("cards") or [])
+                            h["total"] = total
+                            h["is_busted"] = is_busted
+                            if is_busted or total >= 21:
+                                h["is_standing"] = True
+                                stayed = _maybe_continue_same_player_after_this_hand()
+                                if not stayed and not state.get("current_actor"):
+                                    await self._to_dealer_turn(state)
+                            changed = changed_local = True
+
+                        elif move == "stand":
+                            h["is_standing"] = True
+                            h["has_acted"] = True
+                            stayed = _maybe_continue_same_player_after_this_hand()
+                            if not stayed and not state.get("current_actor"):
+                                await self._to_dealer_turn(state)
+                            changed = changed_local = True
+
+                        elif move == "double":
+                            # Only allow on first decision with 2 cards
+                            if len(cards) == 2 and not h.get("has_acted", False):
+                                h["double"] = True
+                                h["has_acted"] = True
+                                if amount > 0:
+                                    h["bet"] = safe_int(h.get("bet"), safe_int(p.get("bet")))
+                                self._deal_one_to_hand(state, h)
+                                h["is_standing"] = True
+                                stayed = _maybe_continue_same_player_after_this_hand()
+                                if not stayed and not state.get("current_actor"):
+                                    await self._to_dealer_turn(state)
+                                changed = changed_local = True
+
+                        elif move == "split":
+                            if len(cards) == 2 and not h.get("has_acted", False) and not p.get("has_split", False):
+                                r0 = (cards[0].get("rank") or "").upper()
+                                r1 = (cards[1].get("rank") or "").upper()
+                                if r0 == r1:
+                                    base_bet = safe_int(h.get("bet"), safe_int(p.get("bet")))
+                                    bet_B = base_bet if amount <= 0 else amount
+                                    cA, cB = cards[0], cards[1]
+                                    hA = {"cards":[cA], "total":0, "is_busted":False, "is_standing":False, "has_acted":False, "bet":base_bet, "double":False, "surrendered":False, "insured":False}
+                                    hB = {"cards":[cB], "total":0, "is_busted":False, "is_standing":False, "has_acted":False, "bet":bet_B,   "double":False, "surrendered":False, "insured":False}
+                                    self._deal_one_to_hand(state, hA)
+                                    hands = p.get("hands") or []
+                                    hands[h_idx] = hA
+                                    hands.insert(h_idx + 1, hB)
+                                    p["hands"] = hands
+                                    p["has_split"] = True
+                                    self._start_action_timer(state)
+                                    changed = changed_local = True
+
+                        elif move == "surrender":
+                            if len(cards) == 2 and not h.get("has_acted", False):
+                                h["surrendered"] = True
+                                h["is_standing"] = True
+                                h["has_acted"] = True
+                                stayed = _maybe_continue_same_player_after_this_hand()
+                                if not stayed and not state.get("current_actor"):
+                                    await self._to_dealer_turn(state)
+                                changed = changed_local = True
+
+                        elif move == "insurance":
+                            if amount > 0 and not h.get("insured", False):
+                                h["insured"] = True
+                                h["insurance_amount"] = amount
+                                h["has_acted"] = True
+                                changed = changed_local = True
+
+                        if changed_local:
+                            self._mark_dirty(state)
+                            self._add_room_active(room_id)
 
             # final save/broadcast if changed — authoritative save from action handler
             if int(state.get("__rev") or 0) != int(before_rev):

@@ -1,3 +1,4 @@
+
 import logging
 import json
 import aiomysql
@@ -375,6 +376,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         # added for new mechanics
         state.setdefault("dealer_reveal_triggered", False)
         state.setdefault("_betting_skip_round", {})  # {discord_id: True} mark per-round betting timeouts
+        state.setdefault("pre_game_timer_start", None)
         return state
 
     def _ensure_room_limits(self, state: dict, cfg: dict):
@@ -699,11 +701,20 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         if not ts or not dur:
             return False
         return int(time.time()) >= (int(ts) + int(dur))
+
     def _clear_action_timer(self, state: dict):
         state["action_timer_start"] = None
         state["action_timer_secs"] = None
         state["action_deadline_epoch"] = None
 
+    # --- pre-game helpers ---
+    def _clear_pre_game_countdown(self, state: dict):
+        state["pre_game_timer_start"] = None
+        state["initial_countdown_triggered"] = False
+        self._mark_dirty(state)
+
+    def _seated_players(self, state: dict) -> List[dict]:
+        return [p for p in state.get("players", []) if p.get("seat_id")]
 
     # ---------------- Dealer & dealing ----------------
     def _fresh_deck(self) -> Deck:
@@ -712,9 +723,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         return d
 
     def _deal_card(self, state: dict) -> dict:
-        """
-        ALWAYS returns a real card dict (never placeholders).
-        """
+        """ALWAYS returns a real card dict (never placeholders)."""
         deck = Deck(cards_data=state["deck"]) if state.get("deck") else self._fresh_deck()
         c = deck.deal_card()
         state["deck"] = deck.to_output_format()
@@ -786,6 +795,8 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
     # ---------------- Phase transitions ----------------
     async def _to_betting(self, state: dict):
+        # leaving pre-game -> clear its countdown
+        self._clear_pre_game_countdown(state)
         state["current_round"] = PHASE_BETTING
         # wipe any previous per-round flags
         state["dealer_reveal_triggered"] = False
@@ -1013,6 +1024,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         state["round_timer_start"] = None; state["round_timer_secs"] = None
         state["action_timer_start"] = None; state["action_timer_secs"] = None; state["action_deadline_epoch"] = None
         state["initial_countdown_triggered"] = False
+        state["pre_game_timer_start"] = None
         state["current_actor"] = None
         state["last_evaluation"] = None
         # keep players list but drop hands/bets
@@ -1136,9 +1148,25 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             self._start_action_timer(state)
                         self._mark_dirty(state)
 
+                # --- PRE-GAME BEHAVIOR ---
                 if phase == PHASE_PRE_GAME:
+                    seated = self._seated_players(state)
                     t0 = state.get("pre_game_timer_start")
-                    if t0 and int(time.time()) >= int(t0) + PRE_GAME_WAIT_SECS:
+
+                    # If at least 1 player is seated and no countdown yet, start it.
+                    if seated and not t0:
+                        state["pre_game_timer_start"] = time.time()
+                        state["initial_countdown_triggered"] = True
+                        self._mark_dirty(state)
+                        self._add_room_active(rid)
+                        t0 = state["pre_game_timer_start"]
+
+                    # If table becomes empty during pre-game, clear countdown.
+                    if not seated and t0:
+                        self._clear_pre_game_countdown(state)
+
+                    # Advance to betting after countdown completes (only if someone is seated).
+                    if seated and t0 and int(time.time()) >= int(t0) + PRE_GAME_WAIT_SECS:
                         await self._to_betting(state)
 
                 elif phase == PHASE_BETTING:
@@ -1295,6 +1323,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         Accepts:
           - 'player_sit', 'player_leave'  (universal)
           - 'advance_phase'               (universal/admin)
+          - 'player_action'               (client bets/moves)
         """
         # Normalize payload to dict in case upstream passed a JSON string
         if isinstance(data, str):
@@ -1341,13 +1370,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
             # Identify sender for room-gating (matches hold'em semantics)
             sender_id = str(data.get('sender_id') or data.get('discord_id') or "")
-
-            # ⚠️ Gate ONLY in-hand player actions. Allow seating freely (prevents sit from being blocked).
-            # (All in-hand actions are now handled serverside by timers/phase changes.)
-            # We keep this comment to avoid confusion with the Texas Hold'em variant.
-            # NOTE: 'player_action' branch from earlier iteration intentionally removed for Blackjack.
-            #       The UI should only send 'player_sit', 'player_leave', or 'advance_phase' for admin/testing.
-            #       Player moves are governed by timers, bets, and dealing phases above.
 
             if action == 'player_sit':
                 pdata = data.get('player_data', {})
@@ -1396,6 +1418,9 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             elif action == 'player_leave':
                 player_id = str(sender_id or data.get('discord_id'))
                 self._remove_player_by_id(state, player_id)
+                # If table became empty while in PRE_GAME, ensure countdown cleared
+                if state.get("current_round") == PHASE_PRE_GAME and not self._seated_players(state):
+                    self._clear_pre_game_countdown(state)
                 self._add_room_active(room_id)
 
             elif action == 'advance_phase':

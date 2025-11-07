@@ -174,7 +174,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
     """
     Blackjack mechanics to be used behind the blackjack_ws websocket.
     IMPORTANT: The server NEVER hides cards. It always sends real codes/dicts.
-               The client (gameth.php) decides what to render face-up/back.
+               The client (gamebj.php) decides what to render face-up/back.
     """
     def __init__(self, bot):
         self.bot = bot
@@ -483,11 +483,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             "current_actor": state.get("current_actor"),
             "__rev": state.get("__rev", 0),
             "ui_for_current_actor": self._build_ui_hint_for_actor(state),
-
-            # Keep dealer visible during player turns
-            "dealer_hand": _sanitize_cards_list(state.get("dealer_hand") or []),
-            "dealer_total": state.get("dealer_total"),
-            "dealer_reveal_triggered": state.get("dealer_reveal_triggered", False),
         }
         msg = json.dumps(payload)
         for ws in list(bucket):
@@ -852,7 +847,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         self._add_room_active(state.get("room_id") or "")
 
     async def _to_post_round(self, state: dict):
-        state["current_round"] = PHASE_POST_ROUND"
+        state["current_round"] = PHASE_POST_ROUND
         # cleanup: zero bets after credit is done
         for p in state.get("players", []):
             p["bet"] = 0
@@ -866,18 +861,17 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
           - Blackjack (2-card 21) pays 3:2 unless dealer also blackjack (push).
           - Bust loses.
           - Surrender loses half.
-          - Double: bet doubled; settle at 1:1 on the doubled amount.
-          - Insurance (placeholder).
+          - Double: bet doubled; draw one card then stand (handled earlier); settle at 1:1.
+          - Insurance (not fully enforced here; placeholder for future).
         """
         state["dealer_hand"] = _sanitize_cards_list(state.get("dealer_hand") or [])
         dealer_cards = state["dealer_hand"]
         d_total, d_bj, d_bust, _ = bj_total(dealer_cards)
         d_is_blackjack = (len(dealer_cards) == 2 and d_total == 21)
 
-        payouts = {}         # discord_id -> int (aggregate)
-        winner_lines = []    # keeps +/- summary lines like before
-        push_lines = []      # NEW: explicit push notices
-        eval_rows = []       # per-hand rows for UI tables
+        payouts = {}  # discord_id -> amount delta (+ means credit)
+        winner_lines = []
+        eval_rows = []
 
         for p in state.get("players", []):
             pid = str(p.get("discord_id"))
@@ -885,16 +879,13 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             hands = p.get("hands") or []
             base_bet = safe_int(p.get("bet"), 0)
 
+            # If no hand (didn't bet), add neutral row
             if not hands:
-                # No bet placed this round: neutral row (kept for table alignment)
-                eval_rows.append({
-                    "name": name, "hand_type": "", "is_winner": False,
-                    "discord_id": pid, "amount_won": 0, "result": "no_bet"
-                })
+                eval_rows.append({"name": name, "hand_type": "", "is_winner": False, "discord_id": pid, "amount_won": 0, "result": None})
                 continue
 
+            # Iterate all hands and accumulate deltas
             total_delta_for_player = 0
-
             for idx, h in enumerate(hands):
                 h["cards"] = _sanitize_cards_list(h.get("cards") or [])
                 bet = safe_int(h.get("bet"), base_bet)
@@ -905,79 +896,71 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 effective_bet = bet * (2 if doubled else 1)
 
                 delta = 0
-                result_str = "lose"
+                result = "push"  # default fallback, will be set properly below
 
                 if surrender:
                     delta = - (effective_bet // 2)
-                    result_str = "surrender"
+                    result = "lose"
                 elif bust:
                     delta = - effective_bet
-                    result_str = "lose"
+                    result = "lose"
                 else:
                     if d_bust:
                         if is_bj and not d_is_blackjack:
-                            delta = int(1.5 * bet)
-                            result_str = "win"
+                            delta = int(1.5 * bet)  # blackjack uses original bet
+                            result = "win"
                         else:
                             delta = effective_bet
-                            result_str = "win"
+                            result = "win"
                     else:
                         if is_bj and not d_is_blackjack:
                             delta = int(1.5 * bet)
-                            result_str = "win"
+                            result = "win"
                         elif d_is_blackjack and is_bj:
                             delta = 0
-                            result_str = "push"
+                            result = "push"
                         else:
                             if t > d_total:
                                 delta = effective_bet
-                                result_str = "win"
+                                result = "win"
                             elif t < d_total:
                                 delta = - effective_bet
-                                result_str = "lose"
+                                result = "lose"
                             else:
                                 delta = 0
-                                result_str = "push"
+                                result = "push"
 
                 total_delta_for_player += delta
-
                 eval_rows.append({
                     "name": name,
                     "hand_type": ("Blackjack" if is_bj else f"{t}") + (f" (Hand {idx+1})" if len(hands) > 1 else ""),
                     "is_winner": (delta > 0),
                     "discord_id": pid,
                     "amount_won": delta,
-                    "result": result_str,  # NEW
-                    "bet": bet,            # handy if UI wants to show “kept $X”
+                    "result": result
                 })
-
-                # Collect explicit push notices per *hand*:
-                if result_str == "push":
-                    push_lines.append(f"{name}: PUSH (keeps bet ${bet:,})" + (f" – Hand {idx+1}" if len(hands) > 1 else ""))
 
             payouts[pid] = payouts.get(pid, 0) + total_delta_for_player
 
-        # winner_lines (aggregate +/- like before)
+        # winner_lines for the UI (now includes pushes)
         for pid, amt in payouts.items():
             nm = None
             for row in eval_rows:
-                if row["discord_id"] == pid and row["name"]:
+                if row["discord_id"] == pid:
                     nm = row["name"]; break
             if nm is None: nm = "Player"
-            if amt != 0:
-                sign = "+" if amt > 0 else "-"
-                winner_lines.append(f"{nm}: {sign}${abs(amt):,}")
+            if amt > 0:
+                winner_lines.append(f"{nm}: +${abs(amt):,}")
+            elif amt < 0:
+                winner_lines.append(f"{nm}: -${abs(amt):,}")
+            else:
+                winner_lines.append(f"{nm}: PUSH")
 
         state["last_evaluation"] = {
             "evaluations": eval_rows,
-            "dealer_evaluation": {
-                "hand_type": "Blackjack" if d_is_blackjack else f"{d_total}",
-                "total": d_total
-            },
-            "winner_lines": winner_lines,
-            "push_lines": push_lines,   # NEW
+            "dealer_evaluation": {"hand_type": "Blackjack" if d_is_blackjack else f"{d_total}"},
+            "winner_lines": winner_lines
         }
-
         state["pending_payouts"] = {"payouts": {k: int(v) for k, v in payouts.items()}, "credited": False}
 
         try:
@@ -1403,9 +1386,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             sender_id = str(data.get('sender_id') or data.get('discord_id') or "")
 
             if action == 'player_sit':
-                pdata = data.get('player_data', {})
-                if not isinstance(pdata, dict):
-                    pdata = {}
+                pdata = data.get('player_data', {}) or {}
                 seat_id = pdata.get('seat_id')
                 player_id = str(pdata.get('discord_id') or sender_id)
 
@@ -1418,33 +1399,52 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                     for q in list(state['players']):
                         if str(q.get('seat_id')) == str(seat_id):
                             qid = str(q.get('discord_id'))
-                            if not self._is_within_dc_grace(state, room_id, qid):
+                            if qid != player_id and not self._is_within_dc_grace(state, room_id, qid):
                                 self._remove_player_by_id(state, qid)
 
-                    # prevent dup seat/dup player post-reap
-                    if any(str(p.get('discord_id')) == player_id for p in state['players']):
-                        pass
-                    elif any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
-                        pass
-                    else:
-                        # mid-hand sits are observers until next betting (hold'em parity)
-                        is_mid_hand = state.get("current_round") != PHASE_PRE_GAME
-                        state['players'].append({
-                            'discord_id': player_id,
-                            'name': pdata.get('name', 'Player'),
-                            'seat_id': seat_id,
-                            'avatar_url': pdata.get('avatar_url'),
-                            'bet': 0,
-                            'hands': [],
-                            'connected': True,
-                            'sitting_out': bool(is_mid_hand),
-                        })
-                        # start pre-game countdown (first sitter)
-                        if state['current_round'] == PHASE_PRE_GAME and not state.get('initial_countdown_triggered'):
-                            state['pre_game_timer_start'] = time.time()
-                            state['initial_countdown_triggered'] = True
+                    existing = self._find_player(state, player_id)
+                    is_mid_hand = state.get("current_round") != PHASE_PRE_GAME
+
+                    if existing:
+                        # If seat held by *another* active player still within grace, do nothing
+                        occupied_by_other = any(
+                            (str(p.get('seat_id')) == str(seat_id)) and (str(p.get('discord_id')) != player_id)
+                            for p in state['players']
+                        )
+                        if occupied_by_other:
+                            pass  # seat truly taken
+                        else:
+                            # Re-seat this same player
+                            existing['seat_id'] = seat_id
+                            existing['sitting_out'] = bool(is_mid_hand)
+                            # keep bet/hands unchanged; if mid-hand, they remain observer (sitting_out=True)
+                            existing['connected'] = True
+                            existing['name'] = pdata.get('name', existing.get('name', 'Player'))
+                            existing['avatar_url'] = pdata.get('avatar_url', existing.get('avatar_url'))
+                            self._mark_dirty(state)
                             self._add_room_active(room_id)
-                        self._mark_dirty(state)
+                    else:
+                        # prevent dup seat after reap
+                        if any(str(p.get('seat_id')) == str(seat_id) for p in state['players']):
+                            pass
+                        else:
+                            # new seated player
+                            state['players'].append({
+                                'discord_id': player_id,
+                                'name': pdata.get('name', 'Player'),
+                                'seat_id': seat_id,
+                                'avatar_url': pdata.get('avatar_url'),
+                                'bet': 0,
+                                'hands': [],
+                                'connected': True,
+                                'sitting_out': bool(is_mid_hand),
+                            })
+                            # start pre-game countdown (first sitter)
+                            if state['current_round'] == PHASE_PRE_GAME and not state.get('initial_countdown_triggered'):
+                                state['pre_game_timer_start'] = time.time()
+                                state['initial_countdown_triggered'] = True
+                                self._add_room_active(room_id)
+                            self._mark_dirty(state)
 
             elif action == 'player_leave':
                 player_id = str(sender_id or data.get('discord_id'))

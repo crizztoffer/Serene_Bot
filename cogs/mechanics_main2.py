@@ -309,8 +309,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         rid = self._normalize_room_id(room_id)
         self.bot.ws_rooms.setdefault(rid, set()).add(ws)
         setattr(ws, "_assigned_room", rid)
-        # >>> Ensure timer loop wakes to process presence/reaps
-        self._add_room_active(rid)
         return True
 
     def unregister_ws_connection(self, ws):
@@ -319,9 +317,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             self.bot.ws_rooms[room].discard(ws)
             if not self.bot.ws_rooms[room]:
                 del self.bot.ws_rooms[room]
-        # >>> Nudge timers in case a disconnect leaves a pending reap
-        if room:
-            self._add_room_active(room)
 
     # ---- Presence tagging helpers (bot.blackjack_ws_handler should set ws._player_id) ----
     def _is_ws_connected(self, room_id: str, player_id: str) -> bool:
@@ -862,12 +857,13 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
     async def _compute_and_credit_payouts(self, state: dict):
         """
         Build last_evaluation and credit winners (idempotent).
-        Rules:
-          - Blackjack (2-card 21) pays 3:2 unless dealer also blackjack (push).
-          - Bust loses.
-          - Surrender loses half.
-          - Double: bet doubled; draw one card then stand (handled earlier); settle at 1:1.
-          - Insurance (not fully enforced here; placeholder for future).
+        Standard rules implemented:
+          - Dealer blackjack: non-blackjack players lose; player blackjack pushes.
+          - Dealer bust: surviving players win 1:1; player natural blackjack pays 3:2.
+          - Otherwise compare totals; player natural blackjack pays 3:2.
+          - Surrender loses half of the (possibly doubled) bet.
+          - Double doubles the main bet; settle at 1:1 on win/lose (blackjack cannot occur after doubling).
+          - Insurance: if taken, pays 2:1 when dealer has blackjack; otherwise the insurance stake is lost.
         """
         state["dealer_hand"] = _sanitize_cards_list(state.get("dealer_hand") or [])
         dealer_cards = state["dealer_hand"]
@@ -896,44 +892,67 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 bet = safe_int(h.get("bet"), base_bet)
                 doubled = bool(h.get("double"))
                 surrender = bool(h.get("surrendered"))
+                insured = bool(h.get("insured"))
+                insurance_amt = safe_int(h.get("insurance_amount"), 0)
+
                 cards = h.get("cards") or []
                 t, is_bj, bust, _ = bj_total(cards)
                 effective_bet = bet * (2 if doubled else 1)
 
                 delta = 0
-                result = "push"  # default fallback, will be set properly below
+                result = "push"  # set below
 
+                # Surrender first (early surrender only) -> lose half of effective bet
                 if surrender:
                     delta = - (effective_bet // 2)
                     result = "lose"
+                # Bust -> lose full effective bet
                 elif bust:
                     delta = - effective_bet
                     result = "lose"
                 else:
-                    if d_bust:
-                        if is_bj and not d_is_blackjack:
-                            delta = int(1.5 * bet)  # blackjack uses original bet
-                            result = "win"
-                        else:
-                            delta = effective_bet
-                            result = "win"
-                    else:
-                        if is_bj and not d_is_blackjack:
-                            delta = int(1.5 * bet)
-                            result = "win"
-                        elif d_is_blackjack and is_bj:
+                    # Dealer has blackjack special handling (beats 21 made in >2 cards)
+                    if d_is_blackjack:
+                        if is_bj:
                             delta = 0
                             result = "push"
                         else:
-                            if t > d_total:
+                            delta = - effective_bet
+                            result = "lose"
+                    else:
+                        # Dealer did not have blackjack
+                        if d_bust:
+                            # Dealer bust: player wins 1:1 unless player's a natural blackjack (still 3:2)
+                            if is_bj:
+                                delta = int(1.5 * bet)
+                                result = "win"
+                            else:
                                 delta = effective_bet
                                 result = "win"
-                            elif t < d_total:
-                                delta = - effective_bet
-                                result = "lose"
+                        else:
+                            # Normal compare
+                            if is_bj:
+                                # Player natural blackjack vs non-blackjack dealer
+                                delta = int(1.5 * bet)
+                                result = "win"
                             else:
-                                delta = 0
-                                result = "push"
+                                if t > d_total:
+                                    delta = effective_bet
+                                    result = "win"
+                                elif t < d_total:
+                                    delta = - effective_bet
+                                    result = "lose"
+                                else:
+                                    # Tie -> push
+                                    delta = 0
+                                    result = "push"
+
+                # Settle insurance (independent side bet) LAST
+                if insured and insurance_amt > 0:
+                    if d_is_blackjack:
+                        delta += insurance_amt * 2  # 2:1 payout; stake is returned implicitly via +2*stake - stake below
+                    else:
+                        delta -= insurance_amt       # lost insurance stake when dealer not blackjack
 
                 total_delta_for_player += delta
                 eval_rows.append({
@@ -947,7 +966,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
 
             payouts[pid] = payouts.get(pid, 0) + total_delta_for_player
 
-        # winner_lines for the UI (now includes pushes)
+        # winner_lines for the UI (include pushes)
         for pid, amt in payouts.items():
             nm = None
             for row in eval_rows:
@@ -1162,7 +1181,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                 elif phase == PHASE_PLAYER_TURN:
                     if state.get("current_actor") and not self._eligible_for_action(state, rid, str(state["current_actor"])):
                         state["current_actor"] = self._next_in_round(ids, state.get("current_actor"),
-                                                                    lambda pid: self._eligible_for_action(state, rid, pid))
+                                                                     lambda pid: self._eligible_for_action(state, rid, pid))
                         if state.get("current_actor"):
                             self._start_action_timer(state)
                         self._mark_dirty(state)
@@ -1291,10 +1310,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if not state.get("room_id"):
                 state["room_id"] = room_id
             p = self._find_player(state, str(discord_id))
-            if not p: 
-                # still wake timers so any old ghosts can be reaped
-                self._add_room_active(room_id)
-                return True, ""
+            if not p: return True, ""
             changed = False
             if p.get("connected") is not True:
                 p["connected"] = True
@@ -1310,9 +1326,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         except Exception as e:
             logger.error(f"player_connect error [{room_id}/{discord_id}]: {e}", exc_info=True)
             return False, str(e)
-        finally:
-            # >>> make sure the timer loop runs to reconcile state immediately
-            self._add_room_active(room_id)
         return True, ""
 
     async def player_disconnect(self, room_id: str, discord_id: str):
@@ -1323,10 +1336,7 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
             if not state.get("room_id"):
                 state["room_id"] = room_id
             p = self._find_player(state, str(discord_id))
-            if not p: 
-                # still wake timers so reaps can clear any stale records
-                self._add_room_active(room_id)
-                return True, ""
+            if not p: return True, ""
             changed = False
             if p.get("connected") is not False:
                 p["connected"] = False; changed = True
@@ -1342,9 +1352,6 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
         except Exception as e:
             logger.error(f"player_disconnect error [{room_id}/{discord_id}]: {e}", exc_info=True)
             return False, str(e)
-        finally:
-            # >>> CRUCIAL: wake the timer loop so the grace window gets processed
-            self._add_room_active(room_id)
         return True, ""
 
     # ---------------- Websocket action handler ----------------
@@ -1564,11 +1571,13 @@ class MechanicsMain2(commands.Cog, name="MechanicsMain2"):
                             total, _, is_busted, _ = bj_total(h.get("cards") or [])
                             h["total"] = total
                             h["is_busted"] = is_busted
-                            if is_busted or total >= 21:
+                            # Only auto-stand on BUST; do NOT auto-stand on 21
+                            if is_busted:
                                 h["is_standing"] = True
                                 stayed = _maybe_continue_same_player_after_this_hand()
                                 if not stayed and not state.get("current_actor"):
                                     await self._to_dealer_turn(state)
+                            # if not busted, player retains turn (can press Stand manually; on timeout we auto-stand)
                             changed = changed_local = True
 
                         elif move == "stand":

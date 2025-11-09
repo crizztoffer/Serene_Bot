@@ -92,8 +92,12 @@ class KekchipzCommands(commands.Cog):
             
             discord_file = discord.File(image_bytes, filename="kekchipz_balance.png")
 
+            # --- MODIFICATION HERE ---
             # Use ctx.send instead of interaction.followup.send
-            await ctx.send(file=discord_file)
+            # Add the content parameter with the user's name
+            await ctx.send(content=f"{ctx.author.display_name} has:", file=discord_file)
+            # --- END MODIFICATION ---
+
         except Exception as e:
             print(f"Error sending kekchipz balance message for !rank: {e}")
             await ctx.send("An error occurred while trying to display your kekchipz balance.")

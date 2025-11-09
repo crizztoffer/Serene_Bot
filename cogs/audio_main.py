@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 SOUND_COMMAND_RE = re.compile(r'^!([A-Za-z0-9_-]{1,64})(?:\s+(\d{2,3}))?$')
+# --- THIS IS THE MISSING LINE ---
+SOUND_NAME_RE = re.compile(r'^([A-Za-z0-9_-]{1,64})$') 
+# --- END FIX ---
 SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
 # We no longer need the UPLOAD_URL or CONVERTER_SECRET
 

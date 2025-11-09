@@ -5,9 +5,10 @@ from discord.ext import commands
 import re
 import aiohttp
 import asyncio
-import os
 import logging
 import io
+from typing import Optional  # <-- was missing
+
 try:
     import pydub
 except ImportError:
@@ -17,21 +18,17 @@ logger = logging.getLogger(__name__)
 
 # --- Constants ---
 SOUND_COMMAND_RE = re.compile(r'^!([A-Za-z0-9_-]{1,64})(?:\s+(\d{2,3}))?$')
-# --- THIS IS THE MISSING LINE ---
-SOUND_NAME_RE = re.compile(r'^([A-Za-z0-9_-]{1,64})$') 
-# --- END FIX ---
+SOUND_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}$')  # <-- you referenced this but hadn’t defined it
 SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
-# We no longer need the UPLOAD_URL or CONVERTER_SECRET
 
 class AudioMain(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.http_session = aiohttp.ClientSession()
         if pydub is None:
-            logger.critical("!!! pydub library is not installed! Audio conversion will fail. !!!")
+            logger.critical("!!! pydub is not installed! Audio conversion will fail. !!!")
 
     def cog_unload(self):
-        """Cog shutdown cleanup."""
         try:
             if not self.http_session.closed:
                 asyncio.create_task(self.http_session.close())
@@ -39,103 +36,107 @@ class AudioMain(commands.Cog):
             pass
 
     def _get_file_url(self, name: str, extension: str) -> str:
-        """Gets the full, direct URL to a sound file."""
         return f"{SOUND_BASE_URL}/{name}.{extension}"
 
     async def _download_file_data(self, url: str) -> Optional[bytes]:
-        """Downloads the raw bytes of a file from a URL."""
         try:
             async with self.http_session.get(url) as resp:
                 if resp.status == 200:
                     return await resp.read()
-                else:
-                    logger.warning(f"Failed to download {url} (status: {resp.status})")
-                    return None
+                logger.warning(f"Failed to download {url} (status: {resp.status})")
+                return None
         except Exception as e:
             logger.error(f"Error downloading {url}: {e}")
             return None
 
     def _convert_ogg_to_mp3(self, ogg_data: bytes) -> Optional[io.BytesIO]:
-        """Converts OGG byte data to MP3 byte data in memory."""
         if pydub is None:
             logger.error("Cannot convert: pydub library is not installed.")
             return None
         try:
             ogg_in_memory = io.BytesIO(ogg_data)
             mp3_in_memory = io.BytesIO()
-
             audio = pydub.AudioSegment.from_file(ogg_in_memory, format="ogg")
             audio.export(mp3_in_memory, format="mp3", bitrate="192k")
-            
             mp3_in_memory.seek(0)
             return mp3_in_memory
         except pydub.exceptions.CouldntFindConversionTool:
-            logger.critical("!!! FFmpeg (or libav) NOT FOUND on Railway !!!")
-            logger.critical("Bot cannot convert audio. Add FFmpeg to your Railway environment (e.g., via nixpacks.toml).")
+            logger.critical("!!! FFmpeg (or libav) NOT FOUND !!!")
             return None
         except Exception as e:
             logger.error(f"In-memory conversion failed: {e}")
             return None
 
+    async def _send_attachment(self, ctx: commands.Context, data: bytes | io.BytesIO, filename: str):
+        """
+        Sends an attachment only (no URL text), ensuring Discord shows the inline player.
+        """
+        # Ensure we have a BytesIO ready
+        file_obj = data if isinstance(data, io.BytesIO) else io.BytesIO(data)
+        file_obj.seek(0)
+        file = discord.File(file_obj, filename=filename)
+
+        # Important: do NOT include a URL in 'content'; just the file.
+        await ctx.send(file=file)
+
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
-        """
-        This is the GLOBAL error handler for the bot.
-        """
-        
         if isinstance(error, commands.CommandNotFound):
             sound_name = ctx.invoked_with
             full_message_match = SOUND_COMMAND_RE.match(ctx.message.content)
 
-            # 2. Check if it's a sound command
             if sound_name and SOUND_NAME_RE.match(sound_name) and full_message_match:
                 mp3_url = self._get_file_url(sound_name, "mp3")
                 ogg_url = self._get_file_url(sound_name, "ogg")
 
                 try:
-                    # 1. Check for existing MP3
+                    # 1) Try MP3 direct
                     mp3_data = await self._download_file_data(mp3_url)
                     if mp3_data:
-                        mp3_file = discord.File(io.BytesIO(mp3_data), filename=f"{sound_name}.mp3")
-                        await ctx.send(file=mp3_file)
-                        return # Handled.
+                        await self._send_attachment(ctx, mp3_data, f"{sound_name}.mp3")
+                        return
 
-                    # 2. No MP3. Check for OGG
+                    # 2) Try OGG, then convert to MP3
                     ogg_data = await self._download_file_data(ogg_url)
                     if ogg_data:
-                        await ctx.message.add_reaction("⏳")
-                        
-                        # Convert OGG to MP3 in memory
+                        try:
+                            await ctx.message.add_reaction("⏳")
+                        except discord.Forbidden:
+                            pass
+
                         mp3_file_data = self._convert_ogg_to_mp3(ogg_data)
-                        
-                        await ctx.message.remove_reaction("⏳", self.bot.user)
+
+                        try:
+                            await ctx.message.remove_reaction("⏳", self.bot.user)
+                        except discord.Forbidden:
+                            pass
 
                         if mp3_file_data:
-                            # Send the *newly converted* MP3 file
-                            mp3_file = discord.File(mp3_file_data, filename=f"{sound_name}.mp3")
-                            await ctx.send(file=mp3_file)
+                            await self._send_attachment(ctx, mp3_file_data, f"{sound_name}.mp3")
                         else:
-                            # Conversion failed, upload the OGG as a fallback
-                            ogg_file = discord.File(io.BytesIO(ogg_data), filename=f"{sound_name}.ogg")
-                            await ctx.send(file=ogg_file)
-                        return # Handled.
+                            # Conversion failed: attach original OGG so at least it plays inline
+                            await self._send_attachment(ctx, ogg_data, f"{sound_name}.ogg")
+                        return
 
-                    # 3. Neither file found
-                    await ctx.message.add_reaction("❓")
-                    return # Handled.
+                    # 3) Neither exists
+                    try:
+                        await ctx.message.add_reaction("❓")
+                    except discord.Forbidden:
+                        pass
+                    return
 
                 except discord.errors.Forbidden:
                     logger.warning(f"Failed to send sound or react in {ctx.channel.id}.")
-                    return # Still "handled"
+                    return
                 except Exception as e:
                     logger.error(f"Error processing sound command: {e}")
-                    return # Still "handled"
-            
-            # 3. It IS CommandNotFound, but it was NOT a sound.
+                    return
+
+            # Not a sound trigger; fallback message
             await ctx.send("Command not found.")
             return
 
-        # 4. Handle all OTHER error types (copied from bot.py)
+        # Other error types
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(f"Missing argument: {error.param.name}.")
         elif isinstance(error, commands.MissingPermissions):

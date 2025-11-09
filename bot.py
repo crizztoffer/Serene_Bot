@@ -2327,17 +2327,17 @@ async def on_message(message):
     if message.author.id != bot.user.id:
         await bot.process_commands(message)
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandNotFound):
-        await ctx.send("Command not found.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(f"Missing argument: {error.param.name}.")
-    elif isinstance(error, commands.MissingPermissions):
-        await ctx.send("You lack permissions.")
-    else:
-        logger.error(f"Command error: {error}")
-        await ctx.send(f"Unexpected error: {error}")
+# @bot.event
+# async def on_command_error(ctx, error):
+#     if isinstance(error, commands.CommandNotFound):
+#         await ctx.send("Command not found.")
+#     elif isinstance(error, commands.MissingRequiredArgument):
+#         await ctx.send(f"Missing argument: {error.param.name}.")
+#     elif isinstance(error, commands.MissingPermissions):
+#         await ctx.send("You lack permissions.")
+#     else:
+#         logger.error(f"Command error: {error}")
+#         await ctx.send(f"Unexpected error: {error}")
 
 # reset continuous session if user goes offline/invisible
 @bot.event

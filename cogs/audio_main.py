@@ -11,10 +11,10 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-# Regex to find ![name] or ![name] 150
-# We will capture the rate (group 2) but ignore it,
-# as Discord's embed player cannot change playback speed.
-DISCORD_SOUND_RE = re.compile(r'!\[\s*([A-Za-z0-9_-]{1,64})\s*\](?:\s+(\d{2,3}))?')
+# --- Constants ---
+# Regex to match a valid sound name.
+# Does NOT include the '!' prefix.
+SOUND_NAME_RE = re.compile(r'^([A-Za-z0-9_-]{1,64})$')
 SOUND_BASE_URL = "https://serenekeks.com/serene_sounds"
 
 class AudioMain(commands.Cog):
@@ -46,50 +46,61 @@ class AudioMain(commands.Cog):
                     headers = {"Range": "bytes=0-0"}
                     async with self.http_session.get(url, headers=headers, allow_redirects=True, timeout=5) as get_resp:
                         return get_resp.status in (200, 206)
+                # Any other status (like 404)
                 return False
         except Exception as e:
             logger.warning(f"Failed to check sound URL {url}: {e}")
             return False
 
     @commands.Cog.listener()
-    async def on_message(self, message: discord.Message):
-        # Ignore bots, DMs, and messages without content
-        if message.author.bot or not message.guild or not message.content:
-            return
-
-        # Check if the message matches the ![sound] format
-        match = DISCORD_SOUND_RE.search(message.content)
-        if not match:
-            return
-
-        # --- We have a match, process the sound ---
-        sound_name = match.group(1)
-        # We parse the rate (match.group(2)) but deliberately ignore it.
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
+        """
+        Listens for command errors. If a command is "not found,"
+        this will check if it's a valid sound name and play it.
+        """
         
-        url = self._sound_url(sound_name)
-
-        # 1. Check if sound exists
-        if not await self._sound_exists(url):
-            try:
-                # Add a 'not found' reaction
-                await message.add_reaction("❓") 
-            except discord.HTTPException:
-                pass # Ignore if we can't add reaction
-            return
-
-        # 2. Post the URL
-        try:
-            # Send the URL. Discord will auto-embed the player.
-            await message.channel.send(url)
+        if isinstance(error, commands.CommandNotFound):
+            # 'ctx.invoked_with' is the command name the user *tried* to use, e.g., "ha7"
+            command_name = ctx.invoked_with
             
-            # 3. (Optional) Delete the user's triggering message to keep chat clean
-            await message.delete()
+            # Check if this "command name" looks like a sound
+            if command_name and SOUND_NAME_RE.match(command_name):
+                url = self._sound_url(command_name)
+                
+                if await self._sound_exists(url):
+                    # --- SUCCESS ---
+                    # It's a valid sound. Post the URL and stop.
+                    try:
+                        await ctx.send(url)
+                    except Exception as e:
+                        logger.error(f"Error sending sound URL: {e}")
+                    finally:
+                        return # Stop all further error processing
+                else:
+                    # --- FAILED SOUND ---
+                    # It *looked* like a sound, but the file doesn't exist.
+                    # Be silent and stop processing.
+                    return 
 
-        except discord.errors.Forbidden:
-            logger.warning(f"Failed to send sound or delete message in {message.channel.id}. Check permissions.")
-        except Exception as e:
-            logger.error(f"Error sending sound URL: {e}")
-
+        # --- FALLTHROUGH FOR OTHER ERRORS ---
+        # If the error was *not* a CommandNotFound, or if it was
+        # CommandNotFound but *didn't* match the sound regex,
+        # handle it normally (replicating your bot.py logic).
+        
+        if isinstance(error, commands.CommandNotFound):
+            # This will only be reached if the command was NOT a sound.
+            await ctx.send("Command not found.")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send(f"Missing argument: {error.param.name}.")
+        elif isinstance(error, commands.MissingPermissions):
+            await ctx.send("You lack permissions.")
+        elif isinstance(error, commands.CommandInvokeError):
+            logger.error(f"Command invoke error for '{ctx.command}': {error.original}")
+            await ctx.send(f"An unexpected error occurred: {error.original}")
+        else:
+            logger.error(f"Unhandled command error: {error}")
+            # You may or may not want to send this to the channel
+            # await ctx.send(f"Unexpected error: {error}")
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(AudioMain(bot))

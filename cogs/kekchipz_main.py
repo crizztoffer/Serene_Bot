@@ -7,6 +7,16 @@ import os
 import importlib.util
 import logging
 
+# --- NEW IMPORT ---
+# Import the image creation function from balance.py
+try:
+    from .kekchipz.balance import create_kekchipz_balance_image
+except ImportError:
+    # Fallback for dynamic loading or different structure
+    create_kekchipz_balance_image = None
+    logging.warning("Could not directly import create_kekchipz_balance_image. Text command !rank may fail.")
+
+
 logger = logging.getLogger(__name__)
 
 class KekchipzCommands(commands.Cog):
@@ -53,6 +63,41 @@ class KekchipzCommands(commands.Cog):
             return []
         files = [f[:-3] for f in os.listdir(kekchipz_path) if f.endswith(".py") and f != "__init__.py"]
         return [app_commands.Choice(name=f, value=f) for f in files if current.lower() in f.lower()]
+
+    # --- NEW TEXT COMMAND ---
+    @commands.command(name="rank")
+    async def rank_command(self, ctx: commands.Context):
+        """
+        Displays the user's kekchipz balance. (Text command alias for /serene kekchipz balance)
+        """
+        if create_kekchipz_balance_image is None:
+            await ctx.send("Error: The balance image function is not available.")
+            logger.error("!rank command failed: create_kekchipz_balance_image was not imported.")
+            return
+
+        db_config = {
+            'host': self.bot.db_host,
+            'user': self.bot.db_user,
+            'password': self.bot.db_password
+        }
+
+        try:
+            # Use ctx.author and ctx.guild instead of interaction.user/interaction.guild
+            image_bytes = await create_kekchipz_balance_image(
+                ctx.guild.id,
+                ctx.author.id,
+                ctx.author.display_name,
+                db_config
+            )
+            
+            discord_file = discord.File(image_bytes, filename="kekchipz_balance.png")
+
+            # Use ctx.send instead of interaction.followup.send
+            await ctx.send(file=discord_file)
+        except Exception as e:
+            print(f"Error sending kekchipz balance message for !rank: {e}")
+            await ctx.send("An error occurred while trying to display your kekchipz balance.")
+
 
 async def setup(bot):
     await bot.add_cog(KekchipzCommands(bot))

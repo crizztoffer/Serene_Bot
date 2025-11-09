@@ -89,28 +89,30 @@ class AudioMain(commands.Cog):
             logger.error(f"Export to MP3 failed: {e}")
             return None
 
-    async def _send_mp3_segment(self, ctx: commands.Context, segment: "pydub.AudioSegment", out_name: str):
+    async def _reply_mp3_segment(self, ctx: commands.Context, segment: "pydub.AudioSegment", out_name: str):
         """
-        Export 'segment' to MP3 in-memory and send as an attachment named out_name.
+        Export 'segment' to MP3 in-memory and reply with it as an attachment named out_name.
         No files are saved to disk or persisted elsewhere.
         """
         out_io = self._export_mp3(segment)
         if out_io is None:
-            await ctx.send("Couldn't encode MP3 (FFmpeg/pydub issue).")
+            await ctx.reply("Couldn't encode MP3 (FFmpeg/pydub issue).", mention_author=False)
             return
-        await ctx.send(file=discord.File(out_io, filename=out_name))
+        await ctx.reply(file=discord.File(out_io, filename=out_name), mention_author=False)
 
-    async def _send_raw_bytes(self, ctx: commands.Context, data: bytes, out_name: str):
-        """Send already-encoded bytes as an attachment (no text)."""
+    async def _reply_raw_bytes(self, ctx: commands.Context, data: bytes, out_name: str):
+        """Reply with already-encoded bytes as an attachment (no text)."""
         bio = io.BytesIO(data)
         bio.seek(0)
-        await ctx.send(file=discord.File(bio, filename=out_name))
+        await ctx.reply(file=discord.File(bio, filename=out_name), mention_author=False)
 
     @commands.Cog.listener()
     async def on_command_error(self, ctx: commands.Context, error: commands.CommandError):
         """
         GLOBAL error handler.
         Intercepts CommandNotFound to treat '!<sound> [pitch]' as a sound trigger.
+        Replies with the attachment (threaded under the user's message). No hourglass reactions.
+        Shows the standard typing indicator during longer operations.
         """
         if isinstance(error, commands.CommandNotFound):
             sound_name = ctx.invoked_with
@@ -128,76 +130,60 @@ class AudioMain(commands.Cog):
 
                     # Validate 50..200 if provided
                     if pitch_percent is not None and not (50 <= pitch_percent <= 200):
-                        await ctx.send("Pitch must be an integer between **50** and **200**.")
+                        await ctx.reply("Pitch must be an integer between **50** and **200**.", mention_author=False)
                         return
 
                 mp3_url = self._get_file_url(sound_name, "mp3")
                 ogg_url = self._get_file_url(sound_name, "ogg")
 
                 try:
-                    # 1) Try MP3 source
-                    mp3_data = await self._download_file_data(mp3_url)
-                    if mp3_data:
-                        # If no pitch requested (or 100) or no pydub available, send original bytes
-                        if pitch_percent is None or pitch_percent == 100 or pydub is None:
-                            await self._send_raw_bytes(ctx, mp3_data, f"{sound_name}.mp3")
+                    # Show "typing..." while we potentially download/convert
+                    async with ctx.typing():
+                        # 1) Try MP3 source
+                        mp3_data = await self._download_file_data(mp3_url)
+                        if mp3_data:
+                            # If no pitch requested (or 100) or no pydub available, reply original bytes
+                            if pitch_percent is None or pitch_percent == 100 or pydub is None:
+                                await self._reply_raw_bytes(ctx, mp3_data, f"{sound_name}.mp3")
+                                return
+
+                            # Pitch in-memory, then export+reply as mp3 with original name
+                            segment = self._segment_from_bytes(mp3_data, "mp3")
+                            if segment is not None:
+                                segment = self._apply_pitch_percent(segment, pitch_percent)
+                                await self._reply_mp3_segment(ctx, segment, f"{sound_name}.mp3")
+                                return
+
+                            # Decode failed; reply original
+                            await self._reply_raw_bytes(ctx, mp3_data, f"{sound_name}.mp3")
                             return
 
-                        # Pitch in-memory, then export+send as mp3 with original name
-                        segment = self._segment_from_bytes(mp3_data, "mp3")
-                        if segment is not None:
-                            segment = self._apply_pitch_percent(segment, pitch_percent)
-                            await self._send_mp3_segment(ctx, segment, f"{sound_name}.mp3")
+                        # 2) Try OGG source (decode → (pitch) → export MP3 → reply)
+                        ogg_data = await self._download_file_data(ogg_url)
+                        if ogg_data:
+                            if pydub is None:
+                                # No pydub: reply OGG as-is; still just an in-memory relay
+                                await self._reply_raw_bytes(ctx, ogg_data, f"{sound_name}.ogg")
+                                return
+
+                            segment = self._segment_from_bytes(ogg_data, "ogg")
+                            if segment is None:
+                                await self._reply_raw_bytes(ctx, ogg_data, f"{sound_name}.ogg")
+                                return
+
+                            if pitch_percent is not None and pitch_percent != 100:
+                                segment = self._apply_pitch_percent(segment, pitch_percent)
+
+                            # Always export to MP3 for the reply (consistent container for attachments)
+                            await self._reply_mp3_segment(ctx, segment, f"{sound_name}.mp3")
                             return
-
-                        # Decode failed; send original
-                        await self._send_raw_bytes(ctx, mp3_data, f"{sound_name}.mp3")
-                        return
-
-                    # 2) Try OGG source (decode → (pitch) → export MP3 → send)
-                    ogg_data = await self._download_file_data(ogg_url)
-                    if ogg_data:
-                        try:
-                            await ctx.message.add_reaction("⏳")
-                        except discord.Forbidden:
-                            pass
-
-                        if pydub is None:
-                            # No pydub: attach OGG as-is; still just an in-memory relay
-                            try:
-                                await ctx.message.remove_reaction("⏳", self.bot.user)
-                            except discord.Forbidden:
-                                pass
-                            await self._send_raw_bytes(ctx, ogg_data, f"{sound_name}.ogg")
-                            return
-
-                        segment = self._segment_from_bytes(ogg_data, "ogg")
-
-                        try:
-                            await ctx.message.remove_reaction("⏳", self.bot.user)
-                        except discord.Forbidden:
-                            pass
-
-                        if segment is None:
-                            await self._send_raw_bytes(ctx, ogg_data, f"{sound_name}.ogg")
-                            return
-
-                        if pitch_percent is not None and pitch_percent != 100:
-                            segment = self._apply_pitch_percent(segment, pitch_percent)
-
-                        # Always export to MP3 for the send (keeps one consistent container for attachments)
-                        await self._send_mp3_segment(ctx, segment, f"{sound_name}.mp3")
-                        return
 
                     # 3) Neither file found
-                    try:
-                        await ctx.message.add_reaction("❓")
-                    except discord.Forbidden:
-                        pass
+                    await ctx.reply("❓ Couldn’t find that sound.", mention_author=False)
                     return
 
                 except discord.errors.Forbidden:
-                    logger.warning(f"Failed to send sound or react in {ctx.channel.id}.")
+                    logger.warning(f"Failed to reply with sound in {ctx.channel.id}.")
                     return
                 except Exception as e:
                     logger.error(f"Error processing sound command: {e}")

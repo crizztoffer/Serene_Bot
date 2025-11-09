@@ -6,3 +6,4 @@ requests
 svglib<1.6
 reportlab
 python-dotenv
+pydub

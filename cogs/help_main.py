@@ -32,7 +32,7 @@ class HelpModal(discord.ui.Modal, title='Serene Bot Commands'):
             label='Available !sound commands',
             style=discord.TextStyle.paragraph,
             default=command_list,
-            required=False, # Makes it read-only
+            required=False,  # Makes it optional; users can still type but we ignore it.
             placeholder="No sound commands found."
         )
         self.add_item(self.command_field)
@@ -95,15 +95,10 @@ class HelpCommands(commands.Cog):
         # Define the /serene help command
         @app_commands.command(name="help", description="Shows a list of available bot commands.")
         async def serene_help(interaction: Interaction):
-            # Show a "thinking" message while we fetch the list
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            
-            # Fetch the list of commands from the server
+            # IMPORTANT: Do not defer; send the modal via interaction.response
             command_list_str = await fetch_sound_commands()
-            
-            # Create and send the modal
             modal = HelpModal(command_list=command_list_str)
-            await interaction.followup.send_modal(modal)
+            await interaction.response.send_modal(modal)
 
         # Add the 'help' command under the '/serene' group
         serene_group.add_command(serene_help)

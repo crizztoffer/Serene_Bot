@@ -1175,33 +1175,62 @@ async def _fetch_gif_url_fallback(query: str) -> Optional[str]:
             continue
     return None
 
-# --- UPDATED broadcaster: gentle on transient errors ---
+async def _resolve_and_send_gif(room_id: str, display_name: str, query: str):
+    """
+    Resolve a GIF via Tenor (with fallback) and broadcast it as a chat image.
+    Runs in the background so it never blocks the WS read loop.
+    """
+    try:
+        url = await _fetch_gif_url_from_tenor(query)
+        if not url:
+            url = await _fetch_gif_url_fallback(query)
+
+        if url:
+            payload = _build_message_payload(room_id, display_name, url, sender_type="user")
+            await _broadcast_room_json(room_id, payload)
+        else:
+            await _broadcast_room_json(room_id, {
+                "type": "system_notice",
+                "room_id": room_id,
+                "message": f"No GIF found for “{query}”.",
+            })
+    except Exception:
+        logger.exception("GIF resolve/send failed for query %r", query)
+
+# --- UPDATED broadcaster: gentle + time-limited sends ---
 async def _broadcast_room_json(room_id: str, payload: dict):
     """
-    Broadcast dict JSON to the room (uses send_str). Avoids hard-removing sockets on transient errors.
+    Broadcast dict JSON to the room (uses send_str). Each send is time-limited
+    so slow clients don't stall the event loop that must keep reading pings.
     """
     try:
         room = bot.chat_ws_rooms.get(room_id) or set()
         msg = json.dumps(payload)
-        dead = []
-        for client_ws in list(room):
+
+        async def _safe_send(client_ws):
+            if client_ws.closed:
+                return False
             try:
-                if client_ws.closed:
-                    dead.append(client_ws)
-                    continue
-                await client_ws.send_str(msg)
-            except Exception as e:
-                logger.warning(f"[chat_ws] send_str error (room={room_id}): {e}")
+                # prevent head-of-line blocking on slow/remotely stalled clients
+                await asyncio.wait_for(client_ws.send_str(msg), timeout=1.0)
+                return True
+            except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+                return False
+            except Exception:
+                return False
+
+        clients = list(room)
+        if not clients:
+            return
+
+        results = await asyncio.gather(*[_safe_send(ws) for ws in clients], return_exceptions=True)
+        for ws, ok in zip(clients, results):
+            # treat exceptions / False / closed as dead
+            if ok is False or isinstance(ok, Exception) or getattr(ws, "closed", False):
                 try:
-                    if client_ws.closed:
-                        dead.append(client_ws)
+                    room.discard(ws)
                 except Exception:
                     pass
-        for ws in dead:
-            try:
-                room.discard(ws)
-            except Exception:
-                pass
     except Exception:
         logger.exception("Broadcast error for room %s", room_id)
 
@@ -1447,21 +1476,24 @@ async def chat_websocket_handler(request):
                                 bot.chat_ws_rooms[new_room] = set()
                             bot.chat_ws_rooms[new_room].add(ws)
 
-                            # Broadcast presence to both rooms
-                            await _broadcast_room_json(old_room, {
-                                "type": "user_left",
-                                "displayName": display_name,
-                                "room_id": old_room
-                            })
-                            await _broadcast_room_json(new_room, {
-                                "type": "user_joined",
-                                "displayName": display_name,
-                                "room_id": new_room
-                            })
-
-                            # >>> NEW: Authoritative system notice lines visible to EVERYONE
-                            await _broadcast_cross_room_presence(old_room, new_room, display_name,
-                                                                 from_name=from_name, to_name=to_name)
+                            # Broadcast presence to both rooms (concurrently so we don't block the loop)
+                            tasks = [
+                                _broadcast_room_json(old_room, {
+                                    "type": "user_left",
+                                    "displayName": display_name,
+                                    "room_id": old_room
+                                }),
+                                _broadcast_room_json(new_room, {
+                                    "type": "user_joined",
+                                    "displayName": display_name,
+                                    "room_id": new_room
+                                }),
+                                _broadcast_cross_room_presence(
+                                    old_room, new_room, display_name,
+                                    from_name=from_name, to_name=to_name
+                                ),
+                            ]
+                            await asyncio.gather(*tasks, return_exceptions=True)
 
                             # Update room_id
                             room_id = new_room
@@ -1481,20 +1513,8 @@ async def chat_websocket_handler(request):
                     if parts and parts[0].lower() == "gif":
                         query = parts[1].strip() if len(parts) > 1 else ""
                         if query:
-                            url = await _fetch_gif_url_from_tenor(query)
-                            if not url:
-                                url = await _fetch_gif_url_fallback(query)
-
-                            if url:
-                                # Reuse wrapper so frontend renders as <img class="chat-gif"> and sets isImage=true
-                                payload = _build_message_payload(room_id, display_name, url, sender_type="user")
-                                await _broadcast_room_json(room_id, payload)
-                            else:
-                                await _broadcast_room_json(room_id, {
-                                    "type": "system_notice",
-                                    "room_id": room_id,
-                                    "message": f"No GIF found for “{query}”.",
-                                })
+                            # Resolve + broadcast in background so we never block the read loop
+                            asyncio.create_task(_resolve_and_send_gif(room_id, display_name, query))
                         # IMPORTANT: do not fall through (prevents echo and Serene triggers)
                         continue
 
@@ -2326,18 +2346,6 @@ async def on_member_join(member):
 async def on_message(message):
     if message.author.id != bot.user.id:
         await bot.process_commands(message)
-
-# @bot.event
-# async def on_command_error(ctx, error):
-#     if isinstance(error, commands.CommandNotFound):
-#         await ctx.send("Command not found.")
-#     elif isinstance(error, commands.MissingRequiredArgument):
-#         await ctx.send(f"Missing argument: {error.param.name}.")
-#     elif isinstance(error, commands.MissingPermissions):
-#         await ctx.send("You lack permissions.")
-#     else:
-#         logger.error(f"Command error: {error}")
-#         await ctx.send(f"Unexpected error: {error}")
 
 # reset continuous session if user goes offline/invisible
 @bot.event
